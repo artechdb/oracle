@@ -1,4 +1,167 @@
 #!/bin/bash
+
+# Usage: ./rac_health_scan.sh <input_file>
+# Input file format (single line):
+#   scan_host db_name
+
+# Check input file
+if [ $# -ne 1 ]; then
+  echo "Usage: $0 <input_file>"
+  exit 1
+fi
+
+INPUT_FILE="$1"
+SCAN_HOST=$(awk '{print $1}' "$INPUT_FILE")
+DB_NAME=$(awk '{print $2}' "$INPUT_FILE")
+REPORT_FILE="rac_health_$(date +%Y%m%d_%H%M).html"
+
+# Validate input
+if [[ -z "$SCAN_HOST" || -z "$DB_NAME" ]]; then
+  echo "Invalid input file format. Expected:"
+  echo "scan_host db_name"
+  exit 1
+fi
+
+# Get SYS password
+read -s -p "Enter SYS password for ${SCAN_HOST}/${DB_NAME}: " SYS_PASSWORD
+echo
+
+# HTML Header
+cat > "$REPORT_FILE" << EOF
+<!DOCTYPE html>
+<html>
+<head>
+  <title>RAC Health Check: ${DB_NAME}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h2 { color: #2c3e50; border-bottom: 2px solid #3498db; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+    th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
+    tr:hover { background-color: #f5f5f5; }
+    .critical { color: #e74c3c; font-weight: bold; }
+    .warning { color: #f39c12; }
+    .ok { color: #27ae60; }
+  </style>
+</head>
+<body>
+  <h1>Oracle RAC Health Report: ${DB_NAME}</h1>
+  <p>Generated at: $(date)</p>
+  <p>SCAN Name: ${SCAN_HOST}</p>
+EOF
+
+# Function to run SQL and format as HTML table
+run_sql_to_html() {
+  local title="$1"
+  local query="$2"
+  local critical="$3"
+  
+  echo "<h2>${title}</h2>" >> "$REPORT_FILE"
+  
+  sqlplus -S "sys/${SYS_PASSWORD}@//${SCAN_HOST}:1521/${DB_NAME} as sysdba" << EOF | awk '
+    BEGIN { print "<table>"; print "<tr><th>Metric</th><th>Value</th></tr>" }
+    /^ERROR/ { print "<tr class=\"critical\"><td colspan=\"2\">" $0 "</td></tr>" }
+    /=/ { 
+      split($0, arr, "="); 
+      cls = "";
+      if (arr[2] ~ /CRITICAL/) cls = "critical";
+      if (arr[2] ~ /WARNING/) cls = "warning";
+      print "<tr><td>" arr[1] "</td><td class=\"" cls "\">" arr[2] "</td></tr>" 
+    }
+    END { print "</table>" }
+  ' >> "$REPORT_FILE"
+  
+    SET FEEDBACK OFF HEADING OFF PAGESIZE 0 LINESIZE 1000
+    ${query}
+    EXIT
+EOF
+}
+
+# RAC Node Status
+run_sql_to_html "Cluster Node Status" "
+  SELECT 'Node ' || instance_number || ': ' || 
+         instance_name || ' (' || host_name || ')' || '=' ||
+         status || ' | Version: ' || version || ' | Startup: ' || 
+         TO_CHAR(startup_time, 'YYYY-MM-DD HH24:MI')
+  FROM gv\$instance;
+"
+
+# Wait Events Analysis
+run_sql_to_html "Top Wait Events (Non-Idle)" "
+  SELECT event || '=' || 
+         ROUND(time_waited_micro/1000000,1) || 's (Waits: ' || 
+         total_waits || ', Avg: ' || 
+         ROUND(time_waited_micro/total_waits/1000,2) || 'ms)'
+  FROM (
+    SELECT event, total_waits, time_waited_micro
+    FROM gv\$system_event 
+    WHERE wait_class NOT IN ('Idle', 'System I/O')
+    ORDER BY time_waited_micro DESC
+    FETCH FIRST 10 ROWS ONLY
+  );
+"
+
+# Global Cache Statistics
+run_sql_to_html "Global Cache Performance" "
+  SELECT 
+    'Global Cache CR Block Receive Time (ms)' || '=' ||
+    ROUND((SUM(CASE name WHEN 'gc cr block receive time' THEN value END) /
+           SUM(CASE name WHEN 'gc cr blocks received' THEN value END)) * 10,2)
+    || 'ms [CR] | ' ||
+    ROUND((SUM(CASE name WHEN 'gc current block receive time' THEN value END) /
+           SUM(CASE name WHEN 'gc current blocks received' THEN value END)) * 10,2)
+    || 'ms [Current]'
+  FROM gv\$sysstat
+  WHERE name IN (
+    'gc cr block receive time', 'gc cr blocks received',
+    'gc current block receive time', 'gc current blocks received'
+  );
+"
+
+# Tablespace Usage
+run_sql_to_html "Tablespace Usage" "
+  SELECT tablespace_name || '=' || 
+         ROUND(used_percent,1) || '% used | ' ||
+         CASE WHEN used_percent > 90 THEN 'CRITICAL' 
+              WHEN used_percent > 80 THEN 'WARNING' 
+              ELSE 'OK' END
+  FROM (
+    SELECT a.tablespace_name, 
+           (a.bytes_alloc - nvl(b.bytes_free,0))/a.bytes_alloc*100 used_percent
+    FROM (
+      SELECT tablespace_name, SUM(bytes) bytes_alloc
+      FROM dba_data_files GROUP BY tablespace_name
+    ) a,
+    (
+      SELECT tablespace_name, SUM(bytes) bytes_free
+      FROM dba_free_space GROUP BY tablespace_name
+    ) b
+    WHERE a.tablespace_name = b.tablespace_name(+)
+  )
+  ORDER BY used_percent DESC;
+"
+
+# Cluster Interconnect
+run_sql_to_html "Interconnect Health" "
+  SELECT 
+    'Network Latency (' || name || ')' || '=' ||
+    ROUND(value/100,2) || 'ms' ||
+    CASE WHEN value/100 > 2 THEN ' CRITICAL' 
+         WHEN value/100 > 1 THEN ' WARNING' ELSE '' END
+  FROM gv\$sysmetric 
+  WHERE metric_name = 'Network Latency'
+    AND group_id = 2
+    AND value > 0;
+"
+
+# HTML Footer
+cat >> "$REPORT_FILE" << EOF
+</body>
+</html>
+EOF
+
+echo -e "\nReport generated: ${REPORT_FILE}"
+
+#!/bin/bash
 # Oracle DB Health Check with HTML Email using mail command
 
 # Configuration
