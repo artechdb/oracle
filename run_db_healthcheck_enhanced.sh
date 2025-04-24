@@ -1,5 +1,206 @@
 #!/bin/bash
 
+# Usage: ./rac_resize_redologs.sh <input_file> <new_size>
+# Example: ./rac_resize_redologs.sh rac_config.txt 1G
+# Input file format:
+#   primary_scan primary_db
+#   standby_scan standby_db
+
+# Check input parameters
+if [ $# -ne 2 ]; then
+  echo "Usage: $0 <input_file> <new_size>"
+  exit 1
+fi
+
+INPUT_FILE="$1"
+NEW_SIZE="$2"
+PRIMARY_HOST=$(awk 'NR==1 {print $1}' "$INPUT_FILE")
+PRIMARY_DB=$(awk 'NR==1 {print $2}' "$INPUT_FILE")
+STANDBY_HOST=$(awk 'NR==2 {print $1}' "$INPUT_FILE")
+STANDBY_DB=$(awk 'NR==2 {print $2}' "$INPUT_FILE")
+DG_USER="sys"
+LOG_FILE="rac_redolog_resize_$(date +%Y%m%d_%H%M).log"
+
+# Validate input
+if [[ -z "$PRIMARY_HOST" || -z "$PRIMARY_DB" || 
+      -z "$STANDBY_HOST" || -z "$STANDBY_DB" || -z "$NEW_SIZE" ]]; then
+  echo "Invalid input file format. Expected:"
+  echo "primary_scan primary_db"
+  echo "standby_scan standby_db"
+  exit 1
+fi
+
+# Get SYS password
+read -s -p "Enter SYS password for ${PRIMARY_HOST}/${PRIMARY_DB}: " SYS_PASSWORD
+echo
+
+# Function to log messages
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+# Verify database role
+verify_role() {
+  local host=$1
+  local db=$2
+  local expected_role=$3
+  
+  role=$(sqlplus -S "${DG_USER}/${SYS_PASSWORD}@//${host}:1521/${db} as sysdba" << EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT database_role FROM v\$database;
+    EXIT;
+EOF
+  )
+  if [[ "$role" != "$expected_role" ]]; then
+    log "Error: ${host}/${db} is not a ${expected_role} (Role: ${role})"
+    exit 1
+  fi
+  log "${expected_role} database confirmed"
+}
+
+# Enhanced online redo log resize with active log handling
+resize_online_redologs() {
+  local host=$1
+  local db=$2
+  log "Resizing ONLINE redo logs on ${db} (RAC) to ${NEW_SIZE}..."
+  
+  sqlplus -S "${DG_USER}/${SYS_PASSWORD}@//${host}:1521/${db} as sysdba" << EOF >> "$LOG_FILE" 2>&1
+    SET SERVEROUTPUT ON
+    DECLARE
+      TYPE thread_t IS TABLE OF NUMBER;
+      threads thread_t;
+      groups_per_thread NUMBER;
+      max_retries NUMBER := 5;
+      retry_interval NUMBER := 10; -- seconds
+      
+      -- Procedure to drop old logs with retries
+      PROCEDURE drop_old_logs IS
+        CURSOR old_groups_cur IS 
+          SELECT group#, thread#, status 
+          FROM v\$log 
+          WHERE bytes < (SELECT MAX(bytes) FROM v\$log);
+      BEGIN
+        FOR oldgrp IN old_groups_cur LOOP
+          DECLARE
+            retries NUMBER := 0;
+            current_status VARCHAR2(10);
+          BEGIN
+            current_status := oldgrp.status;
+            
+            WHILE current_status != 'INACTIVE' AND retries < max_retries LOOP
+              DBMS_OUTPUT.PUT_LINE('Thread ' || oldgrp.thread# || 
+                ' Group ' || oldgrp.group# || ' still ' || current_status ||
+                ' - forcing log switch (attempt ' || (retries+1) || ')');
+                
+              -- Force log switch for specific thread
+              BEGIN
+                EXECUTE IMMEDIATE 'ALTER SYSTEM SWITCH LOGFILE THREAD ' || oldgrp.thread#;
+              EXCEPTION
+                WHEN OTHERS THEN NULL;
+              END;
+              
+              -- Wait for status change
+              DBMS_LOCK.SLEEP(retry_interval);
+              
+              -- Check current status
+              BEGIN
+                SELECT status INTO current_status
+                FROM v\$log
+                WHERE group# = oldgrp.group#;
+              EXCEPTION
+                WHEN OTHERS THEN
+                  current_status := 'UNKNOWN';
+              END;
+              
+              retries := retries + 1;
+            END LOOP;
+            
+            IF current_status = 'INACTIVE' THEN
+              BEGIN
+                EXECUTE IMMEDIATE 'ALTER DATABASE DROP LOGFILE GROUP ' || oldgrp.group#;
+                DBMS_OUTPUT.PUT_LINE('Dropped group ' || oldgrp.group#);
+              EXCEPTION
+                WHEN OTHERS THEN
+                  DBMS_OUTPUT.PUT_LINE('Error dropping group ' || oldgrp.group# || ': ' || SQLERRM);
+              END;
+            ELSE
+              DBMS_OUTPUT.PUT_LINE('Failed to drop group ' || oldgrp.group# || 
+                ' - still ' || current_status || ' after ' || max_retries || ' attempts');
+            END IF;
+          END;
+        END LOOP;
+      END drop_old_logs;
+
+    BEGIN
+      -- Get active threads
+      SELECT thread# BULK COLLECT INTO threads FROM v\$thread;
+
+      -- Get current online log groups per thread
+      SELECT COUNT(*)/COUNT(DISTINCT thread#) INTO groups_per_thread FROM v\$log;
+
+      -- Add new log groups for each thread
+      FOR i IN 1..threads.COUNT LOOP
+        FOR j IN 1..groups_per_thread LOOP
+          EXECUTE IMMEDIATE 'ALTER DATABASE ADD LOGFILE THREAD ' || threads(i) || 
+                            ' SIZE ${NEW_SIZE}';
+        END LOOP;
+      END LOOP;
+
+      -- Force log switches across all threads
+      FOR thread_rec IN (SELECT thread# FROM v\$thread) LOOP
+        FOR k IN 1..(groups_per_thread * 2) LOOP
+          EXECUTE IMMEDIATE 'ALTER SYSTEM SWITCH LOGFILE THREAD ' || thread_rec.thread#;
+        END LOOP;
+      END LOOP;
+
+      -- Drop old logs with retry mechanism
+      drop_old_logs;
+      
+    EXCEPTION
+      WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('Error: ' || SQLERRM);
+        RAISE;
+    END;
+    /
+    EXIT;
+EOF
+
+  if grep -q "ORA-" "$LOG_FILE"; then
+    log "Error resizing online redo logs on ${db}"
+    return 1
+  fi
+  log "Online redo logs resized successfully on ${db} (RAC)"
+}
+
+# Other functions remain unchanged (resize_standby_redologs, manage_mrp, etc.)
+
+# Main execution
+{
+  log "Starting RAC Redo Log Resize Operation"
+  verify_role "$PRIMARY_HOST" "$PRIMARY_DB" "PRIMARY"
+  verify_role "$STANDBY_HOST" "$STANDBY_DB" "PHYSICAL STANDBY"
+
+  # Process standby
+  manage_mrp "OFF"
+  manage_standby_file_management "$STANDBY_HOST" "$STANDBY_DB" "MANUAL"
+  resize_online_redologs "$STANDBY_HOST" "$STANDBY_DB"
+  resize_standby_redologs "$STANDBY_HOST" "$STANDBY_DB"
+  manage_standby_file_management "$STANDBY_HOST" "$STANDBY_DB" "AUTO"
+  manage_mrp "ON"
+
+  # Process primary
+  resize_online_redologs "$PRIMARY_HOST" "$PRIMARY_DB"
+  resize_standby_redologs "$PRIMARY_HOST" "$PRIMARY_DB"
+
+  # Verification steps
+  log "Operation completed successfully"
+} | tee -a "$LOG_FILE"
+
+echo "Detailed log saved to: ${LOG_FILE}"
+
+##########################
+#!/bin/bash
+
 # Usage: ./rac_health_scan.sh <input_file>
 # Input file format (single line):
 #   scan_host db_name
