@@ -1,3 +1,186 @@
+##
+
+db_health_monitor/
+├── config.sh
+├── dblist.txt
+├── db_checks.sh
+├── generate_reports.sh
+└── templates/
+   ├── header.html
+   └── footer.html
+#!/bin/bash
+# Configuration
+REPORTS_DIR="./reports"
+SUMMARY_REPORT="summary_report_$(date +%Y%m%d).html"
+CRITICAL_TABLESPACE_PCT=90
+CRITICAL_ACTIVE_SESSIONS=50
+CRITICAL_WAIT_SECONDS=300
+
+# Create reports directory
+mkdir -p $REPORTS_DIR
+
+<html>
+<head>
+   <title>Database Health Report</title>
+   <style>
+       body { font-family: Arial, sans-serif; margin: 20px; }
+       table { border-collapse: collapse; width: 100%; }
+       th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+       .green { background-color: #dff0d8; color: #3c763d; }
+       .red { background-color: #f2dede; color: #a94442; }
+       th { background-color: #4CAF50; color: white; }
+       a { text-decoration: none; color: #337ab7; }
+   </style>
+</head>
+<body>
+
+</body>
+</html>
+
+#!/bin/bash
+source config.sh
+
+generate_individual_report() {
+   local db_name=$1
+   local db_conn=$2
+   local report_file="$REPORTS_DIR/${db_name}_report_$(date +%Y%m%d).html"
+
+   # Create individual report
+   cat templates/header.html > $report_file
+   echo "<h1>${db_name} Health Report</h1>" >> $report_file
+   echo "<p>Report generated: $(date)</p>" >> $report_file
+
+   # Add database checks
+   add_tablespace_check "$db_conn" "$report_file"
+   add_active_sessions_check "$db_conn" "$report_file"
+   add_wait_events_check "$db_conn" "$report_file"
+
+   cat templates/footer.html >> $report_file
+   echo $report_file
+}
+
+add_tablespace_check() {
+   local db_conn=$1
+   local report_file=$2
+
+   echo "<h2>Tablespace Usage</h2>" >> $report_file
+   sqlplus -S /nolog << EOF >> $report_file
+   connect $db_conn
+   set markup html on
+   SELECT tablespace_name,
+          round(used_space/1024/1024) used_gb,
+          round(tablespace_size/1024/1024) total_gb,
+          round(used_percent) pct_used
+   FROM dba_tablespace_usage_metrics
+   ORDER BY pct_used DESC;
+   exit
+EOF
+}
+
+add_active_sessions_check() {
+   local db_conn=$1
+   local report_file=$2
+
+   echo "<h2>Active Sessions</h2>" >> $report_file
+   sqlplus -S /nolog << EOF >> $report_file
+   connect $db_conn
+   set markup html on
+   SELECT inst_id, COUNT(*) sessions
+   FROM gv\$session
+   WHERE status = 'ACTIVE'
+   GROUP BY inst_id;
+   exit
+EOF
+}
+
+add_wait_events_check() {
+   local db_conn=$1
+   local report_file=$2
+
+   echo "<h2>Top Wait Events</h2>" >> $report_file
+   sqlplus -S /nolog << EOF >> $report_file
+   connect $db_conn
+   set markup html on
+   SELECT event, total_waits,
+          round(time_waited_micro/1000000) wait_seconds
+   FROM (
+       SELECT event, total_waits, time_waited_micro
+       FROM gv\$system_event
+       WHERE wait_class != 'Idle'
+       ORDER BY time_waited_micro DESC
+   ) WHERE rownum <= 5;
+   exit
+EOF
+}
+==
+#!/bin/bash
+source config.sh
+
+# Initialize summary report
+cat templates/header.html > $SUMMARY_REPORT
+echo "<h1>Database Health Summary Report</h1>" >> $SUMMARY_REPORT
+echo "<p>Report generated: $(date)</p>" >> $SUMMARY_REPORT
+echo "<table><tr><th>Database</th><th>Status</th><th>Details</th></tr>" >> $SUMMARY_REPORT
+
+# Process each database
+while IFS='|' read -r db_name db_user db_pass db_sid; do
+   db_conn="$db_user/$db_pass@$db_sid"
+
+   # Generate individual report
+   report_path=$(generate_individual_report "$db_name" "$db_conn")
+
+   # Check status
+   status_check=$(check_database_status "$db_conn")
+
+   # Add to summary report
+   echo "<tr>" >> $SUMMARY_REPORT
+   echo "<td>$db_name</td>" >> $SUMMARY_REPORT
+   echo "<td class='$status_check'>${status_check^^}</td>" >> $SUMMARY_REPORT
+   echo "<td><a href='$report_path'>View Details</a></td>" >> $SUMMARY_REPORT
+   echo "</tr>" >> $SUMMARY_REPORT
+
+done < dblist.txt
+
+# Complete summary report
+echo "</table>" >> $SUMMARY_REPORT
+cat templates/footer.html >> $SUMMARY_REPORT
+
+echo "Summary report generated: $SUMMARY_REPORT"
+
+===
+check_database_status() {
+   local db_conn=$1
+   local status="green"
+
+   # Check tablespace usage
+   ts_usage=$(sqlplus -S /nolog << EOF
+   connect $db_conn
+   set pagesize 0 feedback off
+   SELECT MAX(used_percent) FROM dba_tablespace_usage_metrics;
+   exit
+EOF
+)
+   if (( $(echo "$ts_usage > $CRITICAL_TABLESPACE_PCT" | bc -l) )); then
+       status="red"
+   fi
+
+   # Check active sessions
+   active_sessions=$(sqlplus -S /nolog << EOF
+   connect $db_conn
+   set pagesize 0 feedback off
+   SELECT COUNT(*) FROM gv\$session WHERE status = 'ACTIVE';
+   exit
+EOF
+)
+   if [ $active_sessions -gt $CRITICAL_ACTIVE_SESSIONS ]; then
+       status="red"
+   fi
+
+   echo $status
+}
+
+
+
 #!/bin/bash
 
 # Usage: ./rac_resize_redologs.sh <input_file> <new_size>
