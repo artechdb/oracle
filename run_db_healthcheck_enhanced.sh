@@ -1,4 +1,724 @@
+## pre-check
+#!/bin/bash
+# Refreshable PDB Clone Precheck Script
+# Usage: ./pdb_clone_precheck.sh <input_file.txt>
+
+# Define SQL*Plus path (update if needed)
+SQLPLUS="/u01/app/oracle/product/19c/dbhome_1/bin/sqlplus -s"
+
+# Check input file
+if [ $# -ne 1 ] || [ ! -f "$1" ]; then
+    echo "Usage: $0 <input_file.txt>"
+    echo "Input file format:"
+    echo "source_cdb|source_pdb|target_cdb|target_pdb"
+    exit 1
+fi
+
+INPUT_FILE="$1"
+LOG_FILE="pdb_clone_precheck_$(date +%Y%m%d_%H%M%S).log"
+
+# Precheck validation function
+validate_clone_prerequisites() {
+    local src_cdb="$1"
+    local src_pdb="$2"
+    local tgt_cdb="$3"
+    local tgt_pdb="$4"
+    
+    echo "================================================================="
+    echo " Starting precheck for:"
+    echo " Source: $src_cdb/$src_pdb"
+    echo " Target: $tgt_cdb/$tgt_pdb"
+    echo "================================================================="
+
+    # 1. Source CDB Checks
+    echo "Checking Source CDB ($src_cdb)..."
+    $SQLPLUS "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+connect /@$src_cdb as sysdba
+
+-- Check source PDB exists
+SET HEAD OFF FEED OFF
+SELECT 'VALID' FROM v\$pdbs WHERE name = '$src_pdb';
+EXIT
+EOF
+    [ $? -ne 0 ] && echo "[ERROR] Source PDB $src_pdb not found in $src_cdb" && return 1
+
+    # 2. Source PDB Check
+    echo "Checking Source PDB ($src_pdb)..."
+    SRC_PDB_STATUS=$($SQLPLUS "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+connect /@$src_cdb as sysdba
+
+SET HEAD OFF FEED OFF
+SELECT open_mode FROM v\$pdbs WHERE name = '$src_pdb';
+EXIT
+EOF
+    )
+    [[ ! "$SRC_PDB_STATUS" =~ "READ WRITE" && ! "$SRC_PDB_STATUS" =~ "READ ONLY" ]] && \
+        echo "[ERROR] Source PDB must be in READ WRITE or READ ONLY mode. Current mode: $SRC_PDB_STATUS" && return 1
+
+    # 3. Local Undo Check
+    LOCAL_UNDO=$($SQLPLUS "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+connect /@$src_cdb as sysdba
+
+SET HEAD OFF FEED OFF
+SELECT value FROM v\$parameter WHERE name = 'local_undo_enabled';
+EXIT
+EOF
+    )
+    [ "$LOCAL_UNDO" != "TRUE" ] && echo "[ERROR] LOCAL_UNDO_ENABLED must be TRUE on source CDB" && return 1
+
+    # 4. Target CDB Check
+    echo "Checking Target CDB ($tgt_cdb)..."
+    $SQLPLUS "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+connect /@$tgt_cdb as sysdba
+
+-- Check target PDB name availability
+SET HEAD OFF FEED OFF
+SELECT 'VALID' FROM v\$pdbs WHERE name = '$tgt_pdb';
+EXIT
+EOF
+    [ $? -eq 0 ] && echo "[ERROR] Target PDB $tgt_pdb already exists in $tgt_cdb" && return 1
+
+    # 5. Compatibility Check
+    SRC_COMPAT=$($SQLPLUS "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+connect /@$src_cdb as sysdba
+SET HEAD OFF FEED OFF
+SELECT value FROM v\$parameter WHERE name = 'compatible';
+EXIT
+EOF
+    )
+
+    TGT_COMPAT=$($SQLPLUS "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+connect /@$tgt_cdb as sysdba
+SET HEAD OFF FEED OFF
+SELECT value FROM v\$parameter WHERE name = 'compatible';
+EXIT
+EOF
+    )
+
+    [ "$SRC_COMPAT" != "$TGT_COMPAT" ] && \
+        echo "[ERROR] Compatible parameter mismatch. Source: $SRC_COMPAT, Target: $TGT_COMPAT" && return 1
+
+    # 6. Privilege Check on Target
+    echo "Checking Target Privileges..."
+    $SQLPLUS "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+connect /@$tgt_cdb as sysdba
+SET HEAD OFF FEED OFF
+SELECT 'VALID' FROM dba_sys_privs 
+WHERE grantee = USER 
+AND privilege = 'CREATE PLUGGABLE DATABASE';
+EXIT
+EOF
+    [ $? -ne 0 ] && echo "[ERROR] User lacks CREATE PLUGGABLE DATABASE privilege on target" && return 1
+
+    echo "All prechecks passed successfully!"
+    return 0
+}
+
+# Process input file
+while IFS="|" read -r src_cdb src_pdb tgt_cdb tgt_pdb; do
+    # Skip comments and empty lines
+    [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+    
+    validate_clone_prerequisites "$src_cdb" "$src_pdb" "$tgt_cdb" "$tgt_pdb" | tee -a "$LOG_FILE"
+    echo -e "\n"
+done < "$INPUT_FILE"
+
+echo "Precheck completed. Review log file: $LOG_FILE"
+exit 0
+
+
+###
+#!/bin/bash
+# Refreshable PDB Clone Precheck Script with Advanced Checks
+# Usage: ./pdb_clone_precheck.sh <input_file.txt> <email@domain.com>
+
+# Configuration
+SQLPLUS="/u01/app/oracle/product/19c/dbhome_1/bin/sqlplus -s"
+HTML_FILE="pdb_precheck_$(date +%Y%m%d_%H%M%S).html"
+EMAIL_TO="$2"
+EMAIL_FROM="dba@company.com"
+EMAIL_SUBJECT="Oracle PDB Clone Precheck Report"
+
+# HTML Template Functions
+html_header() {
+    echo "<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+  th { background-color: #f2f2f2; }
+  .pass { background-color: #dfffdf; color: #2a652a; }
+  .fail { background-color: #ffe8e8; color: #a00; }
+  .warning { background-color: #fff3e0; color: #c67605; }
+</style>
+<title>PDB Clone Precheck Report</title>
+</head>
+<body>
+<h2>Oracle PDB Clone Precheck Report</h2>
+<p>Generated at: $(date)</p>
+<table>
+  <tr><th>Check</th><th>Source</th><th>Target</th><th>Status</th><th>Details</th></tr>" > "$HTML_FILE"
+}
+
+html_add_row() {
+    local check="$1"
+    local source="$2"
+    local target="$3"
+    local status="$4"
+    local details="$5"
+    
+    case $status in
+        "PASS") class="pass" ;;
+        "FAIL") class="fail" ;;
+        *) class="warning" ;;
+    esac
+    
+    echo "<tr>
+          <td>$check</td>
+          <td>$source</td>
+          <td>$target</td>
+          <td class='$class'>$status</td>
+          <td>$details</td>
+        </tr>" >> "$HTML_FILE"
+}
+
+html_footer() {
+    echo "</table>
+<p>Report generated by Oracle Precheck Script</p>
+</body>
+</html>" >> "$HTML_FILE"
+}
+
+# Database Check Functions
+run_sql() {
+    local conn="$1"
+    local query="$2"
+    $SQLPLUS -S "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+set heading off feedback off verify off
+connect $conn
+$query
+exit
+EOF
+}
+
+check_tde_settings() {
+    local src_cdb="$1"
+    local tgt_cdb="$2"
+    
+    src_tde=$(run_sql "/@$src_cdb as sysdba" "SELECT wallet_type FROM v\$encryption_wallet;")
+    tgt_tde=$(run_sql "/@$tgt_cdb as sysdba" "SELECT wallet_type FROM v\$encryption_wallet;")
+    
+    if [ "$src_tde" != "$tgt_tde" ]; then
+        echo "FAIL|TDE mismatch|Source: $src_tde|Target: $tgt_tde"
+    else
+        echo "PASS|TDE Match|Both using $src_tde"
+    fi
+}
+
+check_charset() {
+    local src_cdb="$1"
+    local tgt_cdb="$2"
+    
+    src_charset=$(run_sql "/@$src_cdb as sysdba" "SELECT value FROM nls_database_parameters WHERE parameter='NLS_CHARACTERSET';")
+    tgt_charset=$(run_sql "/@$tgt_cdb as sysdba" "SELECT value FROM nls_database_parameters WHERE parameter='NLS_CHARACTERSET';")
+    
+    if [ "$src_charset" != "$tgt_charset" ]; then
+        echo "FAIL|Charset mismatch|Source: $src_charset|Target: $tgt_charset"
+    else
+        echo "PASS|Charset Match|$src_charset"
+    fi
+}
+
+check_patch_level() {
+    local src_cdb="$1"
+    local tgt_cdb="$2"
+    
+    src_patch=$(run_sql "/@$src_cdb as sysdba" "SELECT version || ' - ' || patch_name FROM dba_registry_sqlpatch ORDER BY action_time DESC FETCH FIRST 1 ROWS ONLY;")
+    tgt_patch=$(run_sql "/@$tgt_cdb as sysdba" "SELECT version || ' - ' || patch_name FROM dba_registry_sqlpatch ORDER BY action_time DESC FETCH FIRST 1 ROWS ONLY;")
+    
+    if [ "$src_patch" != "$tgt_patch" ]; then
+        echo "FAIL|Patch mismatch|Source: $src_patch|Target: $tgt_patch"
+    else
+        echo "PASS|Patch Level Match|$src_patch"
+    fi
+}
+
+# Main Validation Function
+validate_clone_prerequisites() {
+    local src_cdb="$1"
+    local src_pdb="$2"
+    local tgt_cdb="$3"
+    local tgt_pdb="$4"
+    
+    # Basic Checks
+    checks=(
+        "Source PDB Exists|$(run_sql "/@$src_cdb as sysdba" "SELECT 'PASS' FROM v\$pdbs WHERE name='$src_pdb';")|PASS|Exists"
+        "Target PDB Free|$(run_sql "/@$tgt_cdb as sysdba" "SELECT 'PASS' FROM v\$pdbs WHERE name='$tgt_pdb';")|FAIL|Not exists"
+        "Local Undo|$(run_sql "/@$src_cdb as sysdba" "SELECT value FROM v\$parameter WHERE name='local_undo_enabled';")|TRUE|Enabled"
+    )
+    
+    # Advanced Checks
+    tde_result=$(check_tde_settings "$src_cdb" "$tgt_cdb")
+    charset_result=$(check_charset "$src_cdb" "$tgt_cdb")
+    patch_result=$(check_patch_level "$src_cdb" "$tgt_cdb")
+    
+    # Process Results
+    for check in "${checks[@]}"; do
+        IFS='|' read -r desc query expect <<< "$check"
+        result=$(echo "$query" | tr -d '\n')
+        [ "$result" = "$expect" ] && status="PASS" || status="FAIL"
+        html_add_row "$desc" "$src_cdb" "$tgt_cdb" "$status" "$result"
+    done
+    
+    IFS='|' read -r status details <<< "$tde_result"
+    html_add_row "TDE Configuration" "$src_cdb" "$tgt_cdb" "${tde_result%%|*}" "${tde_result#*|}"
+    
+    IFS='|' read -r status details <<< "$charset_result"
+    html_add_row "Character Set" "$src_cdb" "$tgt_cdb" "${charset_result%%|*}" "${charset_result#*|}"
+    
+    IFS='|' read -r status details <<< "$patch_result"
+    html_add_row "Patch Level" "$src_cdb" "$tgt_cdb" "${patch_result%%|*}" "${patch_result#*|}"
+}
+
+# Email Function
+send_email() {
+    if [ -n "$EMAIL_TO" ]; then
+        mailx -s "$EMAIL_SUBJECT" -a "Content-Type: text/html" -r "$EMAIL_FROM" "$EMAIL_TO" < "$HTML_FILE"
+        echo "Report sent to $EMAIL_TO"
+    fi
+}
+
+# Main Execution
+[ $# -lt 1 ] && echo "Usage: $0 <input_file.txt> [email]" && exit 1
+
+html_header
+while IFS="|" read -r src_cdb src_pdb tgt_cdb tgt_pdb; do
+    [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+    validate_clone_prerequisites "$src_cdb" "$src_pdb" "$tgt_cdb" "$tgt_pdb"
+done < "$1"
+html_footer
+send_email
+
+echo "Precheck completed. HTML report: $HTML_FILE"
+exit 0
+
+####
+#!/bin/bash
+# Enhanced PDB Clone Precheck Script with Connectivity Checks
+# Usage: ./pdb_clone_precheck.sh <input_file.txt> <email@domain.com>
+
+# Configuration
+SQLPLUS="/u01/app/oracle/product/19c/dbhome_1/bin/sqlplus -s"
+HTML_FILE="pdb_precheck_$(date +%Y%m%d_%H%M%S).html"
+EMAIL_TO="$2"
+EMAIL_FROM="dba@company.com"
+EMAIL_SUBJECT="Oracle PDB Clone Precheck Report"
+OVERALL_STATUS=0
+
+# HTML Template Functions (keep existing implementation)
+html_header() { ... }
+html_add_row() { ... }
+html_footer() { ... }
+
+# Database Connection Validation
+check_db_connectivity() {
+    local cdb="$1"
+    local cdb_type="$2"
+    local query="SELECT 1 FROM DUAL;"
+    
+    echo "Checking $cdb_type connectivity ($cdb)..."
+    local output=$(run_sql "/@$cdb as sysdba" "$query" 2>&1)
+    
+    if [ $? -ne 0 ]; then
+        html_add_row "$cdb_type Connectivity" "$cdb" "N/A" "FAIL" "Connection failed: $output"
+        return 1
+    else
+        html_add_row "$cdb_type Connectivity" "$cdb" "N/A" "PASS" "Successfully connected"
+        return 0
+    fi
+}
+
+# Enhanced Validation Function with Connectivity Checks
+validate_clone_prerequisites() {
+    local src_cdb="$1"
+    local src_pdb="$2"
+    local tgt_cdb="$3"
+    local tgt_pdb="$4"
+    local status=0
+
+    # Check source DB connectivity
+    if ! check_db_connectivity "$src_cdb" "Source CDB"; then
+        OVERALL_STATUS=1
+        status=1
+    fi
+
+    # Check target DB connectivity
+    if ! check_db_connectivity "$tgt_cdb" "Target CDB"; then
+        OVERALL_STATUS=1
+        status=1
+    fi
+
+    # Skip further checks if connectivity failed
+    [ $status -ne 0 ] && return 1
+
+    # Proceed with other checks (keep existing implementation)
+    # TDE, Charset, Patching checks...
+}
+
+# Main Execution with Exit Code Handling
+[ $# -lt 1 ] && echo "Usage: $0 <input_file.txt> [email]" && exit 1
+
+html_header
+while IFS="|" read -r src_cdb src_pdb tgt_cdb tgt_pdb; do
+    [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+    
+    echo "Processing: $src_cdb/$src_pdb -> $tgt_cdb/$tgt_pdb"
+    validate_clone_prerequisites "$src_cdb" "$src_pdb" "$tgt_cdb" "$tgt_pdb"
+done < "$1"
+html_footer
+
+# Send email and exit with proper status
+[ -n "$EMAIL_TO" ] && send_email
+echo "Precheck completed. Exit code: $OVERALL_STATUS"
+exit $OVERALL_STATUS
+
+
+###
+check_db_connectivity() {
+    local cdb="$1"
+    local cdb_type="$2"
+    local query="SELECT 1 FROM DUAL;"
+    
+    echo "Checking $cdb_type connectivity ($cdb)..."
+    local output=$(run_sql "/@$cdb as sysdba" "$query" 2>&1)
+    
+    if [ $? -ne 0 ]; then
+        html_add_row "$cdb_type Connectivity" "$cdb" "N/A" "FAIL" "Connection failed: $output"
+        return 1
+    else
+        html_add_row "$cdb_type Connectivity" "$cdb" "N/A" "PASS" "Successfully connected"
+        return 0
+    fi
+}
+
+###
+validate_clone_prerequisites() {
+    # Check source DB connectivity
+    if ! check_db_connectivity "$src_cdb" "Source CDB"; then
+        OVERALL_STATUS=1
+        status=1
+    fi
+
+    # Check target DB connectivity
+    if ! check_db_connectivity "$tgt_cdb" "Target CDB"; then
+        OVERALL_STATUS=1
+        status=1
+    fi
+
+    # Skip further checks if connectivity failed
+    [ $status -ne 0 ] && return 1
+    # ... existing checks ...
+}
+
+
+####
+#!/bin/bash
+# Refreshable PDB Clone Precheck Script with Parameter Comparison
+# Usage: ./pdb_clone_precheck.sh <input_file.txt> <email@domain.com>
+
+# Configuration
+SQLPLUS="/u01/app/oracle/product/19c/dbhome_1/bin/sqlplus -s"
+HTML_FILE="pdb_precheck_$(date +%Y%m%d_%H%M%S).html"
+EMAIL_TO="$2"
+EMAIL_FROM="dba@company.com"
+EMAIL_SUBJECT="Oracle PDB Clone Precheck Report"
+OVERALL_STATUS=0
+EXCLUDED_PARAMS="db_name|db_unique_name|instance_name|control_files|local_listener|remote_login_passwordfile|log_archive_dest_1|dg_broker_config_file1|dg_broker_config_file2"
+
+# HTML Template Functions (keep existing implementation)
+html_header() { ... }
+html_add_row() { ... }
+html_footer() { ... }
+
+# Parameter Comparison Function
+compare_parameters() {
+    local src_cdb="$1"
+    local tgt_cdb="$2"
+    local differences=0
+
+    # Get parameters from both databases
+    src_params=$(mktemp)
+    tgt_params=$(mktemp)
+    
+    run_sql "/@$src_cdb as sysdba" "SELECT name, value FROM v\$system_parameter 
+        WHERE name NOT IN (${EXCLUDED_PARAMS//|/,}) 
+        ORDER BY name;" | awk -F' ' '{print $1 "|" $2}' > "$src_params"
+    
+    run_sql "/@$tgt_cdb as sysdba" "SELECT name, value FROM v\$system_parameter 
+        WHERE name NOT IN (${EXCLUDED_PARAMS//|/,}) 
+        ORDER BY name;" | awk -F' ' '{print $1 "|" $2}' > "$tgt_params"
+
+    # Compare parameters and format output
+    diff --suppress-common-lines -y "$src_params" "$tgt_params" | while read -r line; do
+        param=$(echo "$line" | awk -F'|' '{print $1}' | tr -d ' ')
+        src_val=$(echo "$line" | awk -F'|' '{print $2}' | awk '{$1=$1;print}')
+        tgt_val=$(echo "$line" | awk -F'|' '{print $4}' | awk '{$1=$1;print}')
+
+        html_add_row "Parameter: $param" "$src_val" "$tgt_val" "FAIL" "Parameter mismatch"
+        ((differences++))
+    done
+
+    [ $differences -gt 0 ] && OVERALL_STATUS=1
+    rm "$src_params" "$tgt_params"
+}
+
+# Enhanced Validation Function
+validate_clone_prerequisites() {
+    local src_cdb="$1"
+    local src_pdb="$2"
+    local tgt_cdb="$3"
+    local tgt_pdb="$4"
+    local status=0
+
+    # Check connectivity (existing implementation)
+    # ...
+
+    # Perform parameter comparison
+    compare_parameters "$src_cdb" "$tgt_cdb"
+
+    # Existing checks (TDE, charset, etc.)
+    # ...
+}
+
+# Main Execution (keep existing flow)
+# ...
+
+
+###
+#!/bin/bash
+# Refreshable PDB Clone Precheck Script with Storage Checks
+# Usage: ./pdb_clone_precheck.sh <input_file.txt> <email@domain.com>
+
+# Configuration
+SQLPLUS="/u01/app/oracle/product/19c/dbhome_1/bin/sqlplus -s"
+HTML_FILE="pdb_precheck_$(date +%Y%m%d_%H%M%S).html"
+EMAIL_TO="$2"
+EMAIL_FROM="dba@company.com"
+EMAIL_SUBJECT="Oracle PDB Clone Precheck Report"
+OVERALL_STATUS=0
+
+# Existing functions (html_header, html_add_row, html_footer, etc.)
+
+check_max_pdb_storage() {
+    local src_cdb="$1"
+    local src_pdb="$2"
+    local tgt_cdb="$3"
+    local tgt_pdb="$4"
+    
+    # Get source PDB storage limit
+    src_storage=$(run_sql "/@$src_cdb as sysdba" "
+        ALTER SESSION SET CONTAINER = $src_pdb;
+        SELECT value FROM v\$parameter WHERE name = 'max_pdb_storage';")
+    
+    # Get target CDB storage capabilities (if target PDB exists)
+    tgt_storage=$(run_sql "/@$tgt_cdb as sysdba" "
+        SELECT NVL2(p.name, 
+            (SELECT value FROM v\$parameter 
+             WHERE name = 'max_pdb_storage' 
+             AND con_id = p.con_id), 'NOT_CREATED')
+        FROM v\$pdbs p WHERE p.name = '$tgt_pdb';")
+
+    # Format comparison results
+    if [ "$tgt_storage" == "NOT_CREATED" ]; then
+        html_add_row "MAX_PDB_STORAGE" "$src_storage" "N/A" "INFO" "Target PDB not created"
+    elif [ "$src_storage" != "$tgt_storage" ]; then
+        html_add_row "MAX_PDB_STORAGE" "$src_storage" "$tgt_storage" "WARN" "Storage limit mismatch"
+        OVERALL_STATUS=1
+    else
+        html_add_row "MAX_PDB_STORAGE" "$src_storage" "$tgt_storage" "PASS" "Storage limits match"
+    fi
+}
+
+validate_clone_prerequisites() {
+    local src_cdb="$1"
+    local src_pdb="$2"
+    local tgt_cdb="$3"
+    local tgt_pdb="$4"
+    local status=0
+
+    # Existing connectivity checks...
+
+    # MAX_PDB_STORAGE Check
+    check_max_pdb_storage "$src_cdb" "$src_pdb" "$tgt_cdb" "$tgt_pdb"
+
+    # Existing TDE, charset, patching checks...
+}
+
+# Main execution remains the same
+
+
+pdb_clone_precheck/
+├── precheck.conf          # Configuration variables
+├── precheck_main.sh       # Main execution script
+├── precheck_helpers.sh    # Core helper functions
+└── precheck_db_checks.sh  # Database validation functions
+
+1. precheck.conf (Configuration File):
+
+bash
+#!/bin/bash
+# Configuration File - Edit these values for your environment
+
+# Database Configuration
+SQLPLUS="/u01/app/oracle/product/19c/dbhome_1/bin/sqlplus -s"
+EXCLUDED_PARAMS="db_name|db_unique_name|instance_name|control_files|local_listener|remote_login_passwordfile"
+WHITELISTED_PARAMS="compatible|db_block_size|memory_target"
+
+# Email Configuration
+EMAIL_FROM="dba@company.com"
+EMAIL_SUBJECT="Oracle PDB Clone Precheck Report"
+
+# File Paths
+LOG_DIR="./logs"
+REPORT_DIR="./reports"
+
+
+2. precheck_helpers.sh (Helper Functions):
+
+bash
+#!/bin/bash
+# Helper Functions
+
+html_header() {
+    echo "<!DOCTYPE html>
+<html>
+<head>
+<style>
+  /* CSS styles */
+</style>
+</head>
+<body>
+<h2>Oracle PDB Clone Precheck Report</h2>
+<p>Generated at: $(date)</p>
+<table>"
+}
+
+html_add_row() {
+    # Existing implementation
+}
+
+html_footer() {
+    echo "</table></body></html>"
+}
+
+validate_input_file() {
+    [ $# -ne 1 ] || [ ! -f "$1" ] && return 1
+    return 0
+}
+
+initialize_directories() {
+    mkdir -p "$LOG_DIR" "$REPORT_DIR"
+}
+
+
+3. precheck_db_checks.sh (Database Validation Functions):
+
+bash
+#!/bin/bash
+# Database Validation Functions
+
+check_db_connectivity() {
+    # Existing implementation
+}
+
+check_tde_settings() {
+    # Existing implementation
+}
+
+compare_parameters() {
+    # Existing implementation
+}
+
+check_max_pdb_storage() {
+    # Existing implementation
+}
+
+check_patch_level() {
+    # Existing implementation
+}
+
+
+4. precheck_main.sh (Main Script):
+
+bash
+#!/bin/bash
+# Main Execution Script
+
+# Source configuration and functions
+source ./precheck.conf
+source ./precheck_helpers.sh
+source ./precheck_db_checks.sh
+
+# Initialize environment
+initialize_directories
+HTML_FILE="${REPORT_DIR}/pdb_precheck_$(date +%Y%m%d_%H%M%S).html"
+OVERALL_STATUS=0
+
+# Main logic
+html_header > "$HTML_FILE"
+
+while IFS="|" read -r src_cdb src_pdb tgt_cdb tgt_pdb; do
+    [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+    
+    validate_clone_prerequisites "$src_cdb" "$src_pdb" "$tgt_cdb" "$tgt_pdb"
+done < "$1"
+
+html_footer >> "$HTML_FILE"
+send_email
+exit $OVERALL_STATUS
+
+
+Directory Structure Explanation:
+
+pdb_clone_precheck/
+├── config/
+│   └── precheck.conf        # Environment-specific settings
+├── lib/
+│   ├── precheck_helpers.sh  # Generic helper functions
+│   └── precheck_db_checks.sh # Database-specific checks
+├── bin/
+│   └── precheck_main.sh     # Main executable script
+├── logs/                    # Auto-generated logs
+└── reports/                 # HTML reports
+Usage Instructions:
+
+Set Up Directory Structure:
+
+bash
+mkdir -p pdb_clone_precheck/{config,lib,bin,logs,reports}
+Make Scripts Executable:
+
+bash
+chmod +x bin/precheck_main.sh
+Run the Script:
+
+bash
+cd pdb_clone_precheck
+bin/precheck_main.sh input_file.txt dba@company.com
 ##
+
+
+
 
 db_health_monitor/
 ├── config.sh
