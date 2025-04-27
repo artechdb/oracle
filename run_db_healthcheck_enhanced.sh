@@ -1,3 +1,122 @@
+
+#!/bin/bash
+# Script: recreate_redologs.sh
+# Usage: ./recreate_redologs.sh <input_file>
+
+# Initialize variables
+INPUT_FILE=$1
+LOG_FILE="redo_recreation_$(date +%Y%m%d%H%M%S).log"
+TMP_DIR="/tmp/redo_workdir"
+mkdir -p $TMP_DIR
+
+# Load input parameters
+source $INPUT_FILE || { echo "Error loading input file"; exit 1; }
+
+# Database connection strings
+PRIMARY_CONN="${SYS_USER}/${SYS_PASSWORD}@${DB_NAME}"
+
+# Get standby DB name using dgmgrl
+get_standby_db() {
+  dgmgrl -silent ${PRIMARY_CONN} <<EOF | awk '/Physical standby/{print $1}'
+SHOW CONFIGURATION;
+EXIT;
+EOF
+}
+
+STANDBY_DB=$(get_standby_db)
+STANDBY_CONN="${SYS_USER}/${SYS_PASSWORD}@${STANDBY_DB}"
+
+# Logging function
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a $LOG_FILE
+}
+
+# Function to capture existing groups
+capture_groups() {
+  local conn=$1
+  local type=$2
+  sqlplus -S $conn <<EOF
+SET PAGES 0 FEED OFF HEAD OFF
+SELECT group#||','||thread#||','||'$type' FROM v\$log UNION
+SELECT group#||','||thread#||','||'STANDBY' FROM v\$standby_log;
+EXIT;
+EOF
+}
+
+# Function to create new log groups
+create_new_groups() {
+  local conn=$1
+  local log_type=$2
+  local new_size=$3
+  local thread=$4
+  local count=$5
+  
+  max_group=$(sqlplus -S $conn <<EOF
+SET PAGES 0 FEED OFF HEAD OFF
+SELECT MAX(group#)+1 FROM v\$log UNION SELECT MAX(group#)+1 FROM v\$standby_log;
+EXIT;
+EOF
+)
+  
+  for ((i=1; i<=$count; i++)); do
+    group_num=$((max_group+i-1))
+    if [ "$log_type" = "STANDBY" ]; then
+      sqlplus -S $conn <<EOF
+ALTER DATABASE ADD STANDBY LOGFILE THREAD $thread GROUP $group_num SIZE $new_size;
+EOF
+    else
+      sqlplus -S $conn <<EOF
+ALTER DATABASE ADD LOGFILE THREAD $thread GROUP $group_num SIZE $new_size;
+EOF
+    fi
+  done
+}
+
+# Main execution
+log "Starting redo log recreation process"
+
+# Capture existing groups
+log "Capturing existing groups on primary"
+capture_groups $PRIMARY_CONN PRIMARY > $TMP_DIR/primary_groups.lst
+log "Capturing existing groups on standby"
+capture_groups $STANDBY_CONN STANDBY > $TMP_DIR/standby_groups.lst
+
+# Create new groups on primary
+log "Creating new primary redo logs"
+awk -F, '/PRIMARY/{print $2}' $TMP_DIR/primary_groups.lst | sort -u | while read thread; do
+  count=$(grep ",$thread,PRIMARY" $TMP_DIR/primary_groups.lst | wc -l)
+  create_new_groups $PRIMARY_CONN PRIMARY $NEW_REDO_SIZE $thread $count
+done
+
+# Create new standby logs on standby
+log "Creating new standby redo logs"
+awk -F, '/STANDBY/{print $2}' $TMP_DIR/standby_groups.lst | sort -u | while read thread; do
+  count=$(grep ",$thread,STANDBY" $TMP_DIR/standby_groups.lst | wc -l)
+  create_new_groups $STANDBY_CONN STANDBY $NEW_STANDBY_REDO_SIZE $thread $count
+done
+
+# Switch logs and wait for old groups to become inactive
+log "Forcing log switches on primary"
+for i in {1..10}; do
+  sqlplus -S $PRIMARY_CONN <<EOF
+ALTER SYSTEM ARCHIVE LOG CURRENT;
+EOF
+  sleep 10
+done
+
+# Drop old groups
+log "Dropping old groups"
+for db in PRIMARY STANDBY; do
+  conn=$([ "$db" = "PRIMARY" ] && echo $PRIMARY_CONN || echo $STANDBY_CONN)
+  grep "^[0-9]*,.*,$db" $TMP_DIR/${db,,}_groups.lst | cut -d',' -f1 | while read group; do
+    sqlplus -S $conn <<EOF
+ALTER DATABASE DROP LOGFILE GROUP $group;
+EOF
+  done
+done
+
+log "Process completed successfully. Please verify log file: $LOG_FILE"
+exit 0
 ## pre-check
 #!/bin/bash
 # Refreshable PDB Clone Precheck Script
