@@ -1,4 +1,122 @@
+#!/bin/bash
 
+# Configuration
+REPORT_FILE="firewall_report.html"
+EMAIL_FROM="dba@example.com"
+EMAIL_TO="admin@example.com"
+EMAIL_SUBJECT="Firewall Policy Validation Report"
+TNS_FILE="${1}"
+
+# Check if tnsnames.ora file is provided
+if [ -z "${TNS_FILE}" ] || [ ! -f "${TNS_FILE}" ]; then
+    echo "Usage: $0 <tnsnames.ora_file>"
+    echo "Please provide valid tnsnames.ora file path"
+    exit 1
+fi
+
+# Check for dependencies
+command -v nc >/dev/null 2>&1 || { echo "netcat (nc) is required but not installed. Aborting."; exit 1; }
+
+# Initialize HTML report
+initialize_report() {
+    cat << EOF > "${REPORT_FILE}"
+<html>
+<head>
+    <title>Firewall Policy Validation Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        table { border-collapse: collapse; width: 50%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .success { background-color: #90EE90; }
+        .failure { background-color: #FFB6C1; }
+    </style>
+</head>
+<body>
+    <h2>Firewall Policy Validation Report</h2>
+    <p>Generated at: $(date)</p>
+    <table>
+        <tr>
+            <th>Hostname</th>
+            <th>Port 1521 Status</th>
+        </tr>
+EOF
+}
+
+# Extract hosts from tnsnames.ora
+extract_hosts() {
+    grep -iE 'HOST\s*=\s*' "${TNS_FILE}" | \
+    awk -F'=' '{print $2}' | \
+    awk '{gsub(/^[ \t]+|[ \t]+$/, ""); print}' | \
+    sort -u
+}
+
+# Test port function
+test_port() {
+    host=$1
+    port=1521
+    timeout 3 nc -zv "${host}" "${port}" > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        echo "success"
+    else
+        echo "failure"
+    fi
+}
+
+# Complete HTML report
+finalize_report() {
+    cat << EOF >> "${REPORT_FILE}"
+    </table>
+</body>
+</html>
+EOF
+}
+
+# Email function
+send_email() {
+    local report_size=$(du -b "${REPORT_FILE}" | awk '{print $1}')
+    
+    if [ "${report_size}" -lt 1048576 ]; then
+        # Send HTML content in body
+        mailx -s "${EMAIL_SUBJECT}" -a "Content-type: text/html" -r "${EMAIL_FROM}" "${EMAIL_TO}" < "${REPORT_FILE}"
+    else
+        # Send as attachment
+        echo "Please find attached the firewall validation report" | \
+        mailx -s "${EMAIL_SUBJECT}" -a "${REPORT_FILE}" -r "${EMAIL_FROM}" "${EMAIL_TO}"
+    fi
+}
+
+# Main execution
+initialize_report
+
+while read -r host; do
+    status=$(test_port "${host}")
+    
+    if [ "${status}" = "success" ]; then
+        class="success"
+        status_text="Open"
+    else
+        class="failure"
+        status_text="Closed"
+    fi
+    
+    echo "Processing host: ${host} - Status: ${status_text}"
+    
+    cat << EOF >> "${REPORT_FILE}"
+        <tr>
+            <td>${host}</td>
+            <td class="${class}">${status_text}</td>
+        </tr>
+EOF
+done < <(extract_hosts)
+
+finalize_report
+
+# Send email
+send_email
+
+echo "Report generated: ${REPORT_FILE}"
+##
 #!/bin/bash
 # Script: recreate_redologs.sh
 # Usage: ./recreate_redologs.sh <input_file>
