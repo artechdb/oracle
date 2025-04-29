@@ -1,3 +1,105 @@
+
+# standby_create_driver.sh
+
+#!/bin/bash
+
+set -euo pipefail
+
+# Load configuration and functions
+source ./standby_create.conf
+source ./functions_standby_rac.sh
+
+log "Starting Standby Creation Process"
+
+# Step 1: Perform pre-checks
+precheck_standby_environment
+
+# Step 2: Create required adump directories dynamically for each host
+create_required_directories_standby "$STANDBY_DB_UNIQUE_NAME"
+
+# Step 3: Check for Password File
+check_password_file
+
+# Step 4: Validate RMAN Connections
+validate_rman_connections "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME"
+
+# Step 5: Prepare and start RMAN DUPLICATE in nohup
+log "Preparing RMAN DUPLICATE command for Standby creation."
+
+cat > duplicate_standby.rman <<EOF
+CONNECT TARGET sys/$SYS_PASS@$PRIMARY_DB_CONN
+CONNECT AUXILIARY sys/$SYS_PASS@$STANDBY_DB_NAME
+
+DUPLICATE TARGET DATABASE
+  FOR STANDBY
+  FROM ACTIVE DATABASE
+  DORECOVER
+  SPFILE
+  SET DB_UNIQUE_NAME='$STANDBY_DB_UNIQUE_NAME'
+  SET CLUSTER_DATABASE='${IS_RAC,,}'
+  SET LOG_FILE_NAME_CONVERT='$PRIMARY_REDO_PATH','$ASM_DISKGROUP_REDO'
+  SET DB_FILE_NAME_CONVERT='$PRIMARY_DATAFILE_PATH','$ASM_DISKGROUP_DATA'
+  NOFILENAMECHECK;
+EXIT;
+EOF
+
+log "Starting RMAN DUPLICATE in background using nohup..."
+nohup rman cmdfile=duplicate_standby.rman log=duplicate_standby.log &
+RMAN_PID=$!
+
+log "Waiting for RMAN process (PID=$RMAN_PID) to finish..."
+wait $RMAN_PID || true
+
+# Step 6: Check completion and send email notification
+STATUS=$(check_rman_duplicate_completion duplicate_standby.log)
+send_email_notification duplicate_standby.log "$STATUS" "$EMAIL_TO"
+
+if [ "$STATUS" != "SUCCESS" ]; then
+  log "RMAN duplicate failed. Exiting."
+  exit 1
+fi
+
+# Step 7: Add standby database and start it to mount stage
+add_and_start_standby_database "$STANDBY_DB_NAME" "$STANDBY_DB_UNIQUE_NAME" "$ORACLE_HOME" "$PRIMARY_REDO_PATH" "$ASM_DISKGROUP_REDO"
+
+# Step 8: Create redo and standby redo logs
+create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP_REDO"
+
+# Step 9: Start MRP process
+start_mrp_via_dgmgrl
+
+# Step 10: Check Data Guard sync status
+check_dg_sync_status
+
+# Step 11: Post Steps Reminder
+log "Post Steps Reminder:"
+echo "- Verify all instances registered correctly with srvctl if RAC."
+echo "- Data Guard sync status already validated."
+
+log "Standby Creation Process Completed Successfully"
+
+##
+check_dg_sync_status() {
+  log "Checking Data Guard Broker Configuration Status..."
+
+  dgmgrl sys/$SYS_PASS@$PRIMARY_DB_CONN <<EOF > /tmp/dg_check.log
+SHOW CONFIGURATION;
+SHOW DATABASE "$STANDBY_DB_UNIQUE_NAME";
+EXIT;
+EOF
+
+  if grep -q "SUCCESS" /tmp/dg_check.log && grep -q "APPLY-ON" /tmp/dg_check.log; then
+    log "Data Guard configuration is healthy and Standby is in APPLY-ON mode."
+  else
+    log "ERROR: Data Guard is not healthy or Standby not applying redo."
+    log "Please review /tmp/dg_check.log for details."
+    cat /tmp/dg_check.log
+    exit 1
+  fi
+}
+
+###
+
 #!/bin/bash
 # File: lib/dg_manager.sh
 CONFIG_FILE="dg_config.cfg"
