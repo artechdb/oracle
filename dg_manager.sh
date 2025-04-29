@@ -1,3 +1,16 @@
+
+it includes everything:
+
+generate_standby_conf.sh
+
+standby_create.conf (template/generated)
+
+functions_standby_rac.sh
+
+standby_create_driver.sh
+
+README_standby_create.md
+################################
 echo "Select Standby Mode:"
 echo "1) Single Instance Standby"
 echo "2) RAC Standby (Multi-Instance)"
