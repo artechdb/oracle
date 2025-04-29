@@ -1,3 +1,92 @@
+echo "Select Health Check Mode:"
+echo "1) Single Database"
+echo "2) Multiple Databases"
+read -rp "Enter choice [1-2]: " check_mode
+
+if [ "$check_mode" == "1" ]; then
+  read -rp "Enter Database Connection String (e.g., sys/password@db1 as sysdba): " DB_CONN
+  rac_db_health_check_html "$DB_CONN" "healthcheck_single.html"
+  send_healthcheck_email "healthcheck_single.html" "$EMAIL_TO"
+else
+  echo "Enter Database Connection Strings (space separated):"
+  read -a DB_CONN_ARRAY
+
+  for db_conn in "${DB_CONN_ARRAY[@]}"; do
+    OUTPUT_FILE="healthcheck_${db_conn//[^a-zA-Z0-9]/_}.html"
+    rac_db_health_check_html "$db_conn" "$OUTPUT_FILE"
+    send_healthcheck_email "$OUTPUT_FILE" "$EMAIL_TO"
+  done
+fi
+
+##
+SUMMARY_FILE="/tmp/healthcheck_summary.html"
+echo "<html><body><h2>RAC Database Health Check Summary</h2><table border='1'>" > "$SUMMARY_FILE"
+echo "<tr><th>Database Connection</th><th>Status</th></tr>" >> "$SUMMARY_FILE"
+
+for db_conn in "${DB_CONN_ARRAY[@]}"; do
+  OUTPUT_FILE="/tmp/healthcheck_${db_conn//[^a-zA-Z0-9]/_}.html"
+  rac_db_health_check_html "$db_conn" "$OUTPUT_FILE"
+  
+  if grep -q "<h2>" "$OUTPUT_FILE"; then
+    STATUS_COLOR="green"
+    STATUS_TEXT="GREEN"
+  else
+    STATUS_COLOR="red"
+    STATUS_TEXT="RED"
+  fi
+
+  echo "<tr><td>$db_conn</td><td style='color:$STATUS_COLOR;'>$STATUS_TEXT</td></tr>" >> "$SUMMARY_FILE"
+done
+
+echo "</table></body></html>" >> "$SUMMARY_FILE"
+
+# Send the summary email
+send_healthcheck_email "$SUMMARY_FILE" "$EMAIL_TO"
+##
+
+
+rac_db_health_check_html() {
+  local CONN="$1"
+  local HTML_OUTFILE="$2"
+
+  echo "Generating RAC DB Health Check Report (HTML) for $CONN"
+
+  sqlplus -s /nolog <<EOF
+CONNECT $CONN
+SET PAGESIZE 500
+SET MARKUP HTML ON SPOOL ON PREFORMAT OFF ENTMAP OFF
+SPOOL $HTML_OUTFILE
+
+PROMPT <h2>Instance Status</h2>
+SELECT inst_id, instance_name, host_name, status FROM gv\$instance ORDER BY inst_id;
+
+PROMPT <h2>Global Enqueue Waits</h2>
+SELECT inst_id, resource_name, request_reason, count FROM gv\$ges_enqueue ORDER BY count DESC FETCH FIRST 5 ROWS ONLY;
+
+PROMPT <h2>Cache Fusion Current Block Latency</h2>
+SELECT inst_id, event, total_waits, time_waited FROM gv\$session_wait WHERE event LIKE '%gc current block%' ORDER BY time_waited DESC FETCH FIRST 5 ROWS ONLY;
+
+PROMPT <h2>Interconnect Traffic (Blocks Received)</h2>
+SELECT inst_id, name, value FROM gv\$sysstat WHERE name = 'gc cr blocks received' ORDER BY inst_id;
+
+PROMPT <h2>Top Wait Classes</h2>
+SELECT inst_id, wait_class, total_waits FROM gv\$session_wait_class ORDER BY total_waits DESC FETCH FIRST 5 ROWS ONLY;
+
+PROMPT <h2>Top System Events</h2>
+SELECT inst_id, event, total_waits, time_waited FROM gv\$system_event WHERE total_waits > 0 ORDER BY time_waited DESC FETCH FIRST 5 ROWS ONLY;
+
+PROMPT <h2>Buffer Cache Hit Ratio</h2>
+SELECT name, value FROM v\$sysstat WHERE name IN ('physical reads', 'db block gets', 'consistent gets');
+
+PROMPT <h2>Global Cache Efficiency</h2>
+SELECT inst_id, name, value FROM gv\$sysstat WHERE name IN ('gc cr block receive time', 'gc current block receive time') ORDER BY inst_id;
+
+SPOOL OFF
+EXIT;
+EOF
+}
+
+
 #!/bin/bash
 # Basic RAC Health Check Functions
 
@@ -110,6 +199,28 @@ EOF
 }
 
 ###
+echo "Select Health Check Mode:"
+echo "1) Single Database"
+echo "2) Multiple Databases"
+read -rp "Enter choice [1-2]: " check_mode
+
+if [ "$check_mode" == "1" ]; then
+  read -rp "Enter Database Connection String (e.g., sys/password@db1 as sysdba): " DB_CONN
+  rac_db_health_check_html "$DB_CONN" "healthcheck_single.html"
+  send_healthcheck_email "healthcheck_single.html" "$EMAIL_TO"
+else
+  echo "Enter Database Connection Strings (space separated):"
+  read -a DB_CONN_ARRAY
+
+  for db_conn in "${DB_CONN_ARRAY[@]}"; do
+    OUTPUT_FILE="healthcheck_${db_conn//[^a-zA-Z0-9]/_}.html"
+    rac_db_health_check_html "$db_conn" "$OUTPUT_FILE"
+    send_healthcheck_email "$OUTPUT_FILE" "$EMAIL_TO"
+  done
+fi
+
+##
+
 #!/bin/bash
 
 # Load functions
