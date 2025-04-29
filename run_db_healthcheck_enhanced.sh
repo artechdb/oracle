@@ -1,4 +1,92 @@
 #!/bin/bash
+# Basic RAC Health Check Functions
+
+AAS_5MIN_THRESHOLD=2
+AAS_1HR_THRESHOLD=1.5
+LONG_TXN_THRESHOLD_MINUTES=60
+BLOCKING_SESSION_THRESHOLD_MINUTES=30
+ACTIVE_SESSION_THRESHOLD=30
+
+exec_sqlplus() {
+  local CONN="$1"
+  local SQL="$2"
+  sqlplus -s /nolog <<EOF
+CONNECT $CONN
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+$SQL
+EXIT;
+EOF
+}
+
+check_instance_status() {
+  local CONN="$1"
+  local STATUS
+  STATUS=$(exec_sqlplus "$CONN" "SELECT DISTINCT status FROM gv\$instance;")
+  if [[ "$STATUS" != "OPEN" ]]; then
+    echo "Instance not OPEN: $STATUS"
+    return 1
+  fi
+  return 0
+}
+
+check_ash_load() {
+  local CONN="$1"
+  local AAS_5MIN AAS_1HR
+  AAS_5MIN=$(exec_sqlplus "$CONN" "SELECT ROUND(COUNT(*)/300, 2) FROM gv\$active_session_history WHERE sample_time > SYSDATE - 5/1440;")
+  AAS_1HR=$(exec_sqlplus "$CONN" "SELECT ROUND(COUNT(*)/3600, 2) FROM gv\$active_session_history WHERE sample_time > SYSDATE - 1/24;")
+  if (( $(echo "$AAS_5MIN > $AAS_5MIN_THRESHOLD" | bc -l) )) || (( $(echo "$AAS_1HR > $AAS_1HR_THRESHOLD" | bc -l) )); then
+    echo "High AAS: 5min=$AAS_5MIN, 1hr=$AAS_1HR"
+    return 1
+  fi
+  return 0
+}
+
+check_long_running_txn() {
+  local CONN="$1"
+  local LONG_TXN
+  LONG_TXN=$(exec_sqlplus "$CONN" "SELECT COUNT(*) FROM v\$transaction WHERE (SYSDATE - start_time) * 24 * 60 > $LONG_TXN_THRESHOLD_MINUTES;")
+  if (( LONG_TXN > 0 )); then
+    echo "Detected $LONG_TXN long transactions."
+    return 1
+  fi
+  return 0
+}
+
+check_blocking_sessions() {
+  local CONN="$1"
+  local BLOCKERS
+  BLOCKERS=$(exec_sqlplus "$CONN" "SELECT COUNT(*) FROM gv\$session WHERE blocking_session IS NOT NULL AND (LAST_CALL_ET/60) > $BLOCKING_SESSION_THRESHOLD_MINUTES;")
+  if (( BLOCKERS > 0 )); then
+    echo "Detected $BLOCKERS blocking sessions."
+    return 1
+  fi
+  return 0
+}
+
+check_active_sessions() {
+  local CONN="$1"
+  local ACTIVE_SESS
+  ACTIVE_SESS=$(exec_sqlplus "$CONN" "SELECT COUNT(*) FROM gv\$session WHERE status = 'ACTIVE' AND type = 'USER';")
+  if (( ACTIVE_SESS > ACTIVE_SESSION_THRESHOLD )); then
+    echo "High active session count: $ACTIVE_SESS"
+    return 1
+  fi
+  return 0
+}
+
+check_recent_critical_errors() {
+  local CONN="$1"
+  local ERRORS
+  ERRORS=$(exec_sqlplus "$CONN" "SELECT message_text FROM gv\$diag_alert_ext WHERE originating_timestamp > SYSTIMESTAMP - INTERVAL '1' HOUR AND message_text LIKE 'ORA-%';")
+  if [[ -n "$ERRORS" ]]; then
+    echo "Critical ORA errors found."
+    return 1
+  fi
+  return 0
+}
+###
+#!/bin/bash
 
 # Load functions
 source ./functions_health_check.sh
