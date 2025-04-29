@@ -1,3 +1,158 @@
+
+#!/bin/bash
+
+set -euo pipefail
+
+# Load configuration and functions
+source ./standby_create.conf
+
+# Perform Precheck
+precheck_standby_environment
+
+# Create required directories on both standby nodes
+create_required_directories_standby "$STANDBY_HOST1" "$STANDBY_HOST2" "$STANDBY_DB_UNIQUE_NAME"
+
+# Startup NOMOUNT standby instance manually (assumed done externally if using RAC)
+
+# RMAN DUPLICATE FOR STANDBY (Manual step assumed or can be scripted separately)
+
+# After RMAN duplication and spfile adjustments, create redo and standby redo logs
+create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP"
+
+# Post-configuration instructions
+cat <<EOF
+
+##########################################
+# Post Steps
+##########################################
+- Ensure RMAN DUPLICATE completed successfully.
+- Verify the RAC standby database is registered with SRVCTL.
+- Register standby database into Data Guard Broker:
+  dgmgrl sys/\$SYS_PASS@\$PRIMARY_DB_CONN
+  ADD DATABASE '$STANDBY_DB_UNIQUE_NAME' AS CONNECT IDENTIFIER IS '$STANDBY_DB_NAME' MAINTAINED AS PHYSICAL;
+  ENABLE DATABASE '$STANDBY_DB_UNIQUE_NAME';
+- Start Managed Recovery:
+  dgmgrl> EDIT DATABASE '$STANDBY_DB_UNIQUE_NAME' SET STATE='APPLY-ON';
+
+EOF
+
+exit 0
+##
+# functions_standby_rac.sh
+
+set -euo pipefail
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+exec_sqlplus() {
+  local CONN="$1"
+  local SQL="$2"
+  sqlplus -s /nolog <<EOF
+CONNECT $CONN
+SET HEAD OFF FEEDBACK OFF PAGES 0 VERIFY OFF
+WHENEVER SQLERROR EXIT SQL.SQLCODE;
+$SQL
+EXIT;
+EOF
+}
+
+precheck_standby_environment() {
+  log "Performing Pre-checks..."
+
+  log "Checking connectivity to Primary Database..."
+  if ! echo "exit" | sqlplus -s sys/$SYS_PASS@$PRIMARY_DB_CONN as sysdba >/dev/null; then
+    log "ERROR: Cannot connect to Primary Database ($PRIMARY_DB_CONN). Exiting."
+    exit 1
+  fi
+
+  log "Checking connectivity to Standby Node1 ($STANDBY_HOST1)..."
+  if ! ping -c 2 "$STANDBY_HOST1" >/dev/null; then
+    log "ERROR: Cannot ping Standby Node1 ($STANDBY_HOST1). Exiting."
+    exit 1
+  fi
+
+  log "Checking connectivity to Standby Node2 ($STANDBY_HOST2)..."
+  if ! ping -c 2 "$STANDBY_HOST2" >/dev/null; then
+    log "ERROR: Cannot ping Standby Node2 ($STANDBY_HOST2). Exiting."
+    exit 1
+  fi
+
+  log "Checking ORACLE_HOME exists..."
+  if [ ! -d "$ORACLE_HOME" ]; then
+    log "ERROR: ORACLE_HOME ($ORACLE_HOME) does not exist. Exiting."
+    exit 1
+  fi
+
+  log "Pre-checks completed successfully."
+}
+
+create_required_directories_standby() {
+  local HOST1="$1"
+  local HOST2="$2"
+  local DBNAME="$3"
+
+  log "Creating adump directory on $HOST1"
+  ssh oracle@"$HOST1" bash <<EOF
+mkdir -p /u01/app/oracle/admin/${DBNAME}/adump
+chown -R oracle:oinstall /u01/app/oracle/admin/${DBNAME}/adump
+EOF
+
+  log "Creating adump directory on $HOST2"
+  ssh oracle@"$HOST2" bash <<EOF
+mkdir -p /u01/app/oracle/admin/${DBNAME}/adump
+chown -R oracle:oinstall /u01/app/oracle/admin/${DBNAME}/adump
+EOF
+
+  log "Adump directories created on both nodes."
+}
+
+create_all_logs_from_primary_info() {
+  local PRIMARY_CONN="$1"
+  local STANDBY_SID="$2"
+  local ASM_DISKGROUP="$3"
+
+  export ORACLE_SID="$STANDBY_SID"
+
+  log "Fetching redo size from Primary Database."
+  local REDO_SIZE_MB=$(exec_sqlplus "$PRIMARY_CONN" "SELECT bytes/1024/1024 FROM v\$log WHERE rownum = 1;" | xargs)
+
+  log "Fetching redo group counts per thread from Primary."
+  local THREAD_COUNTS=$(exec_sqlplus "$PRIMARY_CONN" "SELECT thread#||':'||COUNT(group#) FROM v\$log GROUP BY thread#;" | xargs)
+
+  for entry in $THREAD_COUNTS; do
+    local thread=$(echo "$entry" | cut -d':' -f1)
+    local redo_count=$(echo "$entry" | cut -d':' -f2)
+
+    log "Creating Redo Logs for Thread $thread"
+    for ((i=1; i<=redo_count; i++)); do
+      sqlplus -s / as sysdba <<EOF
+ALTER DATABASE ADD LOGFILE THREAD $thread ('$ASM_DISKGROUP/$STANDBY_SID/ONLINELOG/redo_t${thread}_g${i}.log') SIZE ${REDO_SIZE_MB}M;
+EXIT;
+EOF
+    done
+
+    log "Creating Standby Redo Logs for Thread $thread"
+    standby_count=$((redo_count + 1))
+    for ((i=1; i<=standby_count; i++)); do
+      sqlplus -s / as sysdba <<EOF
+ALTER DATABASE ADD STANDBY LOGFILE THREAD $thread ('$ASM_DISKGROUP/$STANDBY_SID/STANDBYLOG/standby_t${thread}_g${i}.log') SIZE ${REDO_SIZE_MB}M;
+EXIT;
+EOF
+    done
+  done
+
+  log "Redo and Standby Redo Logs created successfully."
+}
+
+################################
+File	Purpose
+standby_create.conf	Configuration variables (primary, standby, paths, ASM, SYS password)
+functions_standby_rac.sh	Functions (precheck, directory creation, redo/standby redo setup)
+standby_create_driver.sh	Main driver script (load config + functions + step execution)
+
+#################################
 create_required_directories_standby() {
   local DBNAME="$1"
 
