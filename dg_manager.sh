@@ -1,3 +1,491 @@
+create_required_directories_standby() {
+  local DBNAME="$1"
+
+  for host in "${STANDBY_HOSTS[@]}"; do
+    log "Creating adump directory on $host"
+    ssh oracle@"$host" bash <<EOF
+mkdir -p /u01/app/oracle/admin/${DBNAME}/adump
+chown -R oracle:oinstall /u01/app/oracle/admin/${DBNAME}/adump
+EOF
+  done
+
+  log "Adump directories created on all standby nodes."
+}
+create_single_standby() {
+  precheck_standby_environment
+  create_required_directories_standby "$STANDBY_HOST1" "$STANDBY_HOST1" "$STANDBY_DB_UNIQUE_NAME"
+  
+  start_rman_duplicate
+
+  STATUS=$(check_rman_duplicate_completion duplicate_standby.log)
+  send_email_notification duplicate_standby.log "$STATUS" "$EMAIL_TO"
+
+  if [ "$STATUS" != "SUCCESS" ]; then
+    log "RMAN duplicate failed for single standby. Exiting."
+    exit 1
+  fi
+
+  create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP"
+}
+create_multiple_standby() {
+  # You may loop over multiple standby DB names/hosts loaded from a file or array
+  for standby in "${STANDBY_LIST[@]}"; do
+    log "Starting creation for Standby Database: $standby"
+
+    # Adjust STANDBY_DB_NAME etc dynamically here
+    # (Load from file, or input parameters)
+
+    precheck_standby_environment
+    create_required_directories_standby "$STANDBY_HOST1" "$STANDBY_HOST2" "$STANDBY_DB_UNIQUE_NAME"
+
+    start_rman_duplicate
+
+    STATUS=$(check_rman_duplicate_completion duplicate_standby.log)
+    send_email_notification duplicate_standby.log "$STATUS" "$EMAIL_TO"
+
+    if [ "$STATUS" != "SUCCESS" ]; then
+      log "RMAN duplicate failed for standby $standby. Exiting."
+      exit 1
+    fi
+
+    create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP"
+  done
+}
+create_single_standby() {
+  precheck_standby_environment
+  create_required_directories_standby "$STANDBY_HOST1" "$STANDBY_HOST2" "$STANDBY_DB_UNIQUE_NAME"
+  
+  start_rman_duplicate
+
+  STATUS=$(check_rman_duplicate_completion duplicate_standby.log)
+  send_email_notification duplicate_standby.log "$STATUS" "$EMAIL_TO"
+
+  if [ "$STATUS" != "SUCCESS" ]; then
+    log "RMAN duplicate failed for single standby. Exiting."
+    exit 1
+  fi
+
+  create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP"
+}
+log "Please select standby creation mode:"
+echo "1) Single Standby Database"
+echo "2) Multiple Standby Databases"
+read -rp "Enter your choice [1-2]: " standby_choice
+
+case "$standby_choice" in
+  1)
+    log "Single Standby Database creation selected."
+    create_single_standby
+    ;;
+  2)
+    log "Multiple Standby Databases creation selected."
+    create_multiple_standby
+    ;;
+  *)
+    echo "Invalid selection. Exiting."
+    exit 1
+    ;;
+esac
+# After starting RMAN nohup
+log "Waiting for RMAN duplicate to complete..."
+wait
+
+log "Checking RMAN duplicate completion..."
+STATUS=$(check_rman_duplicate_completion duplicate_standby.log)
+
+log "Sending email notification..."
+send_email_notification duplicate_standby.log "$STATUS" "DBA@example.com"
+
+if [ "$STATUS" = "SUCCESS" ]; then
+  log "RMAN duplicate completed successfully. Proceeding to redo creation."
+  create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP"
+else
+  log "RMAN duplicate failed. Please check duplicate_standby.log manually."
+  exit 1
+fi
+send_email_notification() {
+  local LOGFILE=$1
+  local STATUS=$2
+  local MAIL_TO=$3
+  local SUBJECT="Standby RAC RMAN DUPLICATE - $STATUS"
+
+  if [ -s "$LOGFILE" ]; then
+    if [ $(stat -c%s "$LOGFILE") -lt 1000000 ]; then
+      # If file size <1MB, send content in email
+      mailx -s "$SUBJECT" "$MAIL_TO" < "$LOGFILE"
+    else
+      # If file size >=1MB, attach the file
+      uuencode "$LOGFILE" "$LOGFILE" | mailx -s "$SUBJECT" "$MAIL_TO"
+    fi
+  fi
+}
+check_rman_duplicate_completion() {
+  local LOGFILE=$1
+
+  if grep -q "Finished Duplicate Db" "$LOGFILE"; then
+    echo "SUCCESS"
+  else
+    echo "FAILURE"
+  fi
+}
+log "Preparing RMAN DUPLICATE command for Standby creation."
+
+# Create RMAN command file
+cat > duplicate_standby.rman <<EOF
+CONNECT TARGET sys/$SYS_PASS@$PRIMARY_DB_CONN
+CONNECT AUXILIARY sys/$SYS_PASS@$STANDBY_DB_NAME
+
+DUPLICATE TARGET DATABASE
+  FOR STANDBY
+  FROM ACTIVE DATABASE
+  DORECOVER
+  SPFILE
+  SET DB_UNIQUE_NAME='$STANDBY_DB_UNIQUE_NAME'
+  SET CLUSTER_DATABASE='true'
+  SET LOG_FILE_NAME_CONVERT='$PRIMARY_REDO_PATH','$STANDBY_REDO_PATH'
+  SET DB_FILE_NAME_CONVERT='$PRIMARY_DATAFILE_PATH','$STANDBY_DATAFILE_PATH'
+  NOFILENAMECHECK;
+EXIT;
+EOF
+
+# Run RMAN DUPLICATE in nohup
+log "Starting RMAN DUPLICATE in nohup mode..."
+nohup rman cmdfile=duplicate_standby.rman log=duplicate_standby.log &
+
+log "RMAN DUPLICATE started. Monitor progress with: tail -f duplicate_standby.log"
+# functions_standby_rac.sh
+
+set -euo pipefail
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+exec_sqlplus() {
+  local CONN="$1"
+  local SQL="$2"
+  sqlplus -s /nolog <<EOF
+CONNECT $CONN
+SET HEAD OFF FEEDBACK OFF PAGES 0 VERIFY OFF
+WHENEVER SQLERROR EXIT SQL.SQLCODE;
+$SQL
+EXIT;
+EOF
+}
+
+precheck_standby_environment() {
+  log "Performing Pre-checks..."
+
+  log "Checking connectivity to Primary Database..."
+  if ! echo "exit" | sqlplus -s sys/$SYS_PASS@$PRIMARY_DB_CONN as sysdba >/dev/null; then
+    log "ERROR: Cannot connect to Primary Database ($PRIMARY_DB_CONN). Exiting."
+    exit 1
+  fi
+
+  log "Checking connectivity to Standby Node1 ($STANDBY_HOST1)..."
+  if ! ping -c 2 "$STANDBY_HOST1" >/dev/null; then
+    log "ERROR: Cannot ping Standby Node1 ($STANDBY_HOST1). Exiting."
+    exit 1
+  fi
+
+  log "Checking connectivity to Standby Node2 ($STANDBY_HOST2)..."
+  if ! ping -c 2 "$STANDBY_HOST2" >/dev/null; then
+    log "ERROR: Cannot ping Standby Node2 ($STANDBY_HOST2). Exiting."
+    exit 1
+  fi
+
+  log "Checking ORACLE_HOME exists..."
+  if [ ! -d "$ORACLE_HOME" ]; then
+    log "ERROR: ORACLE_HOME ($ORACLE_HOME) does not exist. Exiting."
+    exit 1
+  fi
+
+  log "Pre-checks completed successfully."
+}
+
+create_required_directories_standby() {
+  local HOST1="$1"
+  local HOST2="$2"
+  local DBNAME="$3"
+
+  log "Creating adump directory on $HOST1"
+  ssh oracle@"$HOST1" bash <<EOF
+mkdir -p /u01/app/oracle/admin/${DBNAME}/adump
+chown -R oracle:oinstall /u01/app/oracle/admin/${DBNAME}/adump
+EOF
+
+  log "Creating adump directory on $HOST2"
+  ssh oracle@"$HOST2" bash <<EOF
+mkdir -p /u01/app/oracle/admin/${DBNAME}/adump
+chown -R oracle:oinstall /u01/app/oracle/admin/${DBNAME}/adump
+EOF
+
+  log "Adump directories created on both nodes."
+}
+
+create_all_logs_from_primary_info() {
+  local PRIMARY_CONN="$1"
+  local STANDBY_SID="$2"
+  local ASM_DISKGROUP="$3"
+
+  export ORACLE_SID="$STANDBY_SID"
+
+  log "Fetching redo size from Primary Database."
+  local REDO_SIZE_MB=$(exec_sqlplus "$PRIMARY_CONN" "SELECT bytes/1024/1024 FROM v\$log WHERE rownum = 1;" | xargs)
+
+  log "Fetching redo group counts per thread from Primary."
+  local THREAD_COUNTS=$(exec_sqlplus "$PRIMARY_CONN" "SELECT thread#||':'||COUNT(group#) FROM v\$log GROUP BY thread#;" | xargs)
+
+  for entry in $THREAD_COUNTS; do
+    local thread=$(echo "$entry" | cut -d':' -f1)
+    local redo_count=$(echo "$entry" | cut -d':' -f2)
+
+    log "Creating Redo Logs for Thread $thread"
+    for ((i=1; i<=redo_count; i++)); do
+      sqlplus -s / as sysdba <<EOF
+ALTER DATABASE ADD LOGFILE THREAD $thread ('$ASM_DISKGROUP/$STANDBY_SID/ONLINELOG/redo_t${thread}_g${i}.log') SIZE ${REDO_SIZE_MB}M;
+EXIT;
+EOF
+    done
+
+    log "Creating Standby Redo Logs for Thread $thread"
+    standby_count=$((redo_count + 1))
+    for ((i=1; i<=standby_count; i++)); do
+      sqlplus -s / as sysdba <<EOF
+ALTER DATABASE ADD STANDBY LOGFILE THREAD $thread ('$ASM_DISKGROUP/$STANDBY_SID/STANDBYLOG/standby_t${thread}_g${i}.log') SIZE ${REDO_SIZE_MB}M;
+EXIT;
+EOF
+    done
+  done
+
+  log "Redo and Standby Redo Logs created successfully."
+}
+
+start_mrp_via_dgmgrl() {
+  log "Starting MRP via Data Guard Broker (dgmgrl)..."
+  dgmgrl sys/$SYS_PASS@$PRIMARY_DB_CONN <<EOF
+EDIT DATABASE "$STANDBY_DB_UNIQUE_NAME" SET STATE='APPLY-ON';
+EXIT;
+EOF
+}
+
+add_and_start_standby_database() {
+  local DBNAME="$1"
+  local DBUNIQUE="$2"
+  local ORACLE_HOME_PATH="$3"
+  local PRIMARY_REDO_PATH="$4"
+  local ASM_DISKGROUP_REDO="$5"
+
+  log "Adding Standby database into srvctl registry..."
+
+  srvctl add database \
+    -d "$DBUNIQUE" \
+    -o "$ORACLE_HOME_PATH" \
+    -p "$ORACLE_HOME_PATH/dbs/spfile${DBNAME}.ora" \
+    -r PHYSICAL_STANDBY \
+    -s MOUNT \
+    -t "$PRIMARY_REDO_PATH","$ASM_DISKGROUP_REDO"
+
+  log "Starting Standby database into mount stage..."
+  srvctl start database -d "$DBUNIQUE" -o mount
+}
+
+###
+validate_rman_connections() {
+  local PRIMARY_CONN="$1"
+  local STANDBY_CONN="$2"
+
+  echo "Validating RMAN connection to Primary Database ($PRIMARY_CONN)..."
+  rman target sys/$SYS_PASS@$PRIMARY_CONN auxiliary / <<EOF
+exit
+EOF
+  if [ $? -ne 0 ]; then
+    echo "ERROR: RMAN connection to Primary failed."
+    exit 1
+  fi
+
+  echo "Validating RMAN connection to Standby Database ($STANDBY_CONN)..."
+  rman target / auxiliary sys/$SYS_PASS@$STANDBY_CONN <<EOF
+exit
+EOF
+  if [ $? -ne 0 ]; then
+    echo "ERROR: RMAN connection to Standby failed."
+    exit 1
+  fi
+
+  echo "RMAN connection validation successful."
+}
+echo "Select Standby Mode:"
+echo "1) Single Instance Standby"
+echo "2) RAC Standby (Multi-Instance)"
+read -rp "Enter choice [1-2]: " mode_choice
+
+if [ "$mode_choice" == "1" ]; then
+    IS_RAC=false
+else
+    IS_RAC=true
+fi
+
+read -rp "Enter Primary Database Hostname: " PRIMARY_HOST
+read -rp "Enter Primary Database Name (SID): " PRIMARY_DB_NAME
+read -rp "Enter Primary TNS Connection Name: " PRIMARY_DB_CONN
+
+read -rp "Enter Standby Database Name (SID): " STANDBY_DB_NAME
+read -rp "Enter Standby Database Unique Name: " STANDBY_DB_UNIQUE_NAME
+
+if [ "$IS_RAC" == "true" ]; then
+    echo "Enter Standby Hostnames (space separated): "
+    read -ra STANDBY_HOSTS_ARRAY
+else
+    read -rp "Enter Standby Hostname: " STANDBY_HOST_SINGLE
+    STANDBY_HOSTS_ARRAY=("$STANDBY_HOST_SINGLE")
+fi
+
+read -rp "Enter SYS Password: " SYS_PASS
+
+read -rp "Enter ASM Diskgroup for Datafiles (ex: +DATA01): " ASM_DISKGROUP_DATA
+read -rp "Enter ASM Diskgroup for Redo Logs (ex: +DATA01): " ASM_DISKGROUP_REDO
+check_password_file() {
+  local pwfile="$ORACLE_HOME/dbs/orapw$STANDBY_DB_NAME"
+
+  if [ ! -f "$pwfile" ]; then
+    log "ERROR: Password file $pwfile not found."
+    log "Please manually copy the password file from Primary ASM:"
+    echo "1) Find password file on Primary:"
+    echo "   asmcmd find +DATA01 PROD/pwd*"
+    echo "2) Copy it locally:"
+    echo "   asmcmd cp +DATA01/PROD/PASSWORD/pwdPROD /tmp/orapwPROD"
+    echo "3) SCP to Standby and rename as needed:"
+    echo "   scp /tmp/orapwPROD standbyhost:/tmp/"
+    echo "   mv /tmp/orapwPROD \$ORACLE_HOME/dbs/orapw$STANDBY_DB_NAME"
+    echo "   chown oracle:oinstall \$ORACLE_HOME/dbs/orapw$STANDBY_DB_NAME"
+    echo "   chmod 600 \$ORACLE_HOME/dbs/orapw$STANDBY_DB_NAME"
+    exit 1
+  fi
+
+  log "Password file $pwfile found. Continuing..."
+}
+# standby_create.conf
+
+# Primary Database Info
+PRIMARY_DB_NAME=PROD
+PRIMARY_DB_CONN=PROD_TNS
+
+# Standby Database Info
+STANDBY_DB_NAME=PROD_STBY
+STANDBY_DB_UNIQUE_NAME=PROD_STBY
+# Standby Hosts - Flexible list
+STANDBY_HOSTS=("standbyhost1.example.com" "standbyhost2.example.com")
+STANDBY_PORT=1521
+
+# Oracle Environment
+ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
+SYS_PASS=MySysPassword123
+
+# ASM Diskgroup Paths
+ASM_DISKGROUP_DATA=+DATA01
+ASM_DISKGROUP_REDO=+DATA01
+
+# File Name Conversion (source filesystem if any)
+PRIMARY_REDO_PATH=/u01/oradata/PROD/
+PRIMARY_DATAFILE_PATH=/u01/oradata/PROD/
+
+# Single or RAC Standby
+IS_RAC=true
+
+# Email Notification
+EMAIL_TO=dba@example.com
+
+# Function to validate database connectivity and basic environment
+function precheck_standby_environment() {
+  echo "Performing pre-checks..."
+
+  echo "Checking connectivity to Primary Database..."
+  if ! echo "exit" | sqlplus -s sys/$SYS_PASS@$PRIMARY_DB_CONN as sysdba >/dev/null; then
+    echo "ERROR: Cannot connect to Primary Database ($PRIMARY_DB_CONN). Exiting."
+    exit 1
+  fi
+
+  for host in "${STANDBY_HOSTS[@]}"; do
+    echo "Checking connectivity to Standby Host: $host"
+    if ! ping -c 2 "$host" >/dev/null; then
+      echo "ERROR: Cannot ping Standby Host ($host). Exiting."
+      exit 1
+    fi
+  done
+
+  echo "Checking ORACLE_HOME exists..."
+  if [ ! -d "$ORACLE_HOME" ]; then
+    echo "ERROR: ORACLE_HOME ($ORACLE_HOME) does not exist. Exiting."
+    exit 1
+  fi
+
+  echo "Pre-checks completed successfully."
+}
+
+# Function to create required adump directory on standby hosts
+function create_required_directories_standby() {
+  local DBNAME="$1"
+
+  for host in "${STANDBY_HOSTS[@]}"; do
+    echo "Creating adump directory on $host"
+    ssh oracle@"$host" bash <<EOF
+mkdir -p /u01/app/oracle/admin/${DBNAME}/adump
+chown -R oracle:oinstall /u01/app/oracle/admin/${DBNAME}/adump
+EOF
+  done
+
+  echo "Adump directories created successfully."
+}
+
+# Function to create redo and standby redo logs matching primary using ASM
+function create_all_logs_from_primary_info() {
+  local PRIMARY_CONN="$1"
+  local STANDBY_SID="$2"
+  local ASM_DISKGROUP_REDO="$3"
+
+  export ORACLE_SID="$STANDBY_SID"
+
+  echo "Fetching redo log information from Primary..."
+  PRIMARY_REDO_SIZE_MB=$(sqlplus -s sys/$SYS_PASS@$PRIMARY_DB_CONN as sysdba <<EOF
+SET HEAD OFF FEEDBACK OFF;
+SELECT bytes/1024/1024 FROM v\$log WHERE rownum = 1;
+EXIT;
+EOF
+  | xargs)
+
+  THREAD_REDO_COUNTS=$(sqlplus -s sys/$SYS_PASS@$PRIMARY_DB_CONN as sysdba <<EOF
+SET HEAD OFF FEEDBACK OFF;
+SELECT thread# || ':' || COUNT(group#) FROM v\$log GROUP BY thread#;
+EXIT;
+EOF
+  | xargs)
+
+  for entry in $THREAD_REDO_COUNTS; do
+    thread=$(echo "$entry" | cut -d':' -f1)
+    redo_count=$(echo "$entry" | cut -d':' -f2)
+
+    echo "Creating Redo Logs for Thread $thread"
+    for ((i=1; i<=redo_count; i++)); do
+      sqlplus -s / as sysdba <<EOF
+ALTER DATABASE ADD LOGFILE THREAD $thread ('$ASM_DISKGROUP_REDO/$STANDBY_SID/ONLINELOG/redo_t${thread}_g${i}.log') SIZE ${PRIMARY_REDO_SIZE_MB}M;
+EXIT;
+EOF
+    done
+
+    echo "Creating Standby Redo Logs for Thread $thread"
+    standby_count=$((redo_count + 1))
+    for ((i=1; i<=standby_count; i++)); do
+      sqlplus -s / as sysdba <<EOF
+ALTER DATABASE ADD STANDBY LOGFILE THREAD $thread ('$ASM_DISKGROUP_REDO/$STANDBY_SID/STANDBYLOG/standby_t${thread}_g${i}.log') SIZE ${PRIMARY_REDO_SIZE_MB}M;
+EXIT;
+EOF
+    done
+  done
+
+  echo "Redo and Standby Redo logs created successfully."
+}
+
 
 # standby_create_driver.sh
 
