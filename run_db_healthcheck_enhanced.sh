@@ -85,6 +85,30 @@ check_recent_critical_errors() {
   fi
   return 0
 }
+
+check_recent_critical_errors() {
+  local CONN="$1"
+  local ORA_ERRORS
+
+  ORA_ERRORS=$(sqlplus -s /nolog <<EOF
+CONNECT $CONN
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF
+SELECT message_text
+FROM v\\$diag_alert_ext
+WHERE originating_timestamp > SYSTIMESTAMP - INTERVAL '1' HOUR
+AND message_text LIKE 'ORA-%'
+AND NOT (message_text LIKE '%ORA-00028%' OR message_text LIKE '%ORA-01013%');
+EXIT;
+EOF
+)
+
+  if [ -n "$ORA_ERRORS" ]; then
+    return 1  # Fail if any critical error found
+  fi
+
+  return 0
+}
+
 ###
 #!/bin/bash
 
