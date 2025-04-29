@@ -1,3 +1,142 @@
+echo "Select Standby Mode:"
+echo "1) Single Instance Standby"
+echo "2) RAC Standby (Multi-Instance)"
+read -rp "Enter choice [1-2]: " mode_choice
+
+if [ "$mode_choice" == "1" ]; then
+    IS_RAC=false
+else
+    IS_RAC=true
+fi
+
+read -rp "Enter Primary Database Hostname: " PRIMARY_HOST
+read -rp "Enter Primary Database Name (SID): " PRIMARY_DB_NAME
+read -rp "Enter Primary TNS Connection Name: " PRIMARY_DB_CONN
+
+read -rp "Enter Standby Database Name (SID): " STANDBY_DB_NAME
+read -rp "Enter Standby Database Unique Name: " STANDBY_DB_UNIQUE_NAME
+
+if [ "$IS_RAC" == "true" ]; then
+    echo "Enter Standby Hostnames (space separated): "
+    read -ra STANDBY_HOSTS_ARRAY
+else
+    read -rp "Enter Standby Hostname: " STANDBY_HOST_SINGLE
+    STANDBY_HOSTS_ARRAY=("$STANDBY_HOST_SINGLE")
+fi
+
+read -rp "Enter SYS Password: " SYS_PASS
+
+read -rp "Enter ASM Diskgroup for Datafiles (ex: +DATA01): " ASM_DISKGROUP_DATA
+read -rp "Enter ASM Diskgroup for Redo Logs (ex: +DATA01): " ASM_DISKGROUP_REDO
+
+#########################
+validate_rman_connections() {
+  local PRIMARY_CONN="$1"
+  local STANDBY_CONN="$2"
+
+  echo "Validating RMAN connection to Primary Database ($PRIMARY_CONN)..."
+  rman target sys/$SYS_PASS@$PRIMARY_CONN auxiliary / <<EOF
+exit
+EOF
+  if [ $? -ne 0 ]; then
+    echo "ERROR: RMAN connection to Primary failed."
+    exit 1
+  fi
+
+  echo "Validating RMAN connection to Standby Database ($STANDBY_CONN)..."
+  rman target / auxiliary sys/$SYS_PASS@$STANDBY_CONN <<EOF
+exit
+EOF
+  if [ $? -ne 0 ]; then
+    echo "ERROR: RMAN connection to Standby failed."
+    exit 1
+  fi
+
+  echo "RMAN connection validation successful."
+}
+
+#################
+
+# standby_create_driver.sh
+
+#!/bin/bash
+
+set -euo pipefail
+
+# Load configuration and functions
+source ./standby_create.conf
+source ./functions_standby_rac.sh
+
+log "Starting Standby Creation Process"
+
+# Step 1: Perform pre-checks
+precheck_standby_environment
+
+# Step 2: Create required adump directories dynamically for each host
+create_required_directories_standby "$STANDBY_DB_UNIQUE_NAME"
+
+# Step 3: Check for Password File
+check_password_file
+
+# Step 4: Validate RMAN Connections
+validate_rman_connections "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME"
+
+# Step 5: Prepare and start RMAN DUPLICATE in nohup
+log "Preparing RMAN DUPLICATE command for Standby creation."
+
+cat > duplicate_standby.rman <<EOF
+CONNECT TARGET sys/$SYS_PASS@$PRIMARY_DB_CONN
+CONNECT AUXILIARY sys/$SYS_PASS@$STANDBY_DB_NAME
+
+DUPLICATE TARGET DATABASE
+  FOR STANDBY
+  FROM ACTIVE DATABASE
+  DORECOVER
+  SPFILE
+  SET DB_UNIQUE_NAME='$STANDBY_DB_UNIQUE_NAME'
+  SET CLUSTER_DATABASE='${IS_RAC,,}'
+  SET LOG_FILE_NAME_CONVERT='$PRIMARY_REDO_PATH','$ASM_DISKGROUP_REDO'
+  SET DB_FILE_NAME_CONVERT='$PRIMARY_DATAFILE_PATH','$ASM_DISKGROUP_DATA'
+  NOFILENAMECHECK;
+EXIT;
+EOF
+
+log "Starting RMAN DUPLICATE in background using nohup..."
+nohup rman cmdfile=duplicate_standby.rman log=duplicate_standby.log &
+RMAN_PID=$!
+
+log "Waiting for RMAN process (PID=$RMAN_PID) to finish..."
+wait $RMAN_PID || true
+
+# Step 6: Check completion and send email notification
+STATUS=$(check_rman_duplicate_completion duplicate_standby.log)
+send_email_notification duplicate_standby.log "$STATUS" "$EMAIL_TO"
+
+if [ "$STATUS" != "SUCCESS" ]; then
+  log "RMAN duplicate failed. Exiting."
+  exit 1
+fi
+
+# Step 7: Add standby database and start it to mount stage
+add_and_start_standby_database "$STANDBY_DB_NAME" "$STANDBY_DB_UNIQUE_NAME" "$ORACLE_HOME" "$PRIMARY_REDO_PATH" "$ASM_DISKGROUP_REDO"
+
+# Step 8: Create redo and standby redo logs
+create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP_REDO"
+
+# Step 9: Start MRP process
+start_mrp_via_dgmgrl
+
+# Step 10: Check Data Guard sync status
+check_dg_sync_status
+
+# Step 11: Post Steps Reminder
+log "Post Steps Reminder:"
+echo "- Verify all instances registered correctly with srvctl if RAC."
+echo "- Data Guard sync status already validated."
+
+log "Standby Creation Process Completed Successfully"
+
+#############################
 
 #!/bin/bash
 
@@ -153,6 +292,35 @@ functions_standby_rac.sh	Functions (precheck, directory creation, redo/standby r
 standby_create_driver.sh	Main driver script (load config + functions + step execution)
 
 #################################
+
+log "Preparing RMAN DUPLICATE command for Standby creation."
+
+# Create RMAN command file
+cat > duplicate_standby.rman <<EOF
+CONNECT TARGET sys/$SYS_PASS@$PRIMARY_DB_CONN
+CONNECT AUXILIARY sys/$SYS_PASS@$STANDBY_DB_NAME
+
+DUPLICATE TARGET DATABASE
+  FOR STANDBY
+  FROM ACTIVE DATABASE
+  DORECOVER
+  SPFILE
+  SET DB_UNIQUE_NAME='$STANDBY_DB_UNIQUE_NAME'
+  SET CLUSTER_DATABASE='true'
+  SET LOG_FILE_NAME_CONVERT='$PRIMARY_REDO_PATH','$STANDBY_REDO_PATH'
+  SET DB_FILE_NAME_CONVERT='$PRIMARY_DATAFILE_PATH','$STANDBY_DATAFILE_PATH'
+  NOFILENAMECHECK;
+EXIT;
+EOF
+
+# Run RMAN DUPLICATE in nohup
+log "Starting RMAN DUPLICATE in nohup mode..."
+nohup rman cmdfile=duplicate_standby.rman log=duplicate_standby.log &
+
+log "RMAN DUPLICATE started. Monitor progress with: tail -f duplicate_standby.log"
+
+##############
+
 create_required_directories_standby() {
   local DBNAME="$1"
 
