@@ -19,6 +19,47 @@ else
 fi
 
 ##
+rac_db_health_check() {
+  local CONN="$1"
+
+  echo "Checking RAC Performance Health for connection: $CONN"
+
+  sqlplus -s /nolog <<EOF
+CONNECT $CONN
+SET LINESIZE 200
+SET PAGESIZE 100
+SET FEEDBACK OFF
+SET VERIFY OFF
+
+PROMPT === Instance Status ===
+SELECT inst_id, instance_name, host_name, status FROM gv\$instance ORDER BY inst_id;
+
+PROMPT === Global Enqueue Waits ===
+SELECT inst_id, resource_name, request_reason, count FROM gv\$ges_enqueue ORDER BY count DESC FETCH FIRST 5 ROWS ONLY;
+
+PROMPT === Cache Fusion Current Block Latency ===
+SELECT inst_id, event, total_waits, time_waited FROM gv\$session_wait WHERE event LIKE '%gc current block%' ORDER BY time_waited DESC FETCH FIRST 5 ROWS ONLY;
+
+PROMPT === Interconnect Traffic (Blocks Received) ===
+SELECT inst_id, name, value FROM gv\$sysstat WHERE name = 'gc cr blocks received' ORDER BY inst_id;
+
+PROMPT === Top Wait Classes ===
+SELECT inst_id, wait_class, total_waits FROM gv\$session_wait_class ORDER BY total_waits DESC FETCH FIRST 5 ROWS ONLY;
+
+PROMPT === Top System Events ===
+SELECT inst_id, event, total_waits, time_waited FROM gv\$system_event WHERE total_waits > 0 ORDER BY time_waited DESC FETCH FIRST 5 ROWS ONLY;
+
+PROMPT === Buffer Cache Hit Ratio ===
+SELECT name, value FROM v\$sysstat WHERE name IN ('physical reads', 'db block gets', 'consistent gets');
+
+PROMPT === Global Cache Efficiency ===
+SELECT inst_id, name, value FROM gv\$sysstat WHERE name IN ('gc cr block receive time', 'gc current block receive time') ORDER BY inst_id;
+
+EXIT;
+EOF
+}
+
+###
 SUMMARY_FILE="/tmp/healthcheck_summary.html"
 echo "<html><body><h2>RAC Database Health Check Summary</h2><table border='1'>" > "$SUMMARY_FILE"
 echo "<tr><th>Database Connection</th><th>Status</th></tr>" >> "$SUMMARY_FILE"
