@@ -1,3 +1,90 @@
+#!/bin/bash
+
+# Load functions
+source ./functions_health_check.sh
+source ./functions_health_check_advanced.sh
+
+# Variables
+EMAIL_TO="dba-team@example.com"
+SUMMARY_HTML="/tmp/rac_health_summary.html"
+ZIP_FILE="/tmp/rac_health_results_$(date +%Y%m%d).zip"
+
+# Perform health checks (this part should loop over connections in real script)
+
+generate_summary_html
+package_html_reports "/tmp" "$SUMMARY_HTML"
+send_health_report_email "$EMAIL_TO" "$SUMMARY_HTML" "$ZIP_FILE"
+
+exit 0
+
+##########################################
+# Advanced Health Check Functions
+
+REDO_SWITCH_THRESHOLD_PER_HOUR=50
+TEMP_USAGE_THRESHOLD_MB=2048
+SESSION_CPU_THRESHOLD=5000
+CHILD_CURSOR_THRESHOLD=50
+PARALLEL_SKEW_RATIO=2.0
+
+# (functions like check_redo_log_switch_rate, check_temp_usage, etc. are here...)
+
+package_html_reports() {
+  local REPORT_DIR="$1"
+  local SUMMARY_FILE="$2"
+  local DATE_TAG
+  DATE_TAG=$(date +%Y%m%d)
+  local ZIP_NAME="rac_health_results_${DATE_TAG}.zip"
+
+  echo "Packaging all reports into: $ZIP_NAME"
+
+  if [[ ! -f "$SUMMARY_FILE" ]]; then
+    echo "Summary HTML not found: $SUMMARY_FILE"
+    return 1
+  fi
+
+  local REPORTS=("$SUMMARY_FILE" "$REPORT_DIR"/db_*.html)
+
+  zip -j "/tmp/$ZIP_NAME" "${REPORTS[@]}" >/dev/null
+
+  if [[ $? -eq 0 ]]; then
+    echo "Report package created: /tmp/$ZIP_NAME"
+  else
+    echo "Failed to create report package"
+    return 1
+  fi
+}
+
+send_health_report_email() {
+  local RECIPIENT="$1"
+  local SUMMARY_HTML="$2"
+  local ZIP_FILE="$3"
+  local SUBJECT="RAC Health Check Report - $(date '+%Y-%m-%d %H:%M')"
+
+  if [ ! -f "$SUMMARY_HTML" ]; then
+    echo "Missing summary file: $SUMMARY_HTML"
+    return 1
+  fi
+
+  if [ -s "$SUMMARY_HTML" ] && [ $(stat -c%s "$SUMMARY_HTML") -lt 1000000 ]; then
+    {
+      echo "To: $RECIPIENT"
+      echo "Subject: $SUBJECT"
+      echo "MIME-Version: 1.0"
+      echo "Content-Type: text/html"
+      echo
+      cat "$SUMMARY_HTML"
+    } | sendmail -t
+    echo "Email sent with inline HTML summary to $RECIPIENT"
+  elif [ -f "$ZIP_FILE" ]; then
+    echo "Please find attached RAC Health Check ZIP." | mailx -s "$SUBJECT" -a "$ZIP_FILE" "$RECIPIENT"
+    echo "Email sent with ZIP attachment to $RECIPIENT"
+  else
+    echo "No valid file found to send."
+    return 1
+  fi
+}
+
+#########
 # functions_standby_rac.sh
 # functions_standby_rac.sh
 
