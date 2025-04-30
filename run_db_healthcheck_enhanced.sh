@@ -1,3 +1,57 @@
+#!/bin/bash
+
+# Usage: ./compare_db_parameters.sh db_input.txt
+# Output: /tmp/db_parameter_diff_report.html
+
+INPUT_FILE="$1"
+OUTPUT_HTML="/tmp/db_parameter_diff_report.html"
+TMP1="/tmp/db1_params.lst"
+TMP2="/tmp/db2_params.lst"
+
+# Load DB names
+source "$INPUT_FILE"
+
+# Prompt for SYS credentials
+read -s -p "Enter SYS password: " SYSPWD
+echo
+
+# SQL to fetch parameters
+FETCH_SQL="
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF TRIMSPOOL ON
+SELECT name || '=' || value FROM v\\$parameter ORDER BY name;
+"
+
+# Fetch parameters from DB1
+sqlplus -s sys/$SYSPWD@$DB1 as sysdba <<EOF > $TMP1
+$FETCH_SQL
+EOF
+
+# Fetch parameters from DB2
+sqlplus -s sys/$SYSPWD@$DB2 as sysdba <<EOF > $TMP2
+$FETCH_SQL
+EOF
+
+# Generate HTML diff report
+echo "<html><head><style>table{border-collapse:collapse;}td,th{border:1px solid #ccc;padding:6px;}th{background:#f2f2f2}</style></head><body>" > "$OUTPUT_HTML"
+echo "<h2>Oracle Parameter Differences Between $DB1 and $DB2</h2>" >> "$OUTPUT_HTML"
+echo "<table><tr><th>Parameter</th><th>$DB1</th><th>$DB2</th></tr>" >> "$OUTPUT_HTML"
+
+# Build comparison map
+awk -F'=' '{a[$1]=$2} END{for (i in a) print i "=" a[i]}' $TMP1 | sort > /tmp/param1.map
+awk -F'=' '{a[$1]=$2} END{for (i in a) print i "=" a[i]}' $TMP2 | sort > /tmp/param2.map
+
+join -t= -j 1 -o 1.1,1.2,2.2 -a1 -a2 /tmp/param1.map /tmp/param2.map | sort | while IFS="=" read -r param rest; do
+  val1=$(echo "$rest" | awk -F'=' '{print $1}')
+  val2=$(echo "$rest" | awk -F'=' '{print $2}')
+  if [[ "$val1" != "$val2" ]]; then
+    echo "<tr><td>$param</td><td>${val1:-&nbsp;}</td><td>${val2:-&nbsp;}</td></tr>" >> "$OUTPUT_HTML"
+  fi
+done
+
+echo "</table></body></html>" >> "$OUTPUT_HTML"
+echo "✅ Report generated: $OUTPUT_HTML"
+
+
 echo "Select Health Check Mode:"
 echo "1) Single Database"
 echo "2) Multiple Databases"
