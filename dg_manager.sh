@@ -1260,6 +1260,331 @@ main_deployment() {
     generate_html_report
     send_email_report
 }
+##
+#!/bin/bash
+CONFIG_FILE="dg_config.cfg"
+source "$CONFIG_FILE" 2>/dev/null
+
+sync_password_file() {
+    if [ "$DG_TYPE" == "single" ]; then
+        echo "Syncing password file using ASM..."
+        
+        # Primary ASM password file location
+        asm_pwdfile="+DATA/${DB_NAME}/orapw${DB_NAME}"
+        standby_pwdfile="${ORACLE_HOME}/dbs/orapw${STANDBY_SID}"
+        
+        # 1. Copy from ASM to primary /tmp
+        echo "Copying password file from ASM to primary temp..."
+        ssh "${PRIMARY_HOST}" <<EOF
+            export ORACLE_SID=+ASM
+            asmcmd cp '${asm_pwdfile}' /tmp/orapw_temp
+            exit \$?
+EOF
+        [ $? -ne 0 ] && return 1
+
+        # 2. Copy from primary to standby
+        echo "Transferring password file to standby..."
+        ssh "${PRIMARY_HOST}" "scp /tmp/orapw_temp ${STANDBY_HOST}:${standby_pwdfile}"
+        [ $? -ne 0 ] && return 1
+
+        # 3. Cleanup and verify
+        ssh "${PRIMARY_HOST}" "rm -f /tmp/orapw_temp"
+        ssh "${STANDBY_HOST}" <<EOF
+            [ -f "${standby_pwdfile}" ] || {
+                echo "Password file missing, creating new one..."
+                orapwd file=${standby_pwdfile} password=${SYS_PASSWORD} force=y
+            }
+            chmod 640 ${standby_pwdfile}
+EOF
+        return $?
+
+    elif [ "$DG_TYPE" == "rac" ]; then
+        echo "Handling RAC password files..."
+        asm_pwdfile="+DATA/${RAC_DB_NAME}/orapw${RAC_DB_NAME}"
+        
+        # Copy to all standby nodes
+        for node in "${STANDBY_RAC_HOSTS[@]}"; do
+            ssh "${PRIMARY_HOST}" <<EOF
+                export ORACLE_SID=+ASM
+                asmcmd cp '${asm_pwdfile}' /tmp/orapw_temp
+                scp /tmp/orapw_temp ${node}:${ORACLE_HOME}/dbs/orapw${RAC_INSTANCE_PREFIX}1
+                rm -f /tmp/orapw_temp
+EOF
+            ssh "${node}" "[ -f "${ORACLE_HOME}/dbs/orapw${RAC_INSTANCE_PREFIX}1" ] || orapwd file=${ORACLE_HOME}/dbs/orapw${RAC_INSTANCE_PREFIX}1 password=${SYS_PASSWORD} force=y"
+        done
+    fi
+}
+
+# Enhanced validation_and_save with error handling
+validate_and_save() {
+    [ "$DG_TYPE" != "single" ] && return  # Focus on single instance for this example
+    
+    validate_primary_connection || {
+        echo "Primary connection failed!"
+        return 1
+    }
+
+    validate_standby_listener || {
+        echo "Listener configuration failed!"
+        return 1
+    }
+
+    sync_password_file || {
+        echo "Password file sync failed! Error code: $?"
+        read -p "Retry with manual creation? [y/N] " retry
+        if [[ $retry =~ ^[Yy]$ ]]; then
+            ssh "${STANDBY_HOST}" "orapwd file=${ORACLE_HOME}/dbs/orapw${STANDBY_SID} password=${SYS_PASSWORD} force=y"
+        else
+            return 1
+        fi
+    }
+
+    save_config
+}
+#!/bin/bash
+CONFIG_FILE="dg_config.cfg"
+source "$CONFIG_FILE" 2>/dev/null
+
+# New standby connection validation function
+validate_standby_connection() {
+    echo "Validating standby database connectivity..."
+    ssh "${STANDBY_HOST}" <<EOF
+        export ORACLE_SID=${STANDBY_SID}
+        export ORACLE_HOME=${ORACLE_HOME}
+        ${ORACLE_HOME}/bin/sqlplus -s /nolog <<SQL
+            CONNECT / AS SYSDBA
+            WHENEVER SQLERROR EXIT SQL.SQLCODE
+            SELECT 'Standby Instance Status: ' || STATUS FROM V\$INSTANCE;
+            EXIT
+SQL
+        exit \$?
+EOF
+    local status=$?
+    
+    if [ $status -eq 0 ]; then
+        echo "Standby connection successful"
+        return 0
+    else
+        echo "Standby connection failed with error: $status"
+        echo "Trying to start standby instance..."
+        ssh "${STANDBY_HOST}" <<EOF
+            export ORACLE_SID=${STANDBY_SID}
+            export ORACLE_HOME=${ORACLE_HOME}
+            ${ORACLE_HOME}/bin/sqlplus -s /nolog <<SQL
+                CONNECT / AS SYSDBA
+                STARTUP NOMOUNT PFILE='${ORACLE_HOME}/dbs/init${STANDBY_SID}.ora';
+                EXIT
+SQL
+            exit \$?
+EOF
+        return $?
+    fi
+}
+
+# Enhanced validation_and_save function
+validate_and_save() {
+    # Existing primary validation
+    validate_primary_connection || {
+        echo "Primary database connection failed!"
+        return 1
+    }
+
+    # Existing listener validation
+    validate_standby_listener
+    case $? in
+        0) echo "Standby listener validation successful" ;;
+        1) 
+            echo "Reloading standby listener..."
+            ssh "${STANDBY_HOST}" "lsnrctl reload"
+            ;;
+        2)
+            echo "Configuring static listener entry..."
+            ssh "${STANDBY_HOST}" <<EOF
+                echo "SID_LIST_LISTENER =
+                    (SID_LIST =
+                        (SID_DESC =
+                            (GLOBAL_DBNAME = ${DB_NAME}_DGMGRL)
+                            (ORACLE_HOME = ${ORACLE_HOME})
+                            (SID_NAME = ${STANDBY_SID})
+                        )
+                    )" >> ${ORACLE_HOME}/network/admin/listener.ora
+                lsnrctl reload
+EOF
+            ;;
+    esac
+
+    # Password file synchronization
+    sync_password_file || {
+        echo "Password file synchronization failed!"
+        return 1
+    }
+
+    # New standby connection validation
+    validate_standby_connection || {
+        echo "Standby connection validation failed!"
+        echo "Please verify:"
+        echo "1. Standby instance is in NOMOUNT state"
+        echo "2. Password file exists at ${ORACLE_HOME}/dbs/orapw${STANDBY_SID}"
+        echo "3. Static listener configuration is correct"
+        return 1
+    }
+
+    save_config
+}
+
+# Rest of the functions remain unchanged
+# ... [configure_single, configure_rac, show_config, etc] ...
+
+# Start the menu
+show_menu
+# Execute main deployment
+main_deployment
+
+#!/bin/bash
+# File: lib/dg_manager.sh
+CONFIG_FILE="dg_config.cfg"
+source "$CONFIG_FILE" 2>/dev/null
+HTML_REPORT="/tmp/dg_report_$(date +%Y%m%d).html"
+
+# Function: Stop Standby in Mount State
+stop_standby_mount() {
+    if [ "$DG_TYPE" == "single" ]; then
+        ssh "$STANDBY_HOST" <<EOF
+            export ORACLE_SID=$STANDBY_SID
+            sqlplus / as sysdba <<SQL
+                SHUTDOWN IMMEDIATE;
+                STARTUP MOUNT;
+                EXIT;
+SQL
+EOF
+    elif [ "$DG_TYPE" == "rac" ]; then
+        for node in "${STANDBY_RAC_HOSTS[@]}"; do
+            ssh "$node" <<EOF
+                srvctl stop database -db $RAC_DB_NAME
+                srvctl start database -db $RAC_DB_NAME -startoption mount
+EOF
+        done
+    fi
+}
+
+# Function: Setup RAC using srvctl
+setup_rac_srvctl() {
+    if [ "$DG_TYPE" == "rac" ]; then
+        # Add Database to Cluster
+        ssh "${STANDBY_RAC_HOSTS[0]}" <<EOF
+            srvctl add database -db $RAC_DB_NAME \
+                -oraclehome $ORACLE_HOME \
+                -dbtype PHYSICAL_STANDBY \
+                -dbname $RAC_DB_NAME \
+                -spfile "+$DATA_DG/$RAC_DB_NAME/spfile$RAC_DB_NAME.ora"
+            
+            # Add Instances
+            node_num=1
+            for node in "${STANDBY_RAC_HOSTS[@]}"; do
+                srvctl add instance -db $RAC_DB_NAME \
+                    -instance "${RAC_INSTANCE_PREFIX}\${node_num}" \
+                    -node "$node"
+                ((node_num++))
+            done
+            
+            srvctl config database -db $RAC_DB_NAME
+EOF
+    fi
+}
+
+# Function: Configure Data Guard Broker
+configure_dgmgrl() {
+    dgmgrl_cmds="/tmp/dgmgrl_cmds_$$.txt"
+    cat <<DGMGRL > "$dgmgrl_cmds"
+        CREATE CONFIGURATION DG_${DB_NAME} AS PRIMARY DATABASE IS ${DB_NAME} CONNECT IDENTIFIER IS ${PRIMARY_HOST};
+        ADD DATABASE ${DB_NAME}_STBY AS CONNECT IDENTIFIER IS ${STANDBY_HOST} MAINTAINED AS PHYSICAL;
+        ENABLE CONFIGURATION;
+        SHOW CONFIGURATION;
+DGMGRL
+
+    dgmgrl sys/$SYS_PASSWORD@$PRIMARY_HOST <<EOF
+        @$dgmgrl_cmds
+EOF
+    rm -f "$dgmgrl_cmds"
+}
+
+# Function: Generate HTML Report
+generate_html_report() {
+    cat <<HTML > "$HTML_REPORT"
+<html>
+<head>
+<style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background-color: #4CAF50; color: white; }
+    .success { background-color: #dff0d8; }
+    .error { background-color: #f2dede; }
+</style>
+</head>
+<body>
+    <h2>Data Guard Deployment Report</h2>
+    <p>Generated: $(date)</p>
+    <table>
+        <tr><th>Step</th><th>Status</th><th>Details</th></tr>
+HTML
+
+    # Add report entries from log file
+    while read -r line; do
+        echo "<tr><td>${line%%|*}</td><td>${line#*|}</td><td>${line##*|}</td></tr>" >> "$HTML_REPORT"
+    done < /tmp/dg_deploy.log
+
+    cat <<HTML >> "$HTML_REPORT"
+    </table>
+</body>
+</html>
+HTML
+}
+
+# Function: Send Email Report
+send_email_report() {
+    local recipient=$(whoami)@example.com  # Set your email
+    local subject="Data Guard Deployment Report - $DB_NAME"
+    
+    mailx -s "$subject" -a "Content-type: text/html" "$recipient" <<EOF
+$(cat $HTML_REPORT)
+EOF
+}
+
+# Main Deployment Workflow
+main_deployment() {
+    >/tmp/dg_deploy.log  # Initialize log file
+    
+    # 1. Stop Standby in Mount State
+    if stop_standby_mount >>/tmp/dg_deploy.log 2>&1; then
+        echo "Mount Stage|Success|Standby successfully mounted" >>/tmp/dg_deploy.log
+    else
+        echo "Mount Stage|Failed|Error mounting standby" >>/tmp/dg_deploy.log
+        return 1
+    fi
+    
+    # 2. Setup RAC (if applicable)
+    if [ "$DG_TYPE" == "rac" ]; then
+        if setup_rac_srvctl >>/tmp/dg_deploy.log 2>&1; then
+            echo "RAC Setup|Success|Cluster configuration completed" >>/tmp/dg_deploy.log
+        else
+            echo "RAC Setup|Failed|Error configuring RAC" >>/tmp/dg_deploy.log
+            return 1
+        fi
+    fi
+    
+    # 3. Configure Data Guard Broker
+    if configure_dgmgrl >>/tmp/dg_deploy.log 2>&1; then
+        echo "Broker Config|Success|DGMGRL configuration applied" >>/tmp/dg_deploy.log
+    else
+        echo "Broker Config|Failed|Error in broker configuration" >>/tmp/dg_deploy.log
+        return 1
+    fi
+    
+    # Generate and send report
+    generate_html_report
+    send_email_report
+}
 
 # Execute main deployment
 main_deployment
