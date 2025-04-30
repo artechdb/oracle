@@ -1,4 +1,255 @@
 #!/bin/bash
+# Simplified for demonstration: actual version includes all checks
+
+INPUT_FILE="$1"
+OUTPUT_HTML="/tmp/pdb_clone_precheck_$(date +%Y%m%d%H%M%S).html"
+source "$INPUT_FILE"
+
+read -s -p "Enter SYS password: " SYS_PASS
+echo
+
+html_init() {
+  cat <<EOF > "$OUTPUT_HTML"
+<html><head><style>
+body{font-family:sans-serif;} table{border-collapse:collapse;width:100%;}
+td,th{border:1px solid #ccc;padding:6px;} th{background:#f9f9f9}
+.green{color:green;} .red{color:red;}
+</style></head><body>
+<h1>Oracle 19c PDB Clone Precheck Report</h1>
+EOF
+}
+
+compare_parameters "$SOURCE_CDB" "$TARGET_CDB" "$SYS_PASS" "CDB"
+compare_parameters "$SOURCE_CDB/$SOURCE_PDB" "$TARGET_CDB/$TARGET_PDB" "$SYS_PASS" "PDB"
+compare_patch_levels "$SOURCE_CDB" "$TARGET_CDB" "$SYS_PASS"
+html_finish() {
+  echo "<p>Generated: $(date)</p></body></html>" >> "$OUTPUT_HTML"
+}
+
+report_row() {
+  local desc="$1"
+  local status="$2"
+  local details="$3"
+  local color=$( [[ "$status" == "GREEN" ]] && echo green || echo red )
+  echo "<tr><td>$desc</td><td class="$color">$status</td><td>$details</td></tr>" >> "$OUTPUT_HTML"
+}
+
+collect_instance_info() {
+  local DB="$1"
+  local LABEL="$2"
+  local PASS="$3"
+  local TMP="/tmp/${LABEL}_instances.lst"
+  local PDBS="/tmp/${LABEL}_pdbs.lst"
+
+  sqlplus -s sys/$PASS@$DB as sysdba <<EOF > "$TMP"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT instance_name || ',' || host_name FROM gv\$instance ORDER BY inst_id;
+EOF
+
+  sqlplus -s sys/$PASS@$DB as sysdba <<EOF > "$PDBS"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT LISTAGG(pdb_name, ', ') WITHIN GROUP (ORDER BY pdb_name) FROM cdb_pdbs WHERE open_mode = 'READ WRITE';
+EOF
+}
+
+render_instance_table() {
+  echo "<h2>Instance & PDB Info</h2><table>" >> "$OUTPUT_HTML"
+  echo "<tr><th colspan='2'>Source: $SOURCE_CDB</th><th colspan='2'>Target: $TARGET_CDB</th></tr>" >> "$OUTPUT_HTML"
+  echo "<tr><th>Instance</th><th>Host / PDBs</th><th>Instance</th><th>Host / PDBs</th></tr>" >> "$OUTPUT_HTML"
+
+  paste -d '|' /tmp/source_instances.lst /tmp/target_instances.lst | while IFS='|' read s t; do
+    s_inst=$(echo "$s" | cut -d',' -f1)
+    s_host=$(echo "$s" | cut -d',' -f2)
+    t_inst=$(echo "$t" | cut -d',' -f1)
+    t_host=$(echo "$t" | cut -d',' -f2)
+    echo "<tr><td>$s_inst</td><td>$s_host</td><td>$t_inst</td><td>$t_host</td></tr>" >> "$OUTPUT_HTML"
+  done
+
+  echo "<tr><td colspan=2><b>PDBs:</b><br>$(cat /tmp/source_pdbs.lst)</td>" >> "$OUTPUT_HTML"
+  echo "    <td colspan=2><b>PDBs:</b><br>$(cat /tmp/target_pdbs.lst)</td></tr>" >> "$OUTPUT_HTML"
+  echo "</table>" >> "$OUTPUT_HTML"
+}
+
+
+compare_parameters() {
+  local DB1="$1"
+  local DB2="$2"
+  local PWD="$3"
+  local LABEL="$4"
+  local FILE1="/tmp/${LABEL}_params1.lst"
+  local FILE2="/tmp/${LABEL}_params2.lst"
+  local DIFF_HTML="/tmp/${LABEL}_param_diff.html"
+
+  sqlplus -s sys/$PWD@$DB1 as sysdba <<EOF > "$FILE1"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT name || '=' || value FROM v\$parameter ORDER BY name;
+EOF
+
+  sqlplus -s sys/$PWD@$DB2 as sysdba <<EOF > "$FILE2"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT name || '=' || value FROM v\$parameter ORDER BY name;
+EOF
+
+  echo "<h2>Parameter Differences: $LABEL</h2><table><tr><th>Parameter</th><th>$DB1</th><th>$DB2</th></tr>" >> "$OUTPUT_HTML"
+  join -t= <(sort "$FILE1") <(sort "$FILE2") -o 1.1 1.2 2.2 -a1 -a2 | while IFS='=' read param rest; do
+    v1=$(echo "$rest" | cut -d'=' -f1)
+    v2=$(echo "$rest" | cut -d'=' -f2)
+    if [[ "$v1" != "$v2" ]]; then
+      echo "<tr><td>$param</td><td>${v1:-&nbsp;}</td><td>${v2:-&nbsp;}</td></tr>" >> "$OUTPUT_HTML"
+    fi
+  done
+  echo "</table>" >> "$OUTPUT_HTML"
+}
+
+compare_patch_levels() {
+  local DB1="$1"
+  local DB2="$2"
+  local PWD="$3"
+  local FILE1="/tmp/${DB1}_patches.lst"
+  local FILE2="/tmp/${DB2}_patches.lst"
+
+  sqlplus -s sys/$PWD@$DB1 as sysdba <<EOF > "$FILE1"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT patch_id || ' - ' || description FROM dba_registry_sqlpatch ORDER BY patch_id;
+EOF
+
+  sqlplus -s sys/$PWD@$DB2 as sysdba <<EOF > "$FILE2"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT patch_id || ' - ' || description FROM dba_registry_sqlpatch ORDER BY patch_id;
+EOF
+
+  echo "<h2>Patch Level Differences</h2><table><tr><th>Patch ID - Description</th><th>Status</th></tr>" >> "$OUTPUT_HTML"
+  diff -u <(sort "$FILE1") <(sort "$FILE2") | grep '^[-+]' | grep -v '^---\|^+++' | while read line; do
+    [[ "$line" =~ ^- ]] && echo "<tr><td>${line:1}</td><td class='red'>Only in $DB1</td></tr>" >> "$OUTPUT_HTML"
+    [[ "$line" =~ ^\+ ]] && echo "<tr><td>${line:1}</td><td class='red'>Only in $DB2</td></tr>" >> "$OUTPUT_HTML"
+  done
+  echo "</table>" >> "$OUTPUT_HTML"
+}
+
+# --- Main Execution ---
+html_init
+collect_instance_info "$SOURCE_CDB" "source" "$SYS_PASS"
+collect_instance_info "$TARGET_CDB" "target" "$SYS_PASS"
+render_instance_table
+
+# Placeholder precheck section
+echo "<h2>Precheck Results</h2><table><tr><th>Check</th><th>Status</th><th>Details</th></tr>" >> "$OUTPUT_HTML"
+
+# SQL*Plus connectivity check for Source CDB
+if sqlplus -s sys/"$SYS_PASS"@"$SOURCE_CDB" as sysdba <<< "EXIT;" | grep -q "Connected to:"; then
+  report_row "Source CDB SQL*Plus Connection" "GREEN" "Connected successfully"
+else
+  report_row "Source CDB SQL*Plus Connection" "RED" "Connection failed"
+  echo "❌ Cannot connect to Source CDB ($SOURCE_CDB). Exiting."
+  html_finish
+  exit 1
+fi
+
+# SQL*Plus connectivity check for Target CDB
+if sqlplus -s sys/"$SYS_PASS"@"$TARGET_CDB" as sysdba <<< "EXIT;" | grep -q "Connected to:"; then
+  report_row "Target CDB SQL*Plus Connection" "GREEN" "Connected successfully"
+else
+  report_row "Target CDB SQL*Plus Connection" "RED" "Connection failed"
+  echo "❌ Cannot connect to Target CDB ($TARGET_CDB). Exiting."
+  html_finish
+  exit 1
+fi
+if tnsping "$SOURCE_SCAN" | grep -q OK; then
+  report_row "TNSPING Source SCAN" "GREEN" "$SOURCE_SCAN reachable"
+else
+  report_row "TNSPING Source SCAN" "RED" "$SOURCE_SCAN unreachable"
+fi
+
+# TNSPING Target SCAN
+if tnsping "$TARGET_SCAN" | grep -q OK; then
+  report_row "TNSPING Target SCAN" "GREEN" "$TARGET_SCAN reachable"
+else
+  report_row "TNSPING Target SCAN" "RED" "$TARGET_SCAN unreachable"
+fi
+
+# Source CDB open and archivelog
+SRC_STATUS=$(sqlplus -s sys/"$SYS_PASS"@"$SOURCE_CDB" as sysdba <<EOF
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT open_mode || ',' || log_mode FROM v\$database;
+EOF
+)
+OPEN_MODE=$(echo $SRC_STATUS | cut -d',' -f1)
+LOG_MODE=$(echo $SRC_STATUS | cut -d',' -f2)
+[[ "$OPEN_MODE" == "READ WRITE" ]] && report_row "Source CDB Open Mode" "GREEN" "$OPEN_MODE" || report_row "Source CDB Open Mode" "RED" "$OPEN_MODE"
+[[ "$LOG_MODE" == "ARCHIVELOG" ]] && report_row "Source CDB Archivelog Mode" "GREEN" "$LOG_MODE" || report_row "Source CDB Archivelog Mode" "RED" "$LOG_MODE"
+
+# Source PDB open, unrestricted
+SRC_PDB=$(sqlplus -s sys/"$SYS_PASS"@"$SOURCE_CDB" as sysdba <<EOF
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT open_mode || ',' || restricted FROM cdb_pdbs WHERE pdb_name = UPPER('$SOURCE_PDB');
+EOF
+)
+PDB_OPEN=$(echo "$SRC_PDB" | cut -d',' -f1)
+PDB_RES=$(echo "$SRC_PDB" | cut -d',' -f2)
+[[ "$PDB_OPEN" == "READ WRITE" ]] && report_row "Source PDB Open Mode" "GREEN" "$PDB_OPEN" || report_row "Source PDB Open Mode" "RED" "$PDB_OPEN"
+[[ "$PDB_RES" == "NO" ]] && report_row "Source PDB Not Restricted" "GREEN" "$PDB_RES" || report_row "Source PDB Not Restricted" "RED" "$PDB_RES"
+
+# Target CDB checks
+TGT_STATUS=$(sqlplus -s sys/"$SYS_PASS"@"$TARGET_CDB" as sysdba <<EOF
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT cdb || ',' || open_mode FROM v\$database;
+EOF
+)
+IS_CDB=$(echo "$TGT_STATUS" | cut -d',' -f1)
+TGT_OPEN=$(echo "$TGT_STATUS" | cut -d',' -f2)
+[[ "$IS_CDB" == "YES" ]] && report_row "Target is CDB" "GREEN" "$IS_CDB" || report_row "Target is CDB" "RED" "$IS_CDB"
+[[ "$TGT_OPEN" == "READ WRITE" ]] && report_row "Target CDB Open Mode" "GREEN" "$TGT_OPEN" || report_row "Target CDB Open Mode" "RED" "$TGT_OPEN"
+
+# Target PDB existence
+TGT_EXISTS=$(sqlplus -s sys/"$SYS_PASS"@"$TARGET_CDB" as sysdba <<EOF
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT COUNT(*) FROM cdb_pdbs WHERE pdb_name = UPPER('$TARGET_PDB');
+EOF
+)
+[[ "$TGT_EXISTS" == "0" ]] && report_row "Target PDB Name Available" "GREEN" "No conflict" || report_row "Target PDB Name Available" "RED" "$TGT_EXISTS existing"
+
+# Local Undo check (on both CDBs)
+for DB in "$SOURCE_CDB" "$TARGET_CDB"; do
+  LUNDO=$(sqlplus -s sys/"$SYS_PASS"@"$DB" as sysdba <<EOF
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SHOW PARAMETER local_undo_enabled;
+EOF
+)
+  [[ "$LUNDO" =~ TRUE ]] && report_row "$DB Local Undo Enabled" "GREEN" "TRUE" || report_row "$DB Local Undo Enabled" "RED" "FALSE"
+done
+
+# TDE Wallet check
+for DB in "$SOURCE_CDB" "$TARGET_CDB"; do
+  TDE=$(sqlplus -s sys/"$SYS_PASS"@"$DB" as sysdba <<EOF
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT wrl_type || ',' || status FROM v\$encryption_wallet;
+EOF
+)
+  TYPE=$(echo "$TDE" | cut -d',' -f1)
+  STATUS=$(echo "$TDE" | cut -d',' -f2)
+  [[ "$STATUS" == "OPEN" ]] && report_row "$DB TDE Wallet Status" "GREEN" "$TYPE - $STATUS" || report_row "$DB TDE Wallet Status" "RED" "$TYPE - $STATUS"
+done
+
+# DBA Registry Valid
+for DB in "$SOURCE_CDB" "$TARGET_CDB"; do
+  INVALID=$(sqlplus -s sys/"$SYS_PASS"@"$DB" as sysdba <<EOF
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT COUNT(*) FROM dba_registry WHERE status != 'VALID';
+EOF
+)
+  [[ "$INVALID" == "0" ]] && report_row "$DB DBA Registry Status" "GREEN" "All components VALID" || report_row "$DB DBA Registry Status" "RED" "$INVALID invalid components"
+done
+
+echo "</table>" >> "$OUTPUT_HTML"
+
+compare_parameters "$SOURCE_CDB" "$TARGET_CDB" "$SYS_PASS" "CDB"
+compare_parameters "$SOURCE_CDB/$SOURCE_PDB" "$TARGET_CDB/$TARGET_PDB" "$SYS_PASS" "PDB"
+compare_patch_levels "$SOURCE_CDB" "$TARGET_CDB" "$SYS_PASS"
+html_finish
+echo "✅ Report saved to: $OUTPUT_HTML"
+
+
+#!/bin/bash
 
 # Usage: ./compare_db_parameters.sh db_input.txt
 # Output: /tmp/db_parameter_diff_report.html
