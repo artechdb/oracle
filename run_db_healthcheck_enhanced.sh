@@ -109,6 +109,136 @@ else
 fi
 
 ##
+#!/bin/bash
+# Common precheck functions for PDB Clone Validation
+
+html_init() {
+  cat <<EOF > "$OUTPUT_HTML"
+<html><head><style>
+body{font-family:sans-serif;} table{border-collapse:collapse;width:100%;}
+td,th{border:1px solid #ccc;padding:6px;} th{background:#f9f9f9}
+.green{color:green;} .red{color:red;}
+</style></head><body>
+<h1>Oracle 19c PDB Clone Precheck Report</h1>
+EOF
+}
+
+html_finish() {
+  echo "<p>Generated: $(date)</p></body></html>" >> "$OUTPUT_HTML"
+}
+
+report_row() {
+  local desc="$1"
+  local status="$2"
+  local details="$3"
+  local color=$( [[ "$status" == "GREEN" ]] && echo green || echo red )
+  echo "<tr><td>$desc</td><td class="$color">$status</td><td>$details</td></tr>" >> "$OUTPUT_HTML"
+}
+
+read_input_file() {
+  local FILE="$1"
+  source "$FILE"
+}
+run_precheck() {
+  html_init
+
+  # SQL*Plus connectivity checks
+  if sqlplus -s sys/"$SYS_PASS"@"$SOURCE_CDB" as sysdba <<< "EXIT;" | grep -q "Connected to:"; then
+    report_row "Source CDB SQL*Plus Connection" "GREEN" "Connected successfully"
+  else
+    report_row "Source CDB SQL*Plus Connection" "RED" "Connection failed"
+    html_finish
+    exit 1
+  fi
+
+  if sqlplus -s sys/"$SYS_PASS"@"$TARGET_CDB" as sysdba <<< "EXIT;" | grep -q "Connected to:"; then
+    report_row "Target CDB SQL*Plus Connection" "GREEN" "Connected successfully"
+  else
+    report_row "Target CDB SQL*Plus Connection" "RED" "Connection failed"
+    html_finish
+    exit 1
+  fi
+
+  echo "<h2>Precheck Results</h2><table><tr><th>Check</th><th>Status</th><th>Details</th></tr>" >> "$OUTPUT_HTML"
+
+  # Source open/archivelog
+  SRC_STATUS=$(sqlplus -s sys/"$SYS_PASS"@"$SOURCE_CDB" as sysdba <<EOF
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT open_mode || ',' || log_mode FROM v\$database;
+EOF
+)
+  OPEN_MODE=$(echo $SRC_STATUS | cut -d',' -f1)
+  LOG_MODE=$(echo $SRC_STATUS | cut -d',' -f2)
+  [[ "$OPEN_MODE" == "READ WRITE" ]] && report_row "Source CDB Open Mode" "GREEN" "$OPEN_MODE" || report_row "Source CDB Open Mode" "RED" "$OPEN_MODE"
+  [[ "$LOG_MODE" == "ARCHIVELOG" ]] && report_row "Source CDB Archivelog Mode" "GREEN" "$LOG_MODE" || report_row "Source CDB Archivelog Mode" "RED" "$LOG_MODE"
+
+  # Target CDB
+  TGT_STATUS=$(sqlplus -s sys/"$SYS_PASS"@"$TARGET_CDB" as sysdba <<EOF
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT cdb || ',' || open_mode FROM v\$database;
+EOF
+)
+  IS_CDB=$(echo "$TGT_STATUS" | cut -d',' -f1)
+  TGT_OPEN=$(echo "$TGT_STATUS" | cut -d',' -f2)
+  [[ "$IS_CDB" == "YES" ]] && report_row "Target is CDB" "GREEN" "$IS_CDB" || report_row "Target is CDB" "RED" "$IS_CDB"
+  [[ "$TGT_OPEN" == "READ WRITE" ]] && report_row "Target CDB Open Mode" "GREEN" "$TGT_OPEN" || report_row "Target CDB Open Mode" "RED" "$TGT_OPEN"
+
+  echo "</table>" >> "$OUTPUT_HTML"
+  html_finish
+}
+
+compare_parameters() {
+  local DB1="$1"
+  local DB2="$2"
+  local LABEL="$3"
+  local FILE1="/tmp/${LABEL}_params1.lst"
+  local FILE2="/tmp/${LABEL}_params2.lst"
+
+  sqlplus -s sys/$SYS_PASS@$DB1 as sysdba <<EOF > "$FILE1"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT name || '=' || value FROM v\$parameter ORDER BY name;
+EOF
+
+  sqlplus -s sys/$SYS_PASS@$DB2 as sysdba <<EOF > "$FILE2"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT name || '=' || value FROM v\$parameter ORDER BY name;
+EOF
+
+  echo "<h2>Parameter Differences ($LABEL)</h2><table><tr><th>Parameter</th><th>$DB1</th><th>$DB2</th></tr>" >> "$OUTPUT_HTML"
+  join -t= <(sort "$FILE1") <(sort "$FILE2") -o 1.1 1.2 2.2 -a1 -a2 | while IFS='=' read param rest; do
+    v1=$(echo "$rest" | cut -d'=' -f1)
+    v2=$(echo "$rest" | cut -d'=' -f2)
+    if [[ "$v1" != "$v2" ]]; then
+      echo "<tr><td>$param</td><td>${v1:-&nbsp;}</td><td>${v2:-&nbsp;}</td></tr>" >> "$OUTPUT_HTML"
+    fi
+  done
+  echo "</table>" >> "$OUTPUT_HTML"
+}
+
+compare_patch_levels() {
+  local DB1="$1"
+  local DB2="$2"
+  local FILE1="/tmp/${DB1}_patches.lst"
+  local FILE2="/tmp/${DB2}_patches.lst"
+
+  sqlplus -s sys/$SYS_PASS@$DB1 as sysdba <<EOF > "$FILE1"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT patch_id || ' - ' || description FROM dba_registry_sqlpatch ORDER BY patch_id;
+EOF
+
+  sqlplus -s sys/$SYS_PASS@$DB2 as sysdba <<EOF > "$FILE2"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT patch_id || ' - ' || description FROM dba_registry_sqlpatch ORDER BY patch_id;
+EOF
+
+  echo "<h2>Patch Level Differences</h2><table><tr><th>Patch ID - Description</th><th>Status</th></tr>" >> "$OUTPUT_HTML"
+  diff -u <(sort "$FILE1") <(sort "$FILE2") | grep '^[-+]' | grep -v '^---\|^+++' | while read line; do
+    [[ "$line" =~ ^- ]] && echo "<tr><td>${line:1}</td><td class='red'>Only in $DB1</td></tr>" >> "$OUTPUT_HTML"
+    [[ "$line" =~ ^\+ ]] && echo "<tr><td>${line:1}</td><td class='red'>Only in $DB2</td></tr>" >> "$OUTPUT_HTML"
+  done
+  echo "</table>" >> "$OUTPUT_HTML"
+}
+##
 execute_sql() {
   local db="$1"
   local sql="$2"
