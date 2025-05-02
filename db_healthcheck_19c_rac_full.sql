@@ -1,5 +1,211 @@
 #!/bin/bash
 
+# Add this function to check MAX_STRING_SIZE
+check_max_string_size() {
+  local src_props=$1
+  local tgt_props=$2
+  local html_file=$3
+
+  echo "<h2>MAX_STRING_SIZE Compatibility</h2>" >> "$html_file"
+  echo "<table><tr><th>Parameter</th><th>Source</th><th>Target</th><th>Status</th></tr>" >> "$html_file"
+
+  src_size=$(echo "$src_props" | grep '^MAX_STRING_SIZE=' | cut -d'=' -f2)
+  tgt_size=$(echo "$tgt_props" | grep '^MAX_STRING_SIZE=' | cut -d'=' -f2)
+
+  if [ "$src_size" != "$tgt_size" ]; then
+    status="❌ Mismatch - Potential data truncation"
+    status_class="critical"
+  else
+    status="✅ Match"
+    status_class="ok"
+  fi
+
+  echo "<tr class='$status_class'>
+        <td>MAX_STRING_SIZE</td>
+        <td>$src_size</td>
+        <td>$tgt_size</td>
+        <td>$status</td>
+      </tr>" >> "$html_file"
+
+  # Add warning if source is EXTENDED but target is STANDARD
+  if [ "$src_size" = "EXTENDED" ] && [ "$tgt_size" = "STANDARD" ]; then
+    echo "<tr class='warning'>
+          <td colspan='4'>
+            ⚠️ Warning: Source uses EXTENDED (32K) while target uses STANDARD (4K). 
+            This may cause string truncation during migration.
+          </td>
+        </tr>" >> "$html_file"
+  fi
+
+  echo "</table>" >> "$html_file"
+}
+
+# Update get_db_properties to include MAX_STRING_SIZE
+get_db_properties() {
+  local conn_str=$1
+  sqlplus -s /nolog << EOF
+connect $conn_str
+SET PAGESIZE 0
+SET FEEDBACK OFF
+SET HEADING OFF
+SET SERVEROUTPUT OFF
+
+prompt VERSION=
+SELECT version FROM v\$instance;
+
+prompt COMPATIBLE=
+SELECT value FROM v\$parameter WHERE name = 'compatible';
+
+prompt CHARACTERSET=
+SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET';
+
+prompt NCHARACTERSET=
+SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_NCHAR_CHARACTERSET';
+
+prompt PLATFORM_NAME=
+SELECT platform_name FROM v\$database;
+
+prompt ENDIAN_FORMAT=
+SELECT endian_format FROM v\$transportable_platform tp, v\$database d 
+WHERE tp.platform_name = d.platform_name;
+
+prompt LOCAL_UNDO=
+SELECT local_undo_enabled FROM v\$database;
+
+prompt TDE_STATUS=
+SELECT status FROM v\$encryption_wallet;
+
+prompt TDE_WALLET_TYPE=
+SELECT wallet_type FROM v\$encryption_wallet;
+
+prompt TIMEZONE_VERSION=
+SELECT version FROM v\$timezone_file;
+
+prompt DBTIMEZONE=
+SELECT dbtimezone FROM dual;
+
+prompt MAX_STRING_SIZE=
+SELECT value FROM v\$parameter WHERE name = 'max_string_size';
+
+EXIT;
+EOF
+}
+#!/bin/bash
+
+# Function to check PDB existence
+check_pdb_existence() {
+  local conn_str=$1
+  local pdb_name=$2
+  local type=$3
+  local report_file=$4
+
+  echo "<div class='section'>" >> "$report_file"
+  echo "<h2>PDB Existence Check: $type</h2>" >> "$report_file"
+
+  result=$(sqlplus -s /nolog << EOF
+connect $conn_str
+SET SERVEROUTPUT OFF
+SET FEEDBACK OFF
+SET HEADING OFF
+SELECT 'EXISTS' FROM v\$pdbs WHERE name = UPPER('$pdb_name');
+EOF
+  )
+
+  if [[ "$result" == *"EXISTS"* ]]; then
+    pdb_status=$(sqlplus -s /nolog << EOF
+connect $conn_str
+SET PAGESIZE 0
+SET FEEDBACK OFF
+SELECT 'Status: ' || open_mode || ' | Restricted: ' || restricted || 
+       ' | Recovery: ' || recovery_status || ' | Con_ID: ' || con_id
+FROM v\$pdbs WHERE name = UPPER('$pdb_name');
+EOF
+    )
+    echo "<p class='ok'>✅ PDB $pdb_name exists</p>" >> "$report_file"
+    echo "<p>PDB details: $pdb_status</p>" >> "$report_file"
+    echo "</div>" >> "$report_file"
+    return 0
+  else
+    echo "<p class='critical'>❌ PDB $pdb_name does not exist</p>" >> "$report_file"
+    echo "<pre>Available PDBs:" >> "$report_file"
+    sqlplus -s /nolog << EOF >> "$report_file"
+connect $conn_str
+SET PAGESIZE 1000
+SET FEEDBACK OFF
+SET LINESIZE 100
+SET HEADING OFF
+SELECT name || ' - ' || open_mode || ' - ' || restricted FROM v\$pdbs ORDER BY name;
+EOF
+    echo "</pre>" >> "$report_file"
+    echo "</div>" >> "$report_file"
+    return 1
+  fi
+}
+
+# Update verify_db_connection to include container check
+verify_db_connection() {
+  local conn_str=$1
+  local type=$2
+  local report_file=$3
+  local pdb_name=$4
+
+  echo "<div class='section'>" >> "$report_file"
+  echo "<h2>Connection Verification: $type</h2>" >> "$report_file"
+
+  # First verify we can connect to the CDB
+  result=$(sqlplus -s /nolog << EOF
+connect $conn_str
+SET SERVEROUTPUT OFF
+SET FEEDBACK OFF
+SET HEADING OFF
+SELECT 'SUCCESS' FROM dual;
+EOF
+  )
+
+  if [[ "$result" != *"SUCCESS"* ]]; then
+    echo "<p class='critical'>❌ Failed to connect to: $(echo "$conn_str" | sed 's/\"//g')</p>" >> "$report_file"
+    echo "<pre>Error details: $result</pre>" >> "$report_file"
+    echo "</div>" >> "$report_file"
+    return 1
+  fi
+
+  # Then verify we're connected to the correct PDB
+  current_container=$(sqlplus -s /nolog << EOF
+connect $conn_str
+SET PAGESIZE 0
+SET FEEDBACK OFF
+SET HEADING OFF
+SELECT sys_context('USERENV', 'CON_NAME') FROM dual;
+EOF
+  )
+
+  if [[ "$current_container" != "$pdb_name" ]]; then
+    echo "<p class='critical'>❌ Connected to wrong container: $current_container (expected: $pdb_name)</p>" >> "$report_file"
+    echo "</div>" >> "$report_file"
+    return 1
+  fi
+
+  conn_info=$(sqlplus -s /nolog << EOF
+connect $conn_str
+SET PAGESIZE 0
+SET FEEDBACK OFF
+SELECT 'Instance: ' || instance_name || 
+       ' | Version: ' || version || 
+       ' | Host: ' || host_name ||
+       ' | CDB: ' || (SELECT cdb FROM v\$database) ||
+       ' | Container: ' || sys_context('USERENV', 'CON_NAME')
+FROM v\$instance;
+EOF
+  )
+    
+  echo "<p class='ok'>✅ Successfully connected to: $(echo "$conn_str" | sed 's/\"//g')</p>" >> "$report_file"
+  echo "<p>Connection details: $conn_info</p>" >> "$report_file"
+  echo "</div>" >> "$report_file"
+  return 0
+}
+  ##
+#!/bin/bash
+
 # Function to get CDB-level parameters
 get_cdb_parameters() {
   local conn_str=$1
