@@ -1,5 +1,115 @@
 #!/bin/bash
 
+# Function to get CDB-level parameters
+get_cdb_parameters() {
+  local conn_str=$1
+  sqlplus -s /nolog << EOF
+connect $conn_str
+SET PAGESIZE 0
+SET FEEDBACK OFF
+SET HEADING OFF
+SET SERVEROUTPUT OFF
+
+-- CDB-specific parameters
+prompt CDB_PARAMETERS_START
+SELECT name || '=' || value 
+FROM v\$parameter 
+WHERE ispdb_modifiable = 'FALSE'
+AND name NOT IN (
+  'db_unique_name',
+  'service_names',
+  'local_listener',
+  'remote_listener',
+  'log_archive_dest_1',
+  'log_archive_dest_2',
+  'fal_server'
+);
+prompt CDB_PARAMETERS_END
+EXIT;
+EOF
+}
+
+# Function to get PDB-level parameters
+get_pdb_parameters() {
+  local conn_str=$1
+  sqlplus -s /nolog << EOF
+connect $conn_str
+SET PAGESIZE 0
+SET FEEDBACK OFF
+SET HEADING OFF
+SET SERVEROUTPUT OFF
+
+-- PDB-specific parameters
+prompt PDB_PARAMETERS_START
+SELECT name || '=' || value 
+FROM v\$parameter 
+WHERE ispdb_modifiable = 'TRUE'
+AND name NOT IN (
+  'service_names',
+  'local_listener',
+  'db_file_name_convert',
+  'log_file_name_convert'
+);
+prompt PDB_PARAMETERS_END
+EXIT;
+EOF
+}
+
+# Function to compare parameters and generate HTML
+compare_parameters() {
+  local src_params=$1
+  local tgt_params=$2
+  local title=$3
+  local html_file=$4
+
+  echo "<div class='section'>" >> "$html_file"
+  echo "<h2>$title Parameter Comparison</h2>" >> "$html_file"
+  echo "<table><tr><th>Parameter</th><th>Source Value</th><th>Target Value</th></tr>" >> "$html_file"
+
+  awk -F= '
+    BEGIN {count=0}
+    NR==FNR {a[$1]=$2; next}
+    {
+      if ($1 in a) {
+        if (a[$1] != $2) {
+          printf "<tr><td>%s</td><td class=\"diff\">%s</td><td class=\"diff\">%s</td></tr>\n", $1,a[$1],$2
+          count++
+        }
+        delete a[$1]
+      } else {
+        printf "<tr><td>%s</td><td>%s</td><td class=\"critical\">Missing</td></tr>\n", $1,$2
+        count++
+      }
+    }
+    END {
+      for (i in a) {
+        printf "<tr><td>%s</td><td class=\"critical\">Missing</td><td>%s</td></tr>\n", i,a[i]
+        count++
+      }
+      exit (count > 0 ? 1 : 0)
+    }
+  ' <(echo "$src_params") <(echo "$tgt_params") >> "$html_file"
+
+  if [ $? -eq 0 ]; then
+    echo "<tr><td colspan='3' class='ok'>✅ All parameters match</td></tr>" >> "$html_file"
+  fi
+
+  echo "</table></div>" >> "$html_file"
+}
+
+# Function to extract parameters between markers
+extract_parameters() {
+  local full_output=$1
+  local marker=$2
+  awk -v marker="$marker" '
+    $0 ~ marker "_START" {start=1; next}
+    $0 ~ marker "_END" {exit}
+    start {print}
+  ' <<< "$full_output"
+}
+  ############
+#!/bin/bash
+
 # Source functions
 source ./pdb_compatibility_functions.sh
 
