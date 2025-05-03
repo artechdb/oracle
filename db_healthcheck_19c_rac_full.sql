@@ -1,3 +1,123 @@
+
+#!/bin/bash
+
+# Function to get Oracle parameters from a CDB
+get_db_parameters() {
+  local conn_str=$1
+  local out_file=$2
+  
+  sqlplus -s /nolog << EOF > /dev/null
+  connect $conn_str
+  set pagesize 0
+  set feedback off
+  set verify off
+  set linesize 1000
+  set trimspool on
+  spool $out_file
+  select name || '=' || value from v\$parameter 
+  where name not in (
+    'instance_name',
+    'db_unique_name',
+    'service_names',
+    'local_listener',
+    'remote_listener',
+    'log_archive_dest_1',
+    'log_archive_dest_2',
+    'fal_server',
+    'db_file_name_convert',
+    'log_file_name_convert',
+    'db_create_file_dest',
+    'db_recovery_file_dest'
+  );
+  spool off
+  exit
+EOF
+}
+
+# Function to compare parameters and generate HTML
+generate_html_report() {
+  local file1=$1
+  local file2=$2
+  local html_file=$3
+
+  echo "<html>
+<head>
+<style>
+  table {border-collapse: collapse; width: 100%;}
+  th, td {border: 1px solid #ddd; padding: 8px; text-align: left;}
+  tr:nth-child(even) {background-color: #f2f2f2;}
+  .diff {color: red; font-weight: bold;}
+</style>
+</head>
+<body>
+<h2>Oracle CDB Parameter Comparison</h2>
+<p>Generated at: $(date)</p>
+<table>
+  <tr><th>Parameter</th><th>CDB1 Value</th><th>CDB2 Value</th></tr>" > $html_file
+
+  awk -F= '
+    NR==FNR {a[$1]=$2; next} 
+    $1 in a {if(a[$1] != $2) print $1,a[$1],$2; delete a[$1]} 
+    END {for (i in a) print i,a[$1],""}
+  ' $file1 $file2 | while read param val1 val2
+  do
+    echo "<tr>
+            <td>$param</td>
+            <td $( [ "$val1" != "$val2" ] && echo 'class="diff"')>$val1</td>
+            <td $( [ "$val1" != "$val2" ] && echo 'class="diff"')>$val2</td>
+          </tr>"
+  done >> $html_file
+
+  echo "</table></body></html>" >> $html_file
+}
+
+# Function to send email
+send_email() {
+  local html_file=$1
+  local recipient=$2
+  local subject=$3
+
+  (
+  echo "To: $recipient"
+  echo "Subject: $subject"
+  echo "Content-Type: text/html"
+  echo
+  cat $html_file
+  ) | sendmail -t
+}
+##
+    #!/bin/bash
+
+# Source functions
+source ./oracle_compare_functions.sh
+
+# Configuration
+CDB1_CONN="sys/password@cdb1 as sysdba"
+CDB2_CONN="sys/password@cdb2 as sysdba"
+TMP_DIR="/tmp/oracle_compare"
+REPORT_FILE="$TMP_DIR/parameter_compare_$(date +%Y%m%d%H%M%S).html"
+EMAIL_TO="dba@company.com"
+EMAIL_SUB="Oracle CDB Parameter Comparison Report"
+
+# Create temporary directory
+mkdir -p "$TMP_DIR"
+
+# Get parameters from both CDBs
+get_db_parameters "$CDB1_CONN" "$TMP_DIR/cdb1_params.txt"
+get_db_parameters "$CDB2_CONN" "$TMP_DIR/cdb2_params.txt"
+
+# Clean parameter files (remove empty lines and SQL*Plus formatting)
+sed -i '/^$/d' $TMP_DIR/cdb1_params.txt $TMP_DIR/cdb2_params.txt
+sed -i '/^Disconnected/d' $TMP_DIR/cdb1_params.txt $TMP_DIR/cdb2_params.txt
+
+# Generate HTML report
+generate_html_report "$TMP_DIR/cdb1_params.txt" "$TMP_DIR/cdb2_params.txt" "$REPORT_FILE"
+
+# Send email with HTML report
+send_email "$REPORT_FILE" "$EMAIL_TO" "$EMAIL_SUB"
+
+# Cleanup temporary files
+rm -rf "$TMP_DIR"
 #!/bin/bash
 
 # Add this function to check MAX_STRING_SIZE
