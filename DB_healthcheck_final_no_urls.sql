@@ -1,4 +1,112 @@
+# Function to compare DBA_REGISTRY components
+compare_dba_registry() {
+  local src_conn=$1
+  local tgt_conn=$2
+  local html_file=$3
 
+  echo "<div class='section'>" >> "$html_file"
+  echo "<h2>Database Component Comparison (DBA_REGISTRY)</h2>" >> "$html_file"
+  
+  # Get components from both databases
+  sqlplus -s /nolog << EOF > /tmp/src_components.txt
+connect $src_conn
+set pagesize 0 feedback off linesize 200
+SELECT comp_name || '|' || version || '|' || status FROM dba_registry ORDER BY comp_name;
+EOF
+
+  sqlplus -s /nolog << EOF > /tmp/tgt_components.txt
+connect $tgt_conn
+set pagesize 0 feedback off linesize 200
+SELECT comp_name || '|' || version || '|' || status FROM dba_registry ORDER BY comp_name;
+EOF
+
+  # Clean SQL*Plus output
+  sed -i '/^Disconnected/d' /tmp/src_components.txt /tmp/tgt_components.txt
+  sed -i '/^$/d' /tmp/src_components.txt /tmp/tgt_components.txt
+
+  echo "<table>
+        <tr>
+          <th>Component</th>
+          <th>Source Version</th>
+          <th>Source Status</th>
+          <th>Target Version</th>
+          <th>Target Status</th>
+          <th>Status</th>
+        </tr>" >> "$html_file"
+
+  awk -F'|' '
+    BEGIN {
+      print "<tbody>"
+    }
+    NR==FNR {
+      src_comp[$1] = $2 "|" $3
+      delete tgt_comp[$1]
+      next
+    }
+    {
+      comp=$1
+      if (comp in src_comp) {
+        split(src_comp[comp], src, "|")
+        if ($2 != src[1]) {
+          status = "version-mismatch"
+          msg = "Version mismatch"
+        } else if ($3 != src[2]) {
+          status = "status-mismatch"
+          msg = "Status mismatch"
+        } else {
+          status = "match"
+          msg = "OK"
+        }
+        printf "<tr class='%s'><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n",
+               status, comp, src[1], src[2], $2, $3, msg
+        delete src_comp[comp]
+      } else {
+        tgt_comp[$1] = $0
+      }
+    }
+    END {
+      # Print components only in source
+      for (comp in src_comp) {
+        split(src_comp[comp], src, "|")
+        printf "<tr class='missing-target'><td>%s</td><td>%s</td><td>%s</td><td colspan='2'>Not Found</td><td>Missing in target</td></tr>\n",
+               comp, src[1], src[2]
+      }
+      # Print components only in target
+      for (comp in tgt_comp) {
+        split(tgt_comp[comp], tgt, "|")
+        printf "<tr class='missing-source'><td>%s</td><td colspan='2'>Not Found</td><td>%s</td><td>%s</td><td>Missing in source</td></tr>\n",
+               comp, tgt[2], tgt[3]
+      }
+      print "</tbody>"
+    }
+  ' /tmp/src_components.txt /tmp/tgt_components.txt >> "$html_file"
+
+  echo "</table>" >> "$html_file"
+  echo "</div>" >> "$html_file"
+
+  rm -f /tmp/src_components.txt /tmp/tgt_components.txt
+}
+  init_html_report() {
+  local html_file="$1"
+  local migration="$2"
+  cat << EOF > "$html_file"
+<html>
+<head>
+<title>PDB Compatibility Report: $migration</title>
+<style>
+  /* Existing styles... */
+  tr.version-mismatch td { background-color: #ffcccc; }
+  tr.status-mismatch td { background-color: #ffe6cc; }
+  tr.missing-source td { background-color: #ffffcc; }
+  tr.missing-target td { background-color: #ffcccc; }
+  td.component { font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>PDB Compatibility Report: $migration</h1>
+<p>Generated at: $(date)</p>
+EOF
+}
 #!/bin/bash
 
 # Function to get Oracle parameters from a CDB
