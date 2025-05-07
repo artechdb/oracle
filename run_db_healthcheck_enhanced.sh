@@ -1,4 +1,93 @@
+compare_cdb_parameters() {
+    local src_conn="$1"
+    local tgt_conn="$2"
+    local html_file="$3"
+    
+    echo "<div class='section'>" >> "$html_file"
+    echo "<h2>CDB Parameter Comparison (Including Underscore Parameters)</h2>" >> "$html_file"
+    
+    # Get all parameters from both CDBs
+    src_params=$(mktemp)
+    sqlplus -s /nolog << EOF > "$src_params"
+connect $src_conn
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF LINESIZE 200
+SELECT name || '=' || value 
+FROM v\$parameter 
+WHERE ispdb_modifiable = 'FALSE'
+ORDER BY name;
+EOF
 
+    tgt_params=$(mktemp)
+    sqlplus -s /nolog << EOF > "$tgt_params"
+connect $tgt_conn
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF LINESIZE 200
+SELECT name || '=' || value 
+FROM v\$parameter 
+WHERE ispdb_modifiable = 'FALSE'
+ORDER BY name;
+EOF
+
+    # Clean SQL*Plus output
+    sed -i '/^Disconnected/d;/^$/d' "$src_params" "$tgt_params"
+
+    echo "<table>" >> "$html_file"
+    echo "<tr>
+            <th>Parameter</th>
+            <th>Source Value</th>
+            <th>Target Value</th>
+            <th>Status</th>
+          </tr>" >> "$html_file"
+
+    awk -F= '
+        BEGIN {
+            print "<tbody>"
+        }
+        NR==FNR {
+            src[$1] = $2
+            delete tgt[$1]
+            next
+        }
+        {
+            param=$1
+            if (param in src) {
+                if ($2 != src[param]) {
+                    status = "diff"
+                    msg = "❌ Mismatch"
+                } else {
+                    status = "match"
+                    msg = "✅ Match"
+                }
+                printf "<tr class=\"%s\">", status
+                printf "<td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n", 
+                    param, src[param], $2, msg
+                delete src[param]
+            } else {
+                tgt[param] = $2
+            }
+        }
+        END {
+            # Parameters only in source
+            for (param in src) {
+                printf "<tr class=\"missing\">"
+                printf "<td>%s</td><td>%s</td><td colspan=\"2\">❌ Missing in target</td></tr>\n", 
+                    param, src[param]
+            }
+            # Parameters only in target
+            for (param in tgt) {
+                printf "<tr class=\"missing\">"
+                printf "<td>%s</td><td colspan=\"2\">❌ Missing in source</td><td>%s</td></tr>\n", 
+                    param, tgt[param]
+            }
+            print "</tbody>"
+        }
+    ' "$src_params" "$tgt_params" >> "$html_file"
+
+    echo "</table>" >> "$html_file"
+    echo "</div>" >> "$html_file"
+
+    # Cleanup temporary files
+    rm -f "$src_params" "$tgt_params"
+}
 #!/bin/bash
 
 # Add this function to check MAX_STRING_SIZE
