@@ -1,3 +1,98 @@
+
+#!/bin/bash
+
+# Add this function to check MAX_STRING_SIZE
+check_max_string_size() {
+  local src_props=$1
+  local tgt_props=$2
+  local html_file=$3
+
+  echo "<h2>MAX_STRING_SIZE Compatibility</h2>" >> "$html_file"
+  echo "<table><tr><th>Parameter</th><th>Source</th><th>Target</th><th>Status</th></tr>" >> "$html_file"
+
+  src_size=$(echo "$src_props" | grep '^MAX_STRING_SIZE=' | cut -d'=' -f2)
+  tgt_size=$(echo "$tgt_props" | grep '^MAX_STRING_SIZE=' | cut -d'=' -f2)
+
+  if [ "$src_size" != "$tgt_size" ]; then
+    status="❌ Mismatch - Potential data truncation"
+    status_class="critical"
+  else
+    status="✅ Match"
+    status_class="ok"
+  fi
+
+  echo "<tr class='$status_class'>
+        <td>MAX_STRING_SIZE</td>
+        <td>$src_size</td>
+        <td>$tgt_size</td>
+        <td>$status</td>
+      </tr>" >> "$html_file"
+
+  # Add warning if source is EXTENDED but target is STANDARD
+  if [ "$src_size" = "EXTENDED" ] && [ "$tgt_size" = "STANDARD" ]; then
+    echo "<tr class='warning'>
+          <td colspan='4'>
+            ⚠️ Warning: Source uses EXTENDED (32K) while target uses STANDARD (4K). 
+            This may cause string truncation during migration.
+          </td>
+        </tr>" >> "$html_file"
+  fi
+
+  echo "</table>" >> "$html_file"
+}
+
+# Update get_db_properties to include MAX_STRING_SIZE
+get_db_properties() {
+  local conn_str=$1
+  sqlplus -s /nolog << EOF
+connect $conn_str
+SET PAGESIZE 0
+SET FEEDBACK OFF
+SET HEADING OFF
+SET SERVEROUTPUT OFF
+
+prompt VERSION=
+SELECT version FROM v\$instance;
+
+prompt COMPATIBLE=
+SELECT value FROM v\$parameter WHERE name = 'compatible';
+
+prompt CHARACTERSET=
+SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET';
+
+prompt NCHARACTERSET=
+SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_NCHAR_CHARACTERSET';
+
+prompt PLATFORM_NAME=
+SELECT platform_name FROM v\$database;
+
+prompt ENDIAN_FORMAT=
+SELECT endian_format FROM v\$transportable_platform tp, v\$database d 
+WHERE tp.platform_name = d.platform_name;
+
+prompt LOCAL_UNDO=
+SELECT local_undo_enabled FROM v\$database;
+
+prompt TDE_STATUS=
+SELECT status FROM v\$encryption_wallet;
+
+prompt TDE_WALLET_TYPE=
+SELECT wallet_type FROM v\$encryption_wallet;
+
+prompt TIMEZONE_VERSION=
+SELECT version FROM v\$timezone_file;
+
+prompt DBTIMEZONE=
+SELECT dbtimezone FROM dual;
+
+prompt MAX_STRING_SIZE=
+SELECT value FROM v\$parameter WHERE name = 'max_string_size';
+
+EXIT;
+EOF
+}
+
+
 # Function to compare DBA_REGISTRY components
 compare_dba_registry() {
   local src_conn=$1
