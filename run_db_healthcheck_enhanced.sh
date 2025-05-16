@@ -1,3 +1,79 @@
+
+compare_patch_levels() {
+    local src_conn="$1"
+    local tgt_conn="$2"
+    local html_file="$3"
+    
+    echo "<div class='section'>" >> "$html_file"
+    echo "<h2>CDB Patching Level Comparison</h2>" >> "$html_file"
+
+    # Get source CDB patch info
+    src_info=$(sqlplus -s /nolog << EOF
+connect $src_conn
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF LINESIZE 200
+SELECT version || '|' || 
+       NVL(TO_CHAR(MAX(action_time), 'YYYY-MM-DD HH24:MI:SS'), 'NO_PATCHES') || '|' ||
+       NVL(MAX(patch_id), 'NO_PATCHES')
+FROM v\$instance, dba_registry_sqlpatch
+GROUP BY version;
+EOF
+    )
+
+    # Get target CDB patch info
+    tgt_info=$(sqlplus -s /nolog << EOF
+connect $tgt_conn
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF LINESIZE 200
+SELECT version || '|' || 
+       NVL(TO_CHAR(MAX(action_time), 'YYYY-MM-DD HH24:MI:SS'), 'NO_PATCHES') || '|' ||
+       NVL(MAX(patch_id), 'NO_PATCHES')
+FROM v\$instance, dba_registry_sqlpatch
+GROUP BY version;
+EOF
+    )
+
+    # Clean SQL*Plus output
+    src_info=$(echo "$src_info" | sed '/^Disconnected/d;/^$/d')
+    tgt_info=$(echo "$tgt_info" | sed '/^Disconnected/d;/^$/d')
+
+    # Parse information
+    IFS='|' read -r src_version src_patch_date src_patch_id <<< "$src_info"
+    IFS='|' read -r tgt_version tgt_patch_date tgt_patch_id <<< "$tgt_info"
+
+    # Convert versions to comparable format
+    src_version_num=$(echo "$src_version" | awk -F. '{ printf "%04d%04d%04d%04d%04d", $1,$2,$3,$4,$5 }')
+    tgt_version_num=$(echo "$tgt_version" | awk -F. '{ printf "%04d%04d%04d%04d%04d", $1,$2,$3,$4,$5 }')
+
+    # Determine status
+    status="PASS"
+    if [[ "$src_version_num" -lt "$tgt_version_num" ]]; then
+        status="FAIL"
+        reason="Source version ($src_version) is older than target ($tgt_version)"
+    elif [[ "$src_version_num" -eq "$tgt_version_num" ]]; then
+        if [[ "$src_patch_date" != "NO_PATCHES" && "$tgt_patch_date" != "NO_PATCHES" ]]; then
+            src_epoch=$(date -d "$src_patch_date" +%s)
+            tgt_epoch=$(date -d "$tgt_patch_date" +%s)
+            [[ "$src_epoch" -lt "$tgt_epoch" ]] && {
+                status="FAIL"
+                reason="Same version ($src_version) but source patch ($src_patch_date) is older than target ($tgt_patch_date)"
+            }
+        elif [[ "$src_patch_date" == "NO_PATCHES" && "$tgt_patch_date" != "NO_PATCHES" ]]; then
+            status="FAIL"
+            reason="Same version ($src_version) but source has no patches while target has patches"
+        fi
+    fi
+
+    # Generate HTML report
+    echo "<table>
+            <tr><th>Criteria</th><th>Source CDB</th><th>Target CDB</th></tr>
+            <tr><td>Database Version</td><td>$src_version</td><td>$tgt_version</td></tr>
+            <tr><td>Latest Patch Date</td><td>${src_patch_date//NO_PATCHES/None}</td><td>${tgt_patch_date//NO_PATCHES/None}</td></tr>
+            <tr><td>Latest Patch ID</td><td>${src_patch_id//NO_PATCHES/None}</td><td>${tgt_patch_id//NO_PATCHES/None}</td></tr>
+            <tr class='$status'><td colspan='3'>Status: $status ${reason:+(Reason: $reason)}</td></tr>
+          </table>" >> "$html_file"
+
+    echo "</div>" >> "$html_file"
+}
+
 compare_cdb_parameters() {
     local src_conn="$1"
     local tgt_conn="$2"
