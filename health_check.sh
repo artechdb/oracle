@@ -1,3 +1,31 @@
+run_sql_file_report() {
+    local title="$1"
+    local sql_file="$2"
+    append_section "$title"
+    while IFS= read -r line; do
+        if echo "$line" | grep -q 'CRITICAL'; then
+            line=$(echo "$line" | sed 's/CRITICAL/<span style="color:red;"><b>CRITICAL<\/b><\/span>/g')
+        elif echo "$line" | grep -q 'WARNING'; then
+            line=$(echo "$line" | sed 's/WARNING/<span style="color:orange;"><b>WARNING<\/b><\/span>/g')
+        fi
+        echo "$line" >> "$HTML_REPORT"
+    done < <(
+        sqlplus -s "$DB_CONNECT_STRING" <<EOF
+SET LINESIZE 200
+SET PAGESIZE 100
+SET FEEDBACK OFF
+SET VERIFY OFF
+DEFINE DAYS_AGO=$DAYS_AGO
+DEFINE HOURS_AGO=$HOURS_AGO
+DEFINE MINUTES_AGO=$MINUTES_AGO
+@$sql_file
+EXIT
+EOF
+    )
+    echo "</pre>" >> "$HTML_REPORT"
+}
+
+
 #!/bin/bash
 
 # ========== CONFIGURATION ==========
