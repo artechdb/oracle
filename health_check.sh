@@ -365,28 +365,38 @@ SELECT inst_id,
  WHERE resource_name IN ('sessions', 'processes')
  ORDER BY inst_id, resource_name;
  04_sga_pga_usage.sql
- SET PAGESIZE 100
+SET PAGESIZE 100
 SET LINESIZE 200
 COLUMN instance FORMAT 99
 COLUMN pga_alloc_mb FORMAT 999999.99
 COLUMN sga_mem_mb FORMAT 999999.99
 COLUMN status FORMAT A10
 
-SELECT i.inst_id AS instance,
-       ROUND(SUM(CASE WHEN name = 'total PGA allocated' THEN value END)/1024/1024, 2) AS pga_alloc_mb,
-       ROUND(SUM(CASE WHEN name = 'SGA Memory' THEN bytes END)/1024/1024, 2) AS sga_mem_mb,
+WITH pga AS (
+  SELECT inst_id,
+         ROUND(SUM(value)/1024/1024, 2) AS pga_alloc_mb
+    FROM gv$pgastat
+   WHERE name = 'total PGA allocated'
+   GROUP BY inst_id
+),
+sga AS (
+  SELECT inst_id,
+         ROUND(SUM(value)/1024/1024, 2) AS sga_mem_mb
+    FROM gv$sga
+   GROUP BY inst_id
+)
+SELECT p.inst_id AS instance,
+       p.pga_alloc_mb,
+       s.sga_mem_mb,
        CASE
-         WHEN SUM(CASE WHEN name = 'total PGA allocated' THEN value END)/1024/1024 > 2048 THEN 'CRITICAL'
-         WHEN SUM(CASE WHEN name = 'total PGA allocated' THEN value END)/1024/1024 > 1024 THEN 'WARNING'
+         WHEN p.pga_alloc_mb > 2048 THEN 'CRITICAL'
+         WHEN p.pga_alloc_mb > 1024 THEN 'WARNING'
          ELSE 'OK'
        END AS status
-  FROM gv$pgastat p
-  JOIN gv$sgainfo s ON p.inst_id = s.inst_id
-  JOIN gv$instance i ON i.inst_id = p.inst_id
- WHERE p.name = 'total PGA allocated'
-   AND s.name = 'SGA Memory'
- GROUP BY i.inst_id
- ORDER BY i.inst_id;
+  FROM pga p
+  JOIN sga s ON p.inst_id = s.inst_id
+ ORDER BY p.inst_id;
+
  05_blocking_sessions.sql
  SET PAGESIZE 100
 SELECT inst_id,
