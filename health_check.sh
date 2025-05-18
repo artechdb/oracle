@@ -566,7 +566,52 @@ SELECT name,
          ELSE 'OK'
        END AS status
   FROM v$recovery_file_dest;
-  
+  20_ashtop_5minutes.sql
+  SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN username FORMAT A15
+COLUMN sql_id FORMAT A15
+COLUMN aas FORMAT 999.99
+COLUMN status FORMAT A10
+
+PROMPT === ASH TOP SQL (LAST 5 MINUTES) WITH AAS THRESHOLD ===
+
+SELECT username,
+       sql_id,
+       COUNT(*) / (5 * 60) AS aas,
+       CASE
+         WHEN COUNT(*) / (5 * 60) > 20 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE sample_time > SYSDATE - 5 / (24 * 60)
+   AND session_type = 'FOREGROUND'
+ GROUP BY username, sql_id
+ ORDER BY aas DESC
+FETCH FIRST 10 ROWS ONLY;
+21_ashtop_1hour.sql
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN username FORMAT A15
+COLUMN sql_id FORMAT A15
+COLUMN aas FORMAT 999.99
+COLUMN status FORMAT A10
+
+PROMPT === ASH TOP SQL (LAST 1 HOUR) WITH AAS THRESHOLD ===
+
+SELECT username,
+       sql_id,
+       COUNT(*) / (60 * 60) AS aas,
+       CASE
+         WHEN COUNT(*) / (60 * 60) > 20 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE sample_time > SYSDATE - 1 / 24
+   AND session_type = 'FOREGROUND'
+ GROUP BY username, sql_id
+ ORDER BY aas DESC
+FETCH FIRST 10 ROWS ONLY;
 22
 SET PAGESIZE 100
 SET LINESIZE 200
@@ -617,6 +662,99 @@ SELECT s.inst_id,
  WHERE s.username IS NOT NULL
    AND l.type = 'TX'
  ORDER BY s.inst_id, s.sid;
+
+24_invalid_objects_last_hour.sql
+
+SET PAGESIZE 100
+SET LINESIZE 200
+SELECT owner, object_name, object_type, status, last_ddl_time
+  FROM dba_objects
+ WHERE status = 'INVALID'
+   AND last_ddl_time > SYSDATE - 1/24
+ ORDER BY last_ddl_time DESC;
+
+ 25_invalid_indexes_last_hour.sql
+SET PAGESIZE 100
+SET LINESIZE 200
+SELECT i.owner, i.index_name, i.index_type, i.status, i.last_analyzed,
+       p.partition_name
+  FROM dba_indexes i
+  LEFT JOIN dba_ind_partitions p ON i.index_name = p.index_name AND i.owner = p.index_owner
+ WHERE i.status = 'UNUSABLE'
+    OR (p.status = 'UNUSABLE' AND p.last_analyzed > SYSDATE - 1/24)
+ ORDER BY i.owner, i.index_name;
+
+ 26_top10_long_running_sessions.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+SELECT s.inst_id, s.sid, s.serial#, s.username, s.program,
+       s.sql_id, s.status,
+       ROUND((SYSDATE - s.logon_time) * 24 * 60, 2) AS minutes_active
+  FROM gv$session s
+ WHERE s.status = 'ACTIVE'
+   AND s.type = 'USER'
+   AND s.logon_time > SYSDATE - 1/24
+ ORDER BY minutes_active DESC FETCH FIRST 10 ROWS ONLY;
+
+ 27_session_failures_last_hour.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+SELECT session_id, instance_number, username, action_name, error_number, error_message, event_timestamp
+  FROM dba_audit_session
+ WHERE returncode != 0
+   AND event_timestamp > SYSDATE - 1/24
+ ORDER BY event_timestamp DESC;
+
+ 28_active_db_services.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+SELECT name, network_name, creation_date
+  FROM dba_services
+ WHERE enabled = 'TRUE';
+
+
+ 29_current_active_session_count.sql
+
+ SET PAGESIZE 100
+SET LINESIZE 200
+SELECT inst_id, COUNT(*) AS active_sessions
+  FROM gv$session
+ WHERE status = 'ACTIVE'
+ GROUP BY inst_id
+ ORDER BY inst_id;
+
+ 30_downgraded_parallel_sessions.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+SELECT sid, username, degree, requested_degree, sql_id, program
+  FROM gv$px_session
+ WHERE degree < requested_degree
+ ORDER BY degree;
+
+ 31_unstable_sql_plans_24h.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN sql_id FORMAT A15
+COLUMN plan_hash_value FORMAT 9999999999
+COLUMN execs FORMAT 999999
+COLUMN avg_etime FORMAT 99999.99
+COLUMN module FORMAT A20
+
+SELECT sql_id,
+       COUNT(DISTINCT plan_hash_value) AS plan_count,
+       MIN(plan_hash_value) KEEP (DENSE_RANK FIRST ORDER BY elapsed_time_total DESC) AS sample_plan,
+       SUM(executions_delta) AS execs,
+       ROUND(SUM(elapsed_time_delta)/1000000/NULLIF(SUM(executions_delta), 0), 2) AS avg_etime_secs,
+       MIN(module) AS module
+  FROM dba_hist_sqlstat
+ WHERE snap_id IN (
+       SELECT snap_id FROM dba_hist_snapshot
+        WHERE begin_interval_time > SYSDATE - 1)
+ GROUP BY sql_id
+HAVING COUNT(DISTINCT plan_hash_value) > 1
+ORDER BY plan_count DESC, execs DESC
+FETCH FIRST 20 ROWS ONLY;
+ 
 32_sga_pga_advisory.sql
 SET PAGESIZE 100
 SET LINESIZE 200
@@ -711,6 +849,152 @@ SELECT a.inst_id,
   FROM active_sessions a
   JOIN cpu_cores c ON a.inst_id = c.inst_id
  ORDER BY a.inst_id;
+ 43_realtime_cpu_utilization.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN inst_id FORMAT 99
+COLUMN cpu_busy_secs FORMAT 999999.99
+COLUMN total_cpu_secs FORMAT 999999.99
+COLUMN cpu_util_pct FORMAT 999.99
+COLUMN status FORMAT A10
+
+PROMPT === REAL-TIME CPU UTILIZATION (GV$OSSTAT) - ORACLE 19C RAC ===
+
+WITH os_stat AS (
+  SELECT inst_id,
+         MAX(CASE WHEN stat_name = 'BUSY_TIME' THEN value END) AS busy_time,
+         MAX(CASE WHEN stat_name = 'IDLE_TIME' THEN value END) AS idle_time
+    FROM gv$osstat
+   WHERE stat_name IN ('BUSY_TIME', 'IDLE_TIME')
+   GROUP BY inst_id
+)
+SELECT inst_id,
+       ROUND(busy_time / 100, 2) AS cpu_busy_secs,
+       ROUND((busy_time + idle_time) / 100, 2) AS total_cpu_secs,
+       ROUND((busy_time / (busy_time + idle_time)) * 100, 2) AS cpu_util_pct,
+       CASE
+         WHEN (busy_time / (busy_time + idle_time)) * 100 > 90 THEN 'CRITICAL'
+         WHEN (busy_time / (busy_time + idle_time)) * 100 > 75 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM os_stat
+ ORDER BY inst_id;
+ 44_rac_gc_waits.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN event FORMAT A40
+COLUMN samples FORMAT 99999
+COLUMN pct FORMAT 999.99
+COLUMN status FORMAT A10
+
+PROMPT === TOP GLOBAL CACHE WAITS (GV$ACTIVE_SESSION_HISTORY) ===
+
+SELECT event,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct,
+       CASE
+         WHEN event LIKE 'gc%' AND COUNT(*) > 100 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE event LIKE 'gc%'
+   AND sample_time > SYSDATE - (&HOURS_AGO / 24)
+ GROUP BY event
+ ORDER BY samples DESC
+FETCH FIRST 10 ROWS ONLY;
+45_rac_gc_waits_by_instance.sql
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN inst_id FORMAT 99
+COLUMN event FORMAT A40
+COLUMN count FORMAT 99999
+COLUMN status FORMAT A10
+
+PROMPT === GC WAITS BY INSTANCE (GV$ACTIVE_SESSION_HISTORY) ===
+
+SELECT inst_id,
+       event,
+       COUNT(*) AS count,
+       CASE
+         WHEN COUNT(*) > 500 THEN 'CRITICAL'
+         WHEN COUNT(*) > 200 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE event LIKE 'gc%' AND sample_time > SYSDATE - (&HOURS_AGO / 24)
+ GROUP BY inst_id, event
+ ORDER BY inst_id, count DESC;
+46_rac_blocking_ges.sql
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN blocking_session FORMAT 99999
+COLUMN blocking_inst_id FORMAT 99
+COLUMN blocks FORMAT 9999
+COLUMN first_seen FORMAT A20
+COLUMN last_seen FORMAT A20
+COLUMN status FORMAT A10
+
+PROMPT === GES BLOCKING EVENTS (GV$ACTIVE_SESSION_HISTORY) ===
+
+SELECT blocking_session, blocking_inst_id,
+       COUNT(*) AS blocks,
+       TO_CHAR(MIN(sample_time), 'YYYY-MM-DD HH24:MI') AS first_seen,
+       TO_CHAR(MAX(sample_time), 'YYYY-MM-DD HH24:MI') AS last_seen,
+       CASE
+         WHEN COUNT(*) > 20 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE blocking_session IS NOT NULL
+   AND sample_time > SYSDATE - (&HOURS_AGO / 24)
+ GROUP BY blocking_session, blocking_inst_id
+ ORDER BY blocks DESC;
+
+ 47_rac_interconnect_stats.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN inst_id FORMAT 99
+COLUMN name FORMAT A40
+COLUMN mb FORMAT 999999.99
+COLUMN status FORMAT A10
+
+PROMPT === HIGH INTERCONNECT ACTIVITY (GV$SYSSTAT) ===
+
+SELECT inst_id,
+       name,
+       ROUND(value / 1024 / 1024, 2) AS mb,
+       CASE
+         WHEN value > 500000000 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$sysstat
+ WHERE name IN (
+       'gc current blocks received',
+       'gc cr blocks received',
+       'gc current blocks served',
+       'gc cr blocks served'
+     )
+ ORDER BY inst_id, name;
+ 48_rac_global_enqueue_contention.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN event FORMAT A40
+COLUMN samples FORMAT 99999
+COLUMN status FORMAT A10
+
+PROMPT === GLOBAL ENQUEUE CONTENTION (GV$ACTIVE_SESSION_HISTORY) ===
+
+SELECT event,
+       COUNT(*) AS samples,
+       CASE
+         WHEN COUNT(*) > 50 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE event LIKE 'ges%'
+   AND sample_time > SYSDATE - (&HOURS_AGO / 24)
+ GROUP BY event
+ ORDER BY samples DESC;
  49
  SET PAGESIZE 100
 SET LINESIZE 200
@@ -770,4 +1054,194 @@ SELECT sql_id,
  WHERE io_interconnect_bytes IS NOT NULL
    AND last_refresh_time > SYSDATE - 1/24
  ORDER BY last_refresh_time DESC
+FETCH FIRST 10 ROWS ONLY;
+
+26_top10_long_running_sessions.sql
+SET PAGESIZE 100
+SET LINESIZE 200
+SELECT s.inst_id, s.sid, s.serial#, s.username, s.program,
+       s.sql_id, s.status,
+       ROUND((SYSDATE - s.logon_time) * 24 * 60, 2) AS minutes_active
+  FROM gv$session s
+ WHERE s.status = 'ACTIVE'
+   AND s.type = 'USER'
+   AND s.logon_time > SYSDATE - 1/24
+ ORDER BY minutes_active DESC FETCH FIRST 10 ROWS ONLY;
+
+ 27_session_failures_last_hour.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+SELECT session_id, instance_number, username, action_name, error_number, error_message, event_timestamp
+  FROM dba_audit_session
+ WHERE returncode != 0
+   AND event_timestamp > SYSDATE - 1/24
+ ORDER BY event_timestamp DESC;
+
+ 28_active_db_services.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+SELECT name, network_name, creation_date
+  FROM dba_services
+ WHERE enabled = 'TRUE';
+ 29_current_active_session_count.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+SELECT inst_id, COUNT(*) AS active_sessions
+  FROM gv$session
+ WHERE status = 'ACTIVE'
+ GROUP BY inst_id
+ ORDER BY inst_id;
+
+ 30_downgraded_parallel_sessions.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+SELECT sid, username, degree, requested_degree, sql_id, program
+  FROM gv$px_session
+ WHERE degree < requested_degree
+ ORDER BY degree;
+
+ 31_unstable_sql_plans_24h.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN sql_id FORMAT A15
+COLUMN plan_hash_value FORMAT 9999999999
+COLUMN execs FORMAT 999999
+COLUMN avg_etime FORMAT 99999.99
+COLUMN module FORMAT A20
+
+SELECT sql_id,
+       COUNT(DISTINCT plan_hash_value) AS plan_count,
+       MIN(plan_hash_value) KEEP (DENSE_RANK FIRST ORDER BY elapsed_time_total DESC) AS sample_plan,
+       SUM(executions_delta) AS execs,
+       ROUND(SUM(elapsed_time_delta)/1000000/NULLIF(SUM(executions_delta), 0), 2) AS avg_etime_secs,
+       MIN(module) AS module
+  FROM dba_hist_sqlstat
+ WHERE snap_id IN (
+       SELECT snap_id FROM dba_hist_snapshot
+        WHERE begin_interval_time > SYSDATE - 1)
+ GROUP BY sql_id
+HAVING COUNT(DISTINCT plan_hash_value) > 1
+ORDER BY plan_count DESC, execs DESC
+FETCH FIRST 20 ROWS ONLY;
+38_exadata_smart_scan_usage.sql
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN sql_id FORMAT A15
+COLUMN sql_text FORMAT A50
+COLUMN elapsed_time FORMAT 999999.99
+COLUMN io_interconnect_bytes FORMAT 999999999
+COLUMN status FORMAT A10
+
+PROMPT === EXADATA SMART SCAN USAGE (RECENT SQLS) ===
+
+SELECT sql_id,
+       SUBSTR(sql_text, 1, 50) AS sql_text,
+       elapsed_time / 1000000 AS elapsed_time,
+       io_interconnect_bytes,
+       CASE
+         WHEN io_interconnect_bytes > 0 THEN 'OK'
+         ELSE 'WARNING'
+       END AS status
+  FROM v$sql_monitor
+ WHERE io_interconnect_bytes IS NOT NULL
+   AND last_refresh_time > SYSDATE - 1/24
+ ORDER BY last_refresh_time DESC
+FETCH FIRST 10 ROWS ONLY;
+
+41_exadata_iorm_plan.sql
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN name FORMAT A30
+COLUMN value FORMAT A30
+COLUMN status FORMAT A10
+
+PROMPT === EXADATA IORM CONFIGURATION (GV$CELL_CONFIG) ===
+
+SELECT inst_id,
+       name,
+       value,
+       CASE
+         WHEN name = 'iormPlanStatus' AND LOWER(value) LIKE '%active%' THEN 'OK'
+         ELSE 'INFO'
+       END AS status
+  FROM gv$cell_config
+ WHERE name IN ('iormPlanObject', 'iormPlanStatus', 'iormPlan')
+ ORDER BY inst_id, name;
+50_blocking_session_chains.sql
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN inst_id FORMAT 99
+COLUMN sid FORMAT 99999
+COLUMN serial# FORMAT 99999
+COLUMN username FORMAT A15
+COLUMN blocking_sid FORMAT 99999
+COLUMN blocking_inst FORMAT 99
+COLUMN wait_event FORMAT A40
+COLUMN status FORMAT A10
+
+PROMPT === BLOCKING SESSION CHAINS (GV$SESSION) ===
+
+SELECT s.inst_id,
+       s.sid,
+       s.serial#,
+       s.username,
+       s.blocking_session AS blocking_sid,
+       s.blocking_instance AS blocking_inst,
+       s.event AS wait_event,
+       CASE
+         WHEN s.blocking_session IS NOT NULL THEN 'BLOCKED'
+         ELSE 'OK'
+       END AS status
+  FROM gv$session s
+ WHERE s.username IS NOT NULL
+   AND s.blocking_session IS NOT NULL
+ ORDER BY s.inst_id, s.sid;
+
+ 50_blocking_session_chains.sql
+51_ora_01017_login_errors.sql
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN originating_timestamp FORMAT A30
+COLUMN message_text FORMAT A100
+COLUMN host_info FORMAT A40
+COLUMN status FORMAT A10
+
+PROMPT === ORA-01017 LOGIN DENIED ERRORS FROM ALERT LOG (LAST 1 HOUR) ===
+
+SELECT TO_CHAR(originating_timestamp, 'YYYY-MM-DD HH24:MI:SS') AS originating_timestamp,
+       message_text,
+       REGEXP_SUBSTR(message_text, 'host: \S+', 1, 1) AS host_info,
+       'CRITICAL' AS status
+  FROM x$dbgalertext
+ WHERE originating_timestamp > SYSDATE - 1/24
+   AND LOWER(message_text) LIKE '%ora-01017%'
+ ORDER BY originating_timestamp DESC;
+ 52_awr_exadata_smart_scan.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN sql_id FORMAT A15
+COLUMN elapsed_s FORMAT 999999.99
+COLUMN execs FORMAT 99999
+COLUMN buffer_gets FORMAT 999999999
+COLUMN disk_reads FORMAT 99999999
+COLUMN status FORMAT A10
+
+PROMPT === AWR SMART SCAN INSIGHT (LAST 1 DAY FROM DBA_HIST_SQLSTAT) ===
+
+SELECT s.sql_id,
+       ROUND(SUM(s.elapsed_time_delta)/1e6, 2) AS elapsed_s,
+       SUM(s.executions_delta) AS execs,
+       SUM(s.buffer_gets_delta) AS buffer_gets,
+       SUM(s.disk_reads_delta) AS disk_reads,
+       CASE
+         WHEN SUM(s.disk_reads_delta) > 0 AND SUM(s.buffer_gets_delta)/SUM(s.disk_reads_delta) < 5 THEN 'OK'
+         ELSE 'WARNING'
+       END AS status
+  FROM dba_hist_sqlstat s
+ WHERE s.snap_id IN (
+       SELECT snap_id FROM dba_hist_snapshot
+        WHERE begin_interval_time > SYSDATE - 1
+     )
+ GROUP BY s.sql_id
+ ORDER BY elapsed_s DESC
 FETCH FIRST 10 ROWS ONLY;
