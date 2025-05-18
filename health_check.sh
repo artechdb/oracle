@@ -352,7 +352,18 @@ SELECT service_hash,
  04_sga_pga_usage.sql
  05_blocking_sessions.sql
  06_long_running_sessions.sql
+ SET PAGESIZE 100
+SELECT inst_id,
+       sid, serial#, username, status, logon_time,
+       ROUND((SYSDATE - logon_time)*24, 2) AS hours_logged_in
+  FROM gv$session
+ WHERE status = 'ACTIVE' AND logon_time < SYSDATE - 1/24;
  07_io_response_time.sql
+ SET PAGESIZE 100
+SELECT inst_id, name,
+       ROUND(phyblkrd/time_waited_read_micro, 2) AS read_resp_ms,
+       ROUND(phyblkwrt/time_waited_write_micro, 2) AS write_resp_ms
+  FROM gv$iostat_file;
  08_wait_events_window.sql
  SET PAGESIZE 100
 SET LINESIZE 200
@@ -471,14 +482,91 @@ SELECT TO_CHAR(c.begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
  ORDER BY c.begin_interval_time DESC, n.instance_name;
  10_top_waits_by_instance.sql
  11_global_cache_stats.sql
+ SET PAGESIZE 100
+SELECT inst_id, name, value
+  FROM gv$sysstat
+ WHERE name IN ('gc cr blocks received', 'gc current blocks received',
+                'gc cr block busy', 'gc current block busy',
+                'gc cr block lost', 'gc current block lost')
+ ORDER BY inst_id;
  12_top_sql_elapsed.sql
+ SET PAGESIZE 100
+SELECT *
+  FROM (SELECT sql_id, plan_hash_value, elapsed_time_delta/1000000 elapsed_sec,
+               executions_delta execs,
+               module, sql_text
+          FROM dba_hist_sqlstat NATURAL JOIN dba_hist_sqltext
+         WHERE snap_id IN (SELECT MAX(snap_id) FROM dba_hist_snapshot WHERE begin_interval_time > SYSDATE - &HOURS_AGO/24)
+         ORDER BY elapsed_sec DESC)
+ WHERE ROWNUM <= 10;
+ 
  13_tablespace_usage.sql
+ SET PAGESIZE 100
+SELECT tablespace_name,
+       ROUND(used_space*8/1024) AS used_mb,
+       ROUND((tablespace_size - used_space)*8/1024) AS free_mb,
+       ROUND((used_space/tablespace_size)*100,2) AS pct_used
+  FROM dba_tablespace_usage_metrics
+ ORDER BY pct_used DESC;
  14_asm_diskgroup_usage.sql
+ SET PAGESIZE 100
+SELECT name,
+       ROUND(total_mb/1024) total_gb,
+       ROUND(free_mb/1024) free_gb,
+       ROUND((1-(free_mb/total_mb))*100,2) pct_used
+  FROM v$asm_diskgroup;
 15_log_sync_contention.sql
+SET PAGESIZE 100
+SELECT inst_id,
+       event,
+       COUNT(*) AS wait_count,
+       ROUND(AVG(wait_time)) AS avg_wait_ms
+  FROM gv$active_session_history
+ WHERE event = 'log file sync'
+   AND sample_time > SYSDATE - &HOURS_AGO/24
+ GROUP BY inst_id, event
+ ORDER BY wait_count DESC;
+ 
 16_temp_usage.sql
+SET PAGESIZE 100
+SELECT inst_id, tablespace_name,
+       ROUND(used_blocks*8192/1024/1024) used_mb
+  FROM gv$sort_segment
+ WHERE used_blocks > 0;
+ 
 17_parse_to_exec_ratio.sql
+SET PAGESIZE 100
+SELECT inst_id,
+       ROUND((parse_calls/executions)*100, 2) AS parse_to_exec_pct,
+       executions, parse_calls
+  FROM gv$sql
+ WHERE executions > 100
+ ORDER BY parse_to_exec_pct DESC
+ FETCH FIRST 10 ROWS WITH TIES;
+ 
 18_log_switch_history.sql
+SET PAGESIZE 100
+SELECT TO_CHAR(first_time, 'YYYY-MM-DD HH24') AS hour,
+       COUNT(*) AS switch_count
+  FROM v$log_history
+ WHERE first_time >= SYSDATE - &DAYS_AGO
+ GROUP BY TO_CHAR(first_time, 'YYYY-MM-DD HH24')
+ ORDER BY hour;
+ 
 19_fra_usage.sql
+SET PAGESIZE 100
+SELECT name,
+       space_limit/1024/1024 AS limit_mb,
+       space_used/1024/1024 AS used_mb,
+       space_reclaimable/1024/1024 AS reclaimable_mb,
+       ROUND((space_used/space_limit)*100, 2) AS pct_used,
+       CASE
+         WHEN ROUND((space_used/space_limit)*100, 2) > 95 THEN 'CRITICAL'
+         WHEN ROUND((space_used/space_limit)*100, 2) > 85 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM v$recovery_file_dest;
+  
 22
 SET PAGESIZE 100
 SET LINESIZE 200
