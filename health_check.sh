@@ -410,10 +410,47 @@ SELECT inst_id,
  WHERE status = 'ACTIVE' AND logon_time < SYSDATE - 1/24;
  07_io_response_time.sql
  SET PAGESIZE 100
-SELECT inst_id, name,
-       ROUND(phyblkrd/time_waited_read_micro, 2) AS read_resp_ms,
-       ROUND(phyblkwrt/time_waited_write_micro, 2) AS write_resp_ms
-  FROM gv$iostat_file;
+SET LINESIZE 200
+COLUMN begin_time FORMAT A20
+COLUMN instance_name FORMAT A20
+COLUMN avg_latency FORMAT 999.99
+COLUMN io_requests FORMAT 9999999
+COLUMN status FORMAT A10
+
+PROMPT === IO RESPONSE TIME (AVG SYNC SINGLE-BLOCK READ LATENCY) - ORACLE 19C ===
+
+WITH io_latency AS (
+  SELECT s.snap_id,
+         CAST(s.begin_interval_time AS DATE) AS begin_interval_time,
+         h.instance_number,
+         MAX(CASE WHEN h.metric_name = 'Average Synchronous Single-Block Read Latency' THEN h.value END) AS avg_latency,
+         MAX(CASE WHEN h.metric_name = 'Physical Read Total IO Requests Per Sec' THEN h.value END) +
+         MAX(CASE WHEN h.metric_name = 'Physical Write Total IO Requests Per Sec' THEN h.value END) AS io_requests
+    FROM dba_hist_sysmetric_history h
+    JOIN dba_hist_snapshot s ON h.snap_id = s.snap_id AND h.instance_number = s.instance_number
+   WHERE h.metric_name IN (
+         'Average Synchronous Single-Block Read Latency',
+         'Physical Read Total IO Requests Per Sec',
+         'Physical Write Total IO Requests Per Sec'
+       )
+     AND s.begin_interval_time >= SYSDATE - &DAYS_AGO
+   GROUP BY s.snap_id, s.begin_interval_time, h.instance_number
+),
+instances AS (
+  SELECT DISTINCT instance_number, instance_name FROM gv$instance
+)
+SELECT TO_CHAR(i.begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
+       n.instance_name,
+       ROUND(i.avg_latency, 2) AS avg_latency,
+       ROUND(i.io_requests, 2) AS io_requests,
+       CASE
+         WHEN i.avg_latency > 20 THEN 'CRITICAL'
+         WHEN i.avg_latency > 10 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM io_latency i
+  LEFT JOIN instances n ON i.instance_number = n.instance_number
+ ORDER BY i.begin_interval_time DESC, n.instance_name;
  08_wait_events_window.sql
  SET PAGESIZE 100
 SET LINESIZE 200
@@ -472,7 +509,7 @@ COLUMN db_time_per_cpu FORMAT 999999.99
 COLUMN io_mb FORMAT 999999.99
 COLUMN status FORMAT A10
 
-PROMPT === INSTANCE SKEW (PER-CPU LOAD & I/O) - ORACLE 19C RAC ===
+PROMPT === 9.INSTANCE SKEW (PER-CPU LOAD & I/O) - ORACLE 19C RAC ===
 
 WITH workload AS (
   SELECT s.snap_id,
@@ -1244,6 +1281,86 @@ SELECT inst_id,
   FROM gv$cell_config
  WHERE name IN ('iormPlanObject', 'iormPlanStatus', 'iormPlan')
  ORDER BY inst_id, name;
+
+ 
+44_rac_gc_waits.sql – Global cache contention (top events)
+PROMPT === GES BLOCKING EVENTS (GV$ACTIVE_SESSION_HISTORY) ===
+SELECT blocking_session, blocking_inst_id,
+       COUNT(*) AS blocks,
+       MIN(sample_time) AS first_seen,
+       MAX(sample_time) AS last_seen,
+       CASE
+         WHEN COUNT(*) > 20 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE blocking_session IS NOT NULL
+   AND sample_time > SYSDATE - (&HOURS_AGO / 24)
+ GROUP BY blocking_session, blocking_inst_id
+ ORDER BY blocks DESC;
+45_rac_gc_waits_by_instance.sql – GC wait breakdown per node
+PROMPT === GC WAITS BY INSTANCE (GV$ACTIVE_SESSION_HISTORY) ===
+SELECT inst_id,
+       event,
+       COUNT(*) AS count,
+       CASE
+         WHEN COUNT(*) > 500 THEN 'CRITICAL'
+         WHEN COUNT(*) > 200 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE event LIKE 'gc%' AND sample_time > SYSDATE - (&HOURS_AGO / 24)
+ GROUP BY inst_id, event
+ ORDER BY inst_id, count DESC;
+46_rac_blocking_ges.sql – GES blocking sessions (RAC locks)
+PROMPT === GES BLOCKING EVENTS (GV$ACTIVE_SESSION_HISTORY) ===
+SELECT blocking_session, blocking_inst_id,
+       COUNT(*) AS blocks,
+       MIN(sample_time) AS first_seen,
+       MAX(sample_time) AS last_seen,
+       CASE
+         WHEN COUNT(*) > 20 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE blocking_session IS NOT NULL
+   AND sample_time > SYSDATE - (&HOURS_AGO / 24)
+ GROUP BY blocking_session, blocking_inst_id
+ ORDER BY blocks DESC;
+
+47_rac_interconnect_stats.sql – Interconnect activity (GC blocks)
+PROMPT === HIGH INTERCONNECT ACTIVITY (GV$SYSSTAT) ===
+SELECT inst_id,
+       name,
+       ROUND(value / 1024 / 1024, 2) AS mb,
+       CASE
+         WHEN value > 500000000 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$sysstat
+ WHERE name IN (
+       'gc current blocks received',
+       'gc cr blocks received',
+       'gc current blocks served',
+       'gc cr blocks served'
+     )
+ ORDER BY inst_id, name;
+
+48_rac_global_enqueue_contention.sql – Enqueue waits via GES
+PROMPT === GLOBAL ENQUEUE CONTENTION (GV$ACTIVE_SESSION_HISTORY) ===
+SELECT event,
+       COUNT(*) AS samples,
+       CASE
+         WHEN COUNT(*) > 50 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE event LIKE 'ges%'
+   AND sample_time > SYSDATE - (&HOURS_AGO / 24)
+ GROUP BY event
+ ORDER BY samples DESC;
+
+
 50_blocking_session_chains.sql
 SET PAGESIZE 100
 SET LINESIZE 200
