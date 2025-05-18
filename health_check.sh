@@ -349,8 +349,58 @@ SELECT service_hash,
  GROUP BY service_hash, service_name, instance_number, session_type
  ORDER BY instance, service_name;
  03_sessions_processes.sql
+ SET PAGESIZE 100
+SELECT inst_id,
+       resource_name,
+       current_utilization,
+       max_utilization,
+       limit_value,
+       ROUND((current_utilization/limit_value)*100,2) AS utilization_pct,
+       CASE
+         WHEN ROUND((current_utilization/limit_value)*100,2) > 90 THEN 'CRITICAL'
+         WHEN ROUND((current_utilization/limit_value)*100,2) > 80 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM gv$resource_limit
+ WHERE resource_name IN ('sessions', 'processes')
+ ORDER BY inst_id, resource_name;
  04_sga_pga_usage.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN instance FORMAT 99
+COLUMN pga_alloc_mb FORMAT 999999.99
+COLUMN sga_mem_mb FORMAT 999999.99
+COLUMN status FORMAT A10
+
+SELECT i.inst_id AS instance,
+       ROUND(SUM(CASE WHEN name = 'total PGA allocated' THEN value END)/1024/1024, 2) AS pga_alloc_mb,
+       ROUND(SUM(CASE WHEN name = 'SGA Memory' THEN bytes END)/1024/1024, 2) AS sga_mem_mb,
+       CASE
+         WHEN SUM(CASE WHEN name = 'total PGA allocated' THEN value END)/1024/1024 > 2048 THEN 'CRITICAL'
+         WHEN SUM(CASE WHEN name = 'total PGA allocated' THEN value END)/1024/1024 > 1024 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM gv$pgastat p
+  JOIN gv$sgainfo s ON p.inst_id = s.inst_id
+  JOIN gv$instance i ON i.inst_id = p.inst_id
+ WHERE p.name = 'total PGA allocated'
+   AND s.name = 'SGA Memory'
+ GROUP BY i.inst_id
+ ORDER BY i.inst_id;
  05_blocking_sessions.sql
+ SET PAGESIZE 100
+SELECT inst_id,
+       sid, serial#,
+       blocking_session,
+       blocking_instance,
+       wait_class, seconds_in_wait, event,
+       CASE
+         WHEN blocking_session IS NOT NULL THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$session
+ WHERE blocking_session IS NOT NULL;
+
  06_long_running_sessions.sql
  SET PAGESIZE 100
 SELECT inst_id,
@@ -481,6 +531,12 @@ SELECT TO_CHAR(c.begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
   LEFT JOIN instance_names n ON c.instance_number = n.instance_number
  ORDER BY c.begin_interval_time DESC, n.instance_name;
  10_top_waits_by_instance.sql
+ SET PAGESIZE 100
+SELECT inst_id, event, COUNT(*) AS waits
+  FROM gv$active_session_history
+ WHERE sample_time > SYSDATE - &HOURS_AGO/24
+ GROUP BY inst_id, event
+ ORDER BY inst_id, waits DESC FETCH FIRST 10 ROWS WITH TIES;
  11_global_cache_stats.sql
  SET PAGESIZE 100
 SELECT inst_id, name, value
@@ -791,7 +847,28 @@ SELECT ROUND(sga_size / 1024) AS target_mb,
   FROM v$sga_target_advice
  WHERE sga_size_factor BETWEEN 0.5 AND 2
  ORDER BY sga_size;
- 
+ 33_top_sql_io.sql
+ SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN sql_id FORMAT A15
+COLUMN executions FORMAT 9999999
+COLUMN disk_reads FORMAT 9999999
+COLUMN avg_io FORMAT 999999.99
+COLUMN module FORMAT A20
+
+PROMPT === TOP 5 SQLs BY DISK READS ===
+SELECT *
+  FROM (
+    SELECT sql_id,
+           executions_delta AS executions,
+           disk_reads_delta AS disk_reads,
+           ROUND(disk_reads_delta / NULLIF(executions_delta, 0), 2) AS avg_io,
+           module
+      FROM dba_hist_sqlstat
+     WHERE executions_delta > 0
+     ORDER BY disk_reads_delta DESC
+  )
+WHERE ROWNUM <= 5;
 34_top_sql_cpu.sql
 SET PAGESIZE 100
 SET LINESIZE 200
