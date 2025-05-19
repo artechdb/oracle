@@ -1,3 +1,113 @@
+determine_primary_cdb() {
+    local standby_conn="$1"
+    local html_file="$2"
+    local primary_conn=""
+    local tns_desc=""
+    local primary_host=""
+    local primary_port=""
+    local primary_db_name=""
+    local primary_db_unique_name=""
+
+    echo "<div class='section'>" >> "$html_file"
+    echo "<h2>Primary CDB Determination</h2>" >> "$html_file"
+
+    # Verify standby status
+    standby_check=$(sqlplus -s /nolog << EOF
+connect $standby_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT database_role FROM v\$database;
+EOF
+    )
+
+    if [[ "$standby_check" != *"PHYSICAL STANDBY"* ]]; then
+        echo "<p class='critical'>❌ Provided database is not a physical standby</p>" >> "$html_file"
+        echo "</div>" >> "$html_file"
+        return 1
+    fi
+
+    # Try Data Guard Broker first
+    broker_config=$(sqlplus -s /nolog << EOF
+connect $standby_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT 'BROKER_CONFIG=' || LOWER(value) FROM v\$parameter WHERE name = 'dg_broker_config_file';
+EOF
+    )
+
+    if [[ "$broker_config" == *"dg_broker_config_file"* ]]; then
+        primary_info=$(sqlplus -s /nolog << EOF
+connect $standby_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT 'PRIMARY_DB=' || database || '|HOST=' || target_host || '|PORT=' || target_port 
+FROM v\$dg_broker_targets 
+WHERE target_type = 'PRIMARY';
+EOF
+        )
+        IFS='|' read -r db_part host_part port_part <<< "$(echo "$primary_info" | grep 'PRIMARY_DB=')"
+        primary_db_unique_name=$(echo "$db_part" | cut -d'=' -f2)
+        primary_host=$(echo "$host_part" | cut -d'=' -f2)
+        primary_port=$(echo "$port_part" | cut -d'=' -f2)
+    fi
+
+    # Fallback to archive log destinations
+    if [ -z "$primary_host" ]; then
+        tns_desc=$(sqlplus -s /nolog << EOF
+connect $standby_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT value FROM v\$parameter WHERE name = 'log_archive_dest_2' AND value LIKE 'SERVICE%';
+EOF
+        )
+
+        # Parse TNS descriptor
+        primary_host=$(echo "$tns_desc" | sed -n 's/.*HOST=\([^)]*\)).*/\1/p' | head -1)
+        primary_port=$(echo "$tns_desc" | sed -n 's/.*PORT=\([0-9]*\)).*/\1/p' | head -1)
+        primary_db_unique_name=$(sqlplus -s /nolog << EOF
+connect $standby_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT UPPER(db_unique_name) FROM v\$database;
+EOF
+        )
+    fi
+
+    # Validate results
+    if [ -n "$primary_host" ] && [ -n "$primary_port" ] && [ -n "$primary_db_unique_name" ]; then
+        primary_conn="sys@\"$primary_host:$primary_port/$primary_db_unique_name\" as sysdba"
+        echo "<p class='ok'>✅ Primary CDB determined successfully</p>" >> "$html_file"
+        echo "<table>
+                <tr><th>Parameter</th><th>Value</th></tr>
+                <tr><td>Host</td><td>$primary_host</td></tr>
+                <tr><td>Port</td><td>$primary_port</td></tr>
+                <tr><td>DB Unique Name</td><td>$primary_db_unique_name</td></tr>
+                <tr><td>Connection String</td><td>$primary_conn</td></tr>
+              </table>" >> "$html_file"
+    else
+        echo "<p class='critical'>❌ Failed to determine primary CDB</p>" >> "$html_file"
+        echo "<pre>Debug info:
+        Host: $primary_host
+        Port: $primary_port
+        DB Unique Name: $primary_db_unique_name
+        TNS Descriptor: $tns_desc</pre>" >> "$html_file"
+        return 1
+    fi
+
+    # Verify primary connectivity
+    verify_primary=$(sqlplus -s /nolog << EOF
+connect $primary_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT 'PRIMARY_STATUS=' || database_role FROM v\$database;
+EOF
+    )
+
+    if [[ "$verify_primary" == *"PRIMARY_STATUS=PRIMARY"* ]]; then
+        echo "<p class='ok'>✅ Verified primary CDB connection</p>" >> "$html_file"
+    else
+        echo "<p class='warning'>⚠️ Primary connection verification failed</p>" >> "$html_file"
+        echo "<pre>Verification output: $verify_primary</pre>" >> "$html_file"
+    fi
+
+    echo "</div>" >> "$html_file"
+    echo "$primary_conn"
+}
+
 run_ashtop_5minutes() {
   local title="ASHTOP - Last 5 Minutes"
   local sql_file="$SQL_DIR/20_ashtop_5minutes.sql"
