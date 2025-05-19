@@ -1,3 +1,5 @@
+ashtop.sql sql_id,u.username,event "sql_plan_operation='TABLE ACCESS' and sql_plan_options='FULL'" sysdate-1/24 sysdate
+
 SET PAGESIZE 100
 SET LINESIZE 200
 COLUMN role FORMAT A20
