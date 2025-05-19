@@ -1,4 +1,20 @@
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN role FORMAT A20
+COLUMN primary_dest FORMAT A60
 
+PROMPT === CHECK DATABASE ROLE AND PRIMARY DB DESTINATION ===
+
+-- Step 1: Check if current DB is a standby
+SELECT database_role AS role FROM v$database;
+
+-- Step 2: If standby, find the primary DB name from archive destination config
+PROMPT --- If standby, checking for PRIMARY destination in V$ARCHIVE_DEST_STATUS ---
+SELECT destination AS primary_dest
+  FROM v$archive_dest_status
+ WHERE status = 'VALID'
+   AND target = 'PRIMARY'
+   AND rownum = 1;
 # ========== DB CONNECTIVITY VALIDATION ==========
 check_db_connectivity() {
     echo "Validating database connectivity..."
