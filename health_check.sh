@@ -35,7 +35,24 @@ run_ashtop_5minutes() {
   echo "</pre>" >> "$HTML_REPORT"
 }
 
-
+SET PAGESIZE 100
+SELECT day,
+       session_state,
+       count,
+       CASE 
+         WHEN session_state = 'ACTIVE' AND count > 80 THEN 'CRITICAL'
+         WHEN session_state = 'ACTIVE' AND count > 20 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+FROM (
+    SELECT TO_CHAR(sample_time, 'YYYY-MM-DD') day,
+           session_state,
+           COUNT(*) AS count
+      FROM dba_hist_active_sess_history
+     WHERE sample_time > SYSDATE - &DAYS_AGO
+     GROUP BY TO_CHAR(sample_time, 'YYYY-MM-DD'), session_state
+)
+ORDER BY day, session_state;
 
 SET PAGESIZE 100
 SET LINESIZE 200
