@@ -1,3 +1,35 @@
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN aas FORMAT 999.99
+COLUMN status FORMAT A10
+
+PROMPT === ASH TOP (LAST 5 MINUTES, VIA ASHTOP.SQL) ===
+
+-- Call ashtop.sql dynamically and capture output
+@sql/lib/ashtop.sql username,sql_id session_type='FOREGROUND' sysdate-1/288 sysdate
+
+-- Now, highlight if AAS (column 2) > 20
+PROMPT
+PROMPT === AAS HEALTH STATUS CHECK ===
+
+WITH ash_top_data AS (
+  SELECT * FROM (
+    SELECT rownum AS rn, column_value FROM TABLE(sys.dbms_output_lines)
+  ) WHERE rn <= 10
+),
+aas_values AS (
+  SELECT TO_NUMBER(REGEXP_SUBSTR(column_value, '[0-9.]+', 1, 1)) AS aas
+    FROM ash_top_data
+    WHERE REGEXP_LIKE(column_value, '^[[:space:]]*[^ ]+[[:space:]]+[0-9.]+')
+)
+SELECT aas,
+       CASE
+         WHEN aas > 20 THEN 'CRITICAL'
+         WHEN aas > 10 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM aas_values;
+
 ashtop.sql sql_id,u.username,event "sql_plan_operation='TABLE ACCESS' and sql_plan_options='FULL'" sysdate-1/24 sysdate
 
 SET PAGESIZE 100
