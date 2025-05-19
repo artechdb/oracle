@@ -36,7 +36,14 @@ run_ashtop_5minutes() {
   echo "</pre>" >> "$HTML_REPORT"
 }
 
-
+SET PAGESIZE 100
+SELECT tablespace_name,
+       ROUND(used_space*8/1024) AS used_mb,
+       ROUND((tablespace_size - used_space)*8/1024) AS free_mb,
+       ROUND((used_space/tablespace_size)*100,2) AS pct_used
+  FROM dba_tablespace_usage_metrics
+ ORDER BY pct_used DESC;
+ 
 run_ashtop_5minutes() {
   local title="ASHTOP - Last 5 Minutes"
   local sql_file="$SQL_DIR/20_ashtop_5minutes.sql"
