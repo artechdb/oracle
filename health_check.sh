@@ -1,34 +1,36 @@
+run_ashtop_5min_check() {
+  local db_connect="$1"
+  local html_output="$2"
+  local tmp_output="/tmp/ashtop_5m.txt"
+
+  sqlplus -s "$db_connect" <<EOF > "$tmp_output"
 SET PAGESIZE 100
 SET LINESIZE 200
-COLUMN aas FORMAT 999.99
-COLUMN status FORMAT A10
-
-PROMPT === ASH TOP (LAST 5 MINUTES, VIA ASHTOP.SQL) ===
-
--- Call ashtop.sql dynamically and capture output
+SET TRIMSPOOL ON
+SET TRIMOUT ON
+SET HEADING ON
+SET FEEDBACK OFF
+SET COLSEP ' | '
+PROMPT === ASHTOP (LAST 5 MINUTES) ===
 @sql/lib/ashtop.sql username,sql_id session_type='FOREGROUND' sysdate-1/288 sysdate
+EOF
 
--- Now, highlight if AAS (column 2) > 20
-PROMPT
-PROMPT === AAS HEALTH STATUS CHECK ===
+  echo "<h2>ASHTOP - Last 5 Minutes</h2><pre>" >> "$html_output"
+  cat "$tmp_output" >> "$html_output"
+  echo "</pre>" >> "$html_output"
 
-WITH ash_top_data AS (
-  SELECT * FROM (
-    SELECT rownum AS rn, column_value FROM TABLE(sys.dbms_output_lines)
-  ) WHERE rn <= 10
-),
-aas_values AS (
-  SELECT TO_NUMBER(REGEXP_SUBSTR(column_value, '[0-9.]+', 1, 1)) AS aas
-    FROM ash_top_data
-    WHERE REGEXP_LIKE(column_value, '^[[:space:]]*[^ ]+[[:space:]]+[0-9.]+')
-)
-SELECT aas,
-       CASE
-         WHEN aas > 20 THEN 'CRITICAL'
-         WHEN aas > 10 THEN 'WARNING'
-         ELSE 'OK'
-       END AS status
-  FROM aas_values;
+  # Extract AAS (2nd column), skip header lines
+  local max_aas
+  max_aas=$(awk 'NF > 2 && $2 ~ /^[0-9.]+$/ {print $2}' "$tmp_output" | sort -nr | head -1)
+
+  if [[ $(echo "$max_aas > 20" | bc) -eq 1 ]]; then
+    echo "<p><b>Status: <span style='color:red;'>CRITICAL (AAS $max_aas)</span></b></p>" >> "$html_output"
+  elif [[ $(echo "$max_aas > 10" | bc) -eq 1 ]]; then
+    echo "<p><b>Status: <span style='color:orange;'>WARNING (AAS $max_aas)</span></b></p>" >> "$html_output"
+  else
+    echo "<p><b>Status: <span style='color:green;'>OK (AAS $max_aas)</span></b></p>" >> "$html_output"
+  fi
+}
 
 ashtop.sql sql_id,u.username,event "sql_plan_operation='TABLE ACCESS' and sql_plan_options='FULL'" sysdate-1/24 sysdate
 
