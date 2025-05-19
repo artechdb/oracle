@@ -1,3 +1,19 @@
+
+# ========== DB CONNECTIVITY VALIDATION ==========
+check_db_connectivity() {
+    echo "Validating database connectivity..."
+    sqlplus -s "$DB_CONNECT_STRING" <<EOF > /dev/null
+WHENEVER SQLERROR EXIT FAILURE
+SELECT 'Connection Successful' FROM dual;
+EXIT
+EOF
+    if [ $? -ne 0 ]; then
+        echo "❌ ERROR: Cannot connect to Oracle DB with provided credentials."
+        exit 1
+    else
+        echo "✅ Database connection successful."
+    fi
+}
 run_sql_file_report() {
     local title="$1"
     local sql_file="$2"
