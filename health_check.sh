@@ -1,22 +1,19 @@
 
-sqlplus -s "$DB_CONNECT_STRING" <<EOF
 SET PAGESIZE 100
 SET LINESIZE 200
 COLUMN destination FORMAT A40
-COLUMN remote_db_unique_name FORMAT A20
-COLUMN database_mode FORMAT A10
+COLUMN database_mode FORMAT A15
 COLUMN status FORMAT A10
 
+PROMPT === CHECK FOR PRIMARY DESTINATION FROM STANDBY ===
+
 SELECT destination,
-       remote_db_unique_name,
        database_mode,
        status
-  FROM v\$archive_dest_status
+  FROM v$archive_dest_status
  WHERE database_mode = 'PRIMARY'
    AND status = 'VALID';
 
-EXIT;
-EOF
 
 
 run_ashtop_5min_check() {
