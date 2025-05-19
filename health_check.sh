@@ -3,6 +3,45 @@ run_ashtop_5minutes() {
   local sql_file="$SQL_DIR/20_ashtop_5minutes.sql"
   local temp_output="/tmp/ashtop_5m_output.txt"
 
+  # Run the SQL and save output
+  sqlplus -s "$DB_CONNECT_STRING" @"$sql_file" > "$temp_output"
+
+  # Extract AAS value (2nd column)
+  local max_aas
+  max_aas=$(awk 'NF > 2 && $2 ~ /^[0-9.]+$/ {print $2}' "$temp_output" | sort -nr | head -1)
+
+  # Determine status
+  local status_label
+  if [[ -n "$max_aas" && $(echo "$max_aas > 20" | bc) -eq 1 ]]; then
+    status_label="<span style='color:red;font-weight:bold;'>CRITICAL (AAS $max_aas)</span>"
+  elif [[ -n "$max_aas" && $(echo "$max_aas > 10" | bc) -eq 1 ]]; then
+    status_label="<span style='color:orange;font-weight:bold;'>WARNING (AAS $max_aas)</span>"
+  else
+    status_label="<span style='color:green;font-weight:bold;'>OK (AAS $max_aas)</span>"
+  fi
+
+  # Inject section header with status label
+  echo "<h2>$title - $status_label</h2><pre>" >> "$HTML_REPORT"
+
+  # Write output with CRITICAL/WARNING color tags
+  while IFS= read -r line; do
+    if echo "$line" | grep -q 'CRITICAL'; then
+      line=$(echo "$line" | sed 's/CRITICAL/<span style="color:red;font-weight:bold;">CRITICAL<\/span>/g')
+    elif echo "$line" | grep -q 'WARNING'; then
+      line=$(echo "$line" | sed 's/WARNING/<span style="color:orange;font-weight:bold;">WARNING<\/span>/g')
+    fi
+    echo "$line" >> "$HTML_REPORT"
+  done < "$temp_output"
+
+  echo "</pre>" >> "$HTML_REPORT"
+}
+
+
+run_ashtop_5minutes() {
+  local title="ASHTOP - Last 5 Minutes"
+  local sql_file="$SQL_DIR/20_ashtop_5minutes.sql"
+  local temp_output="/tmp/ashtop_5m_output.txt"
+
   # Run and capture output to a temp file
   sqlplus -s "$DB_CONNECT_STRING" @"$sql_file" > "$temp_output"
 
