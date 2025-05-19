@@ -1,4 +1,109 @@
 determine_primary_cdb() {
+    local input_conn="$1"
+    local html_file="$2"
+    local primary_conn=""
+    local db_role=""
+    local db_unique_name=""
+
+    echo "<div class='section'>" >> "$html_file"
+    echo "<h2>Primary CDB Determination</h2>" >> "$html_file"
+
+    # Get database role and unique name
+    db_info=$(sqlplus -s /nolog << EOF
+connect $input_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT 'ROLE=' || database_role || '|UNIQUE_NAME=' || db_unique_name FROM v\$database;
+EOF
+    )
+
+    # Clean SQL*Plus output
+    db_info=$(echo "$db_info" | sed '/^Disconnected/d;/^$/d')
+
+    # Parse database information
+    IFS='|' read -r role_part unique_part <<< "$db_info"
+    db_role=$(echo "$role_part" | cut -d'=' -f2)
+    db_unique_name=$(echo "$unique_part" | cut -d'=' -f2)
+
+    case $db_role in
+        "PRIMARY")
+            echo "<p class='ok'>✅ Connected to PRIMARY CDB: $db_unique_name</p>" >> "$html_file"
+            primary_conn="$input_conn"
+            ;;
+        "PHYSICAL STANDBY")
+            echo "<p class='info'>🔍 Connected to STANDBY CDB: $db_unique_name</p>" >> "$html_file"
+            
+            # Try to find primary using Data Guard Broker
+            primary_info=$(sqlplus -s /nolog << EOF
+connect $input_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT 'HOST=' || target_host || '|PORT=' || target_port || '|SERVICE=' || database 
+FROM v\$dg_broker_targets 
+WHERE target_type = 'PRIMARY' AND ROWNUM = 1;
+EOF
+            )
+
+            if [[ "$primary_info" == *"HOST="* ]]; then
+                IFS='|' read -r host_part port_part service_part <<< "$primary_info"
+                primary_host=$(echo "$host_part" | cut -d'=' -f2)
+                primary_port=$(echo "$port_part" | cut -d'=' -f2)
+                primary_service=$(echo "$service_part" | cut -d'=' -f2)
+            else
+                # Fallback to archive log destinations
+                tns_desc=$(sqlplus -s /nolog << EOF
+connect $input_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT value FROM v\$parameter 
+WHERE name = 'log_archive_dest_2' 
+AND value LIKE 'SERVICE%';
+EOF
+                )
+                primary_host=$(echo "$tns_desc" | sed -n 's/.*HOST=\([^)]*\)).*/\1/p')
+                primary_port=$(echo "$tns_desc" | sed -n 's/.*PORT=\([0-9]*\)).*/\1/p')
+                primary_service=$(echo "$tns_desc" | sed -n 's/.*SERVICE=\([^)]*\)).*/\1/p')
+            fi
+
+            if [ -n "$primary_host" ] && [ -n "$primary_port" ] && [ -n "$primary_service" ]; then
+                primary_conn="sys@\"$primary_host:$primary_port/$primary_service\" as sysdba"
+                echo "<p class='ok'>✅ Discovered primary CDB connection</p>" >> "$html_file"
+                echo "<table>
+                        <tr><th>Parameter</th><th>Value</th></tr>
+                        <tr><td>Host</td><td>$primary_host</td></tr>
+                        <tr><td>Port</td><td>$primary_port</td></tr>
+                        <tr><td>Service</td><td>$primary_service</td></tr>
+                      </table>" >> "$html_file"
+            else
+                echo "<p class='critical'>❌ Failed to determine primary CDB</p>" >> "$html_file"
+                return 1
+            fi
+            ;;
+        *)
+            echo "<p class='critical'>❌ Invalid database role: $db_role</p>" >> "$html_file"
+            return 1
+            ;;
+    esac
+
+    # Verify primary connection
+    if [ -n "$primary_conn" ]; then
+        verify_primary=$(sqlplus -s /nolog << EOF
+connect $primary_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT 'PRIMARY_VERIFICATION=' || database_role FROM v\$database;
+EOF
+        )
+
+        if [[ "$verify_primary" == *"PRIMARY_VERIFICATION=PRIMARY"* ]]; then
+            echo "<p class='ok'>✅ Verified primary CDB connection</p>" >> "$html_file"
+        else
+            echo "<p class='critical'>❌ Primary verification failed</p>" >> "$html_file"
+            primary_conn=""
+        fi
+    fi
+
+    echo "</div>" >> "$html_file"
+    echo "$primary_conn"
+}
+
+determine_primary_cdb() {
     local standby_conn="$1"
     local html_file="$2"
     local primary_conn=""
