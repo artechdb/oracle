@@ -1,3 +1,41 @@
+run_ashtop_5minutes() {
+  local title="ASHTOP - Last 5 Minutes"
+  local sql_file="$SQL_DIR/20_ashtop_5minutes.sql"
+  local temp_output="/tmp/ashtop_5m_output.txt"
+
+  # Run and capture output to a temp file
+  sqlplus -s "$DB_CONNECT_STRING" @"$sql_file" > "$temp_output"
+
+  # Inject section header
+  append_section "$title"
+
+  # Output full result to HTML with coloring (your original logic)
+  while IFS= read -r line; do
+    if echo "$line" | grep -q 'CRITICAL'; then
+      line=$(echo "$line" | sed 's/CRITICAL/<span style="color:red;font-weight:bold;">CRITICAL<\/span>/g')
+    elif echo "$line" | grep -q 'WARNING'; then
+      line=$(echo "$line" | sed 's/WARNING/<span style="color:orange;font-weight:bold;">WARNING<\/span>/g')
+    fi
+    echo "$line" >> "$HTML_REPORT"
+  done < "$temp_output"
+
+  # Extract AAS from second column
+  local max_aas
+  max_aas=$(awk 'NF > 2 && $2 ~ /^[0-9.]+$/ {print $2}' "$temp_output" | sort -nr | head -1)
+
+  # Append overall health status
+  if [[ -n "$max_aas" && $(echo "$max_aas > 20" | bc) -eq 1 ]]; then
+    echo "<p><b>Status: <span style='color:red;'>CRITICAL (AAS $max_aas)</span></b></p>" >> "$HTML_REPORT"
+  elif [[ -n "$max_aas" && $(echo "$max_aas > 10" | bc) -eq 1 ]]; then
+    echo "<p><b>Status: <span style='color:orange;'>WARNING (AAS $max_aas)</span></b></p>" >> "$HTML_REPORT"
+  else
+    echo "<p><b>Status: <span style='color:green;'>OK (AAS $max_aas)</span></b></p>" >> "$HTML_REPORT"
+  fi
+
+  echo "</pre>" >> "$HTML_REPORT"
+}
+
+
 
 SET PAGESIZE 100
 SET LINESIZE 200
