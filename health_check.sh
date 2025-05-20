@@ -3,6 +3,128 @@ determine_primary_cdb() {
     local html_file="$2"
     local primary_conn=""
     local db_role=""
+    local primary_host=""
+    local primary_port=""
+    local primary_service=""
+
+    echo "<div class='section'>" >> "$html_file"
+    echo "<h2>Primary CDB Determination</h2>" >> "$html_file"
+
+    # Get database role and configuration
+    db_info=$(sqlplus -s /nolog << EOF
+connect $input_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT 'ROLE=' || database_role || '|FAL_SERVER=' || NVL(fal_server, 'NONE') || '|DG_BROKER=' || 
+       (SELECT CASE WHEN COUNT(*) > 0 THEN 'ACTIVE' ELSE 'INACTIVE' END 
+        FROM v\$parameter WHERE name = 'dg_broker_start' AND value = 'TRUE')
+FROM v\$database;
+EOF
+    )
+
+    # Parse database info
+    IFS='|' read -r role_part fal_part broker_part <<< "$db_info"
+    db_role=$(echo "$role_part" | cut -d'=' -f2)
+    fal_server=$(echo "$fal_part" | cut -d'=' -f2)
+    dg_broker=$(echo "$broker_part" | cut -d'=' -f2)
+
+    case $db_role in
+        "PRIMARY")
+            echo "<p class='ok'>✅ Connected database is already PRIMARY</p>" >> "$html_file"
+            primary_conn="$input_conn"
+            ;;
+        "PHYSICAL STANDBY")
+            echo "<p class='info'>🔍 Connected to STANDBY database</p>" >> "$html_file"
+            
+            # Try Data Guard Broker first
+            if [ "$dg_broker" = "ACTIVE" ]; then
+                echo "<p class='info'>🔍 Checking Data Guard Broker configuration</p>" >> "$html_file"
+                broker_config=$(sqlplus -s /nolog << EOF
+connect $input_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT db_unique_name || '|' || hostname || '|' || db_domain 
+FROM v\$dg_broker_config 
+WHERE type = 'DATABASE' AND role = 'PRIMARY';
+EOF
+                )
+                IFS='|' read -r primary_name primary_host primary_domain <<< "$broker_config"
+                primary_service="${primary_name}.${primary_domain}"
+                primary_port="1521"  # Default port for broker
+            fi
+
+            # Fallback to FAL_SERVER
+            if [ -z "$primary_host" ] && [ "$fal_server" != "NONE" ]; then
+                echo "<p class='info'>🔍 Using FAL_SERVER: $fal_server</p>" >> "$html_file"
+                
+                # Try to resolve FAL_SERVER from tnsnames.ora
+                tns_entry=$(cat $ORACLE_HOME/network/admin/tnsnames.ora | grep -i "^$fal_server\s*=")
+                
+                # Parse TNS entry
+                primary_host=$(echo "$tns_entry" | sed -n 's/.*HOST\s*=\s*\([^)]*\).*/\1/p' | head -1)
+                primary_port=$(echo "$tns_entry" | sed -n 's/.*PORT\s*=\s*\([0-9]*\).*/\1/p' | head -1)
+                primary_service=$(echo "$tns_entry" | sed -n 's/.*SERVICE_NAME\s*=\s*\([^)]*\).*/\1/p' | head -1)
+                
+                # Fallback to direct parsing if tnsnames.ora not accessible
+                if [ -z "$primary_host" ]; then
+                    primary_host=$(echo "$fal_server" | cut -d':' -f1)
+                    primary_port=$(echo "$fal_server" | cut -d':' -f2 | cut -d'/' -f1)
+                    primary_service=$(echo "$fal_server" | cut -d'/' -f2)
+                fi
+            fi
+
+            # Validate results
+            if [ -n "$primary_host" ] && [ -n "$primary_service" ]; then
+                primary_port=${primary_port:-1521}  # Default port if not found
+                primary_conn="sys@\"$primary_host:$primary_port/$primary_service\" as sysdba"
+                echo "<p class='ok'>✅ Discovered primary CDB connection</p>" >> "$html_file"
+                echo "<table>
+                        <tr><th>Parameter</th><th>Value</th></tr>
+                        <tr><td>Host</td><td>$primary_host</td></tr>
+                        <tr><td>Port</td><td>$primary_port</td></tr>
+                        <tr><td>Service</td><td>$primary_service</td></tr>
+                      </table>" >> "$html_file"
+            else
+                echo "<p class='critical'>❌ Failed to determine primary CDB</p>" >> "$html_file"
+                echo "<pre>Debug info:
+                DG Broker Status: $dg_broker
+                FAL_SERVER: $fal_server
+                Broker Config: $broker_config
+                Parsed Host: $primary_host
+                Parsed Port: $primary_port
+                Parsed Service: $primary_service</pre>" >> "$html_file"
+                return 1
+            fi
+
+            # Verify primary connection
+            verify_primary=$(sqlplus -s /nolog << EOF
+connect $primary_conn
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT database_role FROM v\$database;
+EOF
+            )
+
+            if [[ "$verify_primary" == *"PRIMARY"* ]]; then
+                echo "<p class='ok'>✅ Verified primary CDB connection</p>" >> "$html_file"
+            else
+                echo "<p class='critical'>❌ Primary verification failed</p>" >> "$html_file"
+                echo "<pre>Verification output: $verify_primary</pre>" >> "$html_file"
+                primary_conn=""
+            fi
+            ;;
+        *)
+            echo "<p class='critical'>❌ Unsupported database role: $db_role</p>" >> "$html_file"
+            return 1
+            ;;
+    esac
+
+    echo "</div>" >> "$html_file"
+    echo "$primary_conn"
+}
+
+determine_primary_cdb() {
+    local input_conn="$1"
+    local html_file="$2"
+    local primary_conn=""
+    local db_role=""
     local db_unique_name=""
 
     echo "<div class='section'>" >> "$html_file"
