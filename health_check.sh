@@ -1,3 +1,469 @@
+44_rac_gc_waits.sql – Global cache contention (top events)
+
+45_rac_gc_waits_by_instance.sql – GC wait breakdown per node
+
+46_rac_blocking_ges.sql – GES blocking sessions (RAC locks)
+
+47_rac_interconnect_stats.sql – Interconnect activity (GC blocks)
+
+48_rac_global_enqueue_contention.sql – Enqueue waits via GES
+48
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN event FORMAT A40
+COLUMN samples FORMAT 99999
+COLUMN status FORMAT A10
+
+PROMPT === GLOBAL ENQUEUE CONTENTION (GV$ACTIVE_SESSION_HISTORY) ===
+
+SELECT event,
+       COUNT(*) AS samples,
+       CASE
+         WHEN COUNT(*) > 50 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE event LIKE 'ges%'
+   AND sample_time > SYSDATE - (&HOURS_AGO / 24)
+ GROUP BY event
+ ORDER BY samples DESC;
+47
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN inst_id FORMAT 99
+COLUMN name FORMAT A40
+COLUMN mb FORMAT 999999.99
+COLUMN status FORMAT A10
+
+PROMPT === HIGH INTERCONNECT ACTIVITY (GV$SYSSTAT) ===
+
+SELECT inst_id,
+       name,
+       ROUND(value / 1024 / 1024, 2) AS mb,
+       CASE
+         WHEN value > 500000000 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$sysstat
+ WHERE name IN (
+       'gc current blocks received',
+       'gc cr blocks received',
+       'gc current blocks served',
+       'gc cr blocks served'
+     )
+ ORDER BY inst_id, name;
+46
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN blocking_session FORMAT 99999
+COLUMN blocking_inst_id FORMAT 99
+COLUMN blocks FORMAT 9999
+COLUMN first_seen FORMAT A20
+COLUMN last_seen FORMAT A20
+COLUMN status FORMAT A10
+
+PROMPT === GES BLOCKING EVENTS (GV$ACTIVE_SESSION_HISTORY) ===
+
+SELECT blocking_session, blocking_inst_id,
+       COUNT(*) AS blocks,
+       TO_CHAR(MIN(sample_time), 'YYYY-MM-DD HH24:MI') AS first_seen,
+       TO_CHAR(MAX(sample_time), 'YYYY-MM-DD HH24:MI') AS last_seen,
+       CASE
+         WHEN COUNT(*) > 20 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE blocking_session IS NOT NULL
+   AND sample_time > SYSDATE - (&HOURS_AGO / 24)
+ GROUP BY blocking_session, blocking_inst_id
+ ORDER BY blocks DESC;
+45
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN inst_id FORMAT 99
+COLUMN event FORMAT A40
+COLUMN count FORMAT 99999
+COLUMN status FORMAT A10
+
+PROMPT === GC WAITS BY INSTANCE (GV$ACTIVE_SESSION_HISTORY) ===
+
+SELECT inst_id,
+       event,
+       COUNT(*) AS count,
+       CASE
+         WHEN COUNT(*) > 500 THEN 'CRITICAL'
+         WHEN COUNT(*) > 200 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE event LIKE 'gc%' AND sample_time > SYSDATE - (&HOURS_AGO / 24)
+ GROUP BY inst_id, event
+ ORDER BY inst_id, count DESC;45
+
+44
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN event FORMAT A40
+COLUMN samples FORMAT 99999
+COLUMN pct FORMAT 999.99
+COLUMN status FORMAT A10
+
+PROMPT === TOP GLOBAL CACHE WAITS (GV$ACTIVE_SESSION_HISTORY) ===
+
+SELECT event,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct,
+       CASE
+         WHEN event LIKE 'gc%' AND COUNT(*) > 100 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM gv$active_session_history
+ WHERE event LIKE 'gc%'
+   AND sample_time > SYSDATE - (&HOURS_AGO / 24)
+ GROUP BY event
+ ORDER BY samples DESC
+FETCH FIRST 10 ROWS ONLY;
+
+43
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN inst_id FORMAT 99
+COLUMN cpu_busy_secs FORMAT 999999.99
+COLUMN total_cpu_secs FORMAT 999999.99
+COLUMN cpu_util_pct FORMAT 999.99
+COLUMN status FORMAT A10
+
+PROMPT === REAL-TIME CPU UTILIZATION (GV$OSSTAT) - ORACLE 19C RAC ===
+
+WITH os_stat AS (
+  SELECT inst_id,
+         MAX(CASE WHEN stat_name = 'BUSY_TIME' THEN value END) AS busy_time,
+         MAX(CASE WHEN stat_name = 'IDLE_TIME' THEN value END) AS idle_time
+    FROM gv$osstat
+   WHERE stat_name IN ('BUSY_TIME', 'IDLE_TIME')
+   GROUP BY inst_id
+)
+SELECT inst_id,
+       ROUND(busy_time / 100, 2) AS cpu_busy_secs,
+       ROUND((busy_time + idle_time) / 100, 2) AS total_cpu_secs,
+       ROUND((busy_time / (busy_time + idle_time)) * 100, 2) AS cpu_util_pct,
+       CASE
+         WHEN (busy_time / (busy_time + idle_time)) * 100 > 90 THEN 'CRITICAL'
+         WHEN (busy_time / (busy_time + idle_time)) * 100 > 75 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM os_stat
+ ORDER BY inst_id;
+42
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN inst_id FORMAT 99
+COLUMN cpu_count FORMAT 99
+COLUMN aas FORMAT 999.99
+COLUMN status FORMAT A10
+
+PROMPT === REAL-TIME AAS (GV$ACTIVE_SESSION_HISTORY, LAST &MINUTES_AGO MINUTES) ===
+
+WITH active_sessions AS (
+  SELECT inst_id,
+         COUNT(*) / (&MINUTES_AGO * 60) AS aas
+    FROM gv$active_session_history
+   WHERE sample_time > SYSDATE - (&MINUTES_AGO / 1440)
+     AND session_type = 'FOREGROUND'
+   GROUP BY inst_id
+),
+cpu_cores AS (
+  SELECT instance_number AS inst_id, MAX(value) AS cpu_count
+    FROM dba_hist_osstat
+   WHERE stat_name = 'NUM_CPUS'
+   GROUP BY instance_number
+)
+SELECT a.inst_id,
+       c.cpu_count,
+       ROUND(a.aas, 2) AS aas,
+       CASE
+         WHEN a.aas > c.cpu_count THEN 'CRITICAL'
+         WHEN a.aas > c.cpu_count * 0.75 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM active_sessions a
+  JOIN cpu_cores c ON a.inst_id = c.inst_id
+ ORDER BY a.inst_id;
+
+ SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN service_name FORMAT A25
+COLUMN inst_id FORMAT 99
+COLUMN session_type FORMAT A10
+COLUMN active_count FORMAT 99999
+COLUMN cpu_count FORMAT 99
+COLUMN status FORMAT A10
+
+PROMPT === ACTIVE SESSIONS PER INSTANCE (SCALED TO CPU CORES) - ORACLE 19C RAC ===
+
+WITH session_stats AS (
+  SELECT inst_id,
+         service_hash,
+         session_type,
+         COUNT(CASE WHEN session_state IN ('ON CPU','WAITING') THEN 1 END) AS active_count
+    FROM gv$active_session_history
+   WHERE sample_time > SYSDATE - &DAYS_AGO
+   GROUP BY inst_id, service_hash, session_type
+),
+cpu_cores AS (
+  SELECT instance_number AS inst_id, MAX(value) AS cpu_count
+    FROM dba_hist_osstat
+   WHERE stat_name = 'NUM_CPUS'
+   GROUP BY instance_number
+),
+services AS (
+  SELECT name_hash, name AS service_name FROM gv$services
+)
+SELECT NVL(s.service_name, 'Unknown') AS service_name,
+       ss.inst_id,
+       ss.session_type,
+       ss.active_count,
+       c.cpu_count,
+       CASE
+         WHEN ss.active_count > c.cpu_count THEN 'CRITICAL'
+         WHEN ss.active_count > c.cpu_count * 0.75 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM session_stats ss
+  JOIN cpu_cores c ON ss.inst_id = c.inst_id
+  LEFT JOIN services s ON ss.service_hash = s.name_hash
+ ORDER BY ss.inst_id, service_name;
+#####
+# Example modules
+run_sql_file_report "DB Load (AAS)" "$SQL_DIR/01_db_load.sql" "$DB_CONNECT_STRING"
+run_sql_file_report "Long Running Sessions" "$SQL_DIR/06_long_running_sessions.sql" "$DB_CONNECT_STRING"
+run_sql_file_report "IO Response Time" "$SQL_DIR/07_io_response_time.sql" "$DB_CONNECT_STRING"
+
+if is_exadata; then
+  run_sql_file_report "Exadata Offload Efficiency" "$SQL_DIR/35_exadata_offload_efficiency.sql" "$DB_CONNECT_STRING"
+  run_sql_file_report "Exadata Cell Interconnect Waits" "$SQL_DIR/36_exadata_cell_interconnect_waits.sql" "$DB_CONNECT_STRING"
+  run_sql_file_report "Exadata Flash Cache Stats" "$SQL_DIR/37_exadata_flashcache_stats.sql" "$DB_CONNECT_STRING"
+  run_sql_file_report "Exadata Smart Scan Usage" "$SQL_DIR/38_exadata_smart_scan_usage.sql" "$DB_CONNECT_STRING"
+  run_sql_file_report "ASM Diskgroup Status" "$SQL_DIR/39_exadata_asm_diskgroup_status.sql" "$DB_CONNECT_STRING"
+  run_sql_file_report "Exadata Wait Class Usage" "$SQL_DIR/40_exadata_wait_class_usage.sql" "$DB_CONNECT_STRING"
+  run_sql_file_report "IORM Plan Check" "$SQL_DIR/41_exadata_iorm_plan.sql" "$DB_CONNECT_STRING"
+fi
+
+echo "</body></html>" >> "$HTML_REPORT"
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN begin_time FORMAT A20
+COLUMN instance_name FORMAT A20
+COLUMN cpu_count FORMAT 99
+COLUMN db_time_mins FORMAT 999999.99
+COLUMN aas FORMAT 999.99
+COLUMN status FORMAT A10
+
+PROMPT === DATABASE LOAD (AAS AUTO-SCALED BY CPU CORES PER INSTANCE) - ORACLE 19C RAC ===
+
+WITH db_time_data AS (
+  SELECT s.snap_id,
+         s.instance_number,
+         s.begin_interval_time,
+         s.end_interval_time,
+         MAX(CASE WHEN tm.stat_name = 'DB time' THEN tm.value END) AS db_time
+    FROM dba_hist_sys_time_model tm
+    JOIN dba_hist_snapshot s
+      ON tm.snap_id = s.snap_id
+     AND tm.instance_number = s.instance_number
+   WHERE s.begin_interval_time > SYSDATE - &DAYS_AGO
+     AND tm.stat_name = 'DB time'
+   GROUP BY s.snap_id, s.instance_number, s.begin_interval_time, s.end_interval_time
+),
+cpu_cores AS (
+  SELECT instance_number,
+         MAX(VALUE) AS cpu_count
+    FROM dba_hist_osstat
+   WHERE stat_name = 'NUM_CPUS'
+   GROUP BY instance_number
+),
+instance_names AS (
+  SELECT DISTINCT instance_number, instance_name FROM gv$instance
+)
+SELECT TO_CHAR(d.begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
+       i.instance_name,
+       c.cpu_count,
+       ROUND(d.db_time / 1000000 / 60, 2) AS db_time_mins,
+       ROUND((d.db_time / 1000000 / 60) /
+             ((CAST(d.end_interval_time AS DATE) - CAST(d.begin_interval_time AS DATE)) * 24 * 60), 2) AS aas,
+       CASE
+         WHEN ROUND((d.db_time / 1000000 / 60) /
+                    ((CAST(d.end_interval_time AS DATE) - CAST(d.begin_interval_time AS DATE)) * 24 * 60), 2) > c.cpu_count * 1.0 THEN 'CRITICAL'
+         WHEN ROUND((d.db_time / 1000000 / 60) /
+                    ((CAST(d.end_interval_time AS DATE) - CAST(d.begin_interval_time AS DATE)) * 24 * 60), 2) > c.cpu_count * 0.75 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM db_time_data d
+  JOIN cpu_cores c ON d.instance_number = c.instance_number
+  LEFT JOIN instance_names i ON d.instance_number = i.instance_number
+ ORDER BY d.begin_interval_time DESC, i.instance_name;
+ if is_exadata; then
+  run_sql_file_report "Exadata Offload Efficiency" "$SQL_DIR/35_exadata_offload_efficiency.sql" "$DB_CONNECT_STRING"
+  run_sql_file_report "Exadata Cell Interconnect Waits" "$SQL_DIR/36_exadata_cell_interconnect_waits.sql" "$DB_CONNECT_STRING"
+  run_sql_file_report "Exadata Flash Cache Stats" "$SQL_DIR/37_exadata_flashcache_stats.sql" "$DB_CONNECT_STRING"
+  run_sql_file_report "Exadata Smart Scan Usage" "$SQL_DIR/38_exadata_smart_scan_usage.sql" "$DB_CONNECT_STRING"
+  run_sql_file_report "ASM Diskgroup Status" "$SQL_DIR/39_exadata_asm_diskgroup_status.sql" "$DB_CONNECT_STRING"
+  run_sql_file_report "Exadata Wait Class Usage" "$SQL_DIR/40_exadata_wait_class_usage.sql" "$DB_CONNECT_STRING"
+  run_sql_file_report "IORM Plan Check" "$SQL_DIR/41_exadata_iorm_plan.sql" "$DB_CONNECT_STRING"
+fi
+
+PROMPT === EXADATA CELL OFFLOAD EFFICIENCY ===
+SELECT name,
+       value,
+       CASE
+         WHEN name = 'cell physical IO interconnect bytes returned by smart scan' AND value = 0 THEN 'CRITICAL'
+         ELSE 'OK'
+       END AS status
+  FROM v$sysstat
+ WHERE name IN (
+       'cell physical IO interconnect bytes returned by smart scan',
+       'cell physical IO bytes eligible for predicate offload'
+     );
+
+##
+PROMPT === INTERCONNECT-RELATED WAITS (EXADATA) ===
+SELECT event,
+       total_waits,
+       time_waited_micro/1000000 AS time_secs,
+       CASE
+         WHEN event LIKE 'cell%' AND time_waited_micro > 1000000 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM v$system_event
+ WHERE event LIKE 'cell%'
+ ORDER BY time_waited_micro DESC
+FETCH FIRST 10 ROWS ONLY;
+
+##
+PROMPT === FLASH CACHE STATISTICS (EXADATA) ===
+SELECT name, value
+  FROM v$sysstat
+ WHERE name LIKE '%flash cache%'
+ ORDER BY name;
+
+##
+PROMPT === SMART SCAN USAGE CHECK (RECENT SQLs) ===
+SELECT sql_id,
+       offload_eligibility,
+       offload_returned_bytes/1024/1024 AS returned_mb,
+       offload_eligible_bytes/1024/1024 AS eligible_mb,
+       CASE
+         WHEN offload_eligibility = 'NONE' THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM v$sql_monitor
+ WHERE offload_eligibility IS NOT NULL
+   AND last_refresh_time > SYSDATE - 1/24
+ ORDER BY last_refresh_time DESC
+FETCH FIRST 10 ROWS ONLY;
+
+##
+PROMPT === ASM DISKGROUP SPACE & STATE ===
+SELECT name, total_mb, free_mb, state,
+       ROUND((free_mb/total_mb)*100, 2) AS pct_free,
+       CASE
+         WHEN state != 'MOUNTED' THEN 'CRITICAL'
+         WHEN (free_mb/total_mb)*100 < 10 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM v$asm_diskgroup;
+
+PROMPT === EXADATA-SPECIFIC WAITS (GV$SESSION) ===
+SELECT inst_id, wait_class, COUNT(*) AS count
+  FROM gv$session
+ WHERE wait_class IN ('Exadata', 'User I/O')
+ GROUP BY inst_id, wait_class;
+   ##
+  PROMPT === IORM PLAN CHECK ===
+SELECT plan_name,
+       active,
+       objective,
+       status
+  FROM v$cell_iorm_plan
+ WHERE active = 'YES';
+##
+                                         
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN begin_time FORMAT A20
+COLUMN instance_name FORMAT A20
+COLUMN db_time_secs FORMAT 999999.99
+COLUMN cpu_time_secs FORMAT 999999.99
+COLUMN io_mb FORMAT 999999.99
+COLUMN skew_status FORMAT A10
+
+PROMPT === RAC INSTANCE SKEW ANALYSIS (DB TIME, CPU TIME, I/O) - ORACLE 19C ===
+
+WITH workload AS (
+  SELECT s.snap_id,
+         s.begin_interval_time,
+         s.instance_number,
+         MAX(CASE WHEN tm.stat_name = 'DB time' THEN tm.value END)/1000000 AS db_time_secs,
+         MAX(CASE WHEN tm.stat_name = 'DB CPU' THEN tm.value END)/1000000 AS cpu_time_secs
+    FROM dba_hist_sys_time_model tm
+    JOIN dba_hist_snapshot s
+      ON tm.snap_id = s.snap_id
+     AND tm.instance_number = s.instance_number
+   WHERE s.begin_interval_time > SYSDATE - &DAYS_AGO
+     AND tm.stat_name IN ('DB time', 'DB CPU')
+   GROUP BY s.snap_id, s.begin_interval_time, s.instance_number
+),
+io_stats AS (
+  SELECT ss.snap_id,
+         ss.instance_number,
+         (SUM(CASE WHEN ss.stat_name IN ('physical read bytes', 'physical write bytes') THEN ss.value ELSE 0 END)/1024/1024) AS io_mb
+    FROM dba_hist_sysstat ss
+   WHERE ss.stat_name IN ('physical read bytes', 'physical write bytes')
+   GROUP BY ss.snap_id, ss.instance_number
+),
+instance_names AS (
+  SELECT DISTINCT instance_number, instance_name FROM gv$instance
+),
+combined AS (
+  SELECT w.snap_id,
+         w.begin_interval_time,
+         w.instance_number,
+         w.db_time_secs,
+         w.cpu_time_secs,
+         COALESCE(i.io_mb, 0) AS io_mb
+    FROM workload w
+    LEFT JOIN io_stats i ON w.snap_id = i.snap_id AND w.instance_number = i.instance_number
+)
+SELECT TO_CHAR(c.begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
+       i.instance_name,
+       ROUND(c.db_time_secs, 2) AS db_time_secs,
+       ROUND(c.cpu_time_secs, 2) AS cpu_time_secs,
+       ROUND(c.io_mb, 2) AS io_mb,
+       CASE
+         WHEN c.db_time_secs > (SELECT AVG(db_time_secs)*1.5 FROM combined c2 WHERE c2.begin_interval_time = c.begin_interval_time) THEN 'CRITICAL'
+         WHEN c.db_time_secs > (SELECT AVG(db_time_secs)*1.2 FROM combined c2 WHERE c2.begin_interval_time = c.begin_interval_time) THEN 'WARNING'
+         WHEN c.io_mb > (SELECT AVG(io_mb)*1.5 FROM combined c3 WHERE c3.begin_interval_time = c.begin_interval_time) THEN 'CRITICAL'
+         WHEN c.io_mb > (SELECT AVG(io_mb)*1.2 FROM combined c3 WHERE c3.begin_interval_time = c.begin_interval_time) THEN 'WARNING'
+         ELSE 'OK'
+       END AS skew_status
+  FROM combined c
+  LEFT JOIN instance_names i ON c.instance_number = i.instance_number
+ ORDER BY c.begin_interval_time DESC, i.instance_name;
+
+ 
+ SET PAGESIZE 100
+SELECT name,
+       space_limit/1024/1024 AS limit_mb,
+       space_used/1024/1024 AS used_mb,
+       space_reclaimable/1024/1024 AS reclaimable_mb,
+       ROUND((space_used/space_limit)*100, 2) AS pct_used,
+       CASE
+         WHEN ROUND((space_used/space_limit)*100, 2) > 95 THEN 'CRITICAL'
+         WHEN ROUND((space_used/space_limit)*100, 2) > 85 THEN 'WARNING'
+         ELSE 'OK'
+       END AS status
+  FROM v$recovery_file_dest;
+  
 determine_primary_cdb() {
     local input_conn="$1"
     local html_file="$2"
