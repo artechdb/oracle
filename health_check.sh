@@ -1,4 +1,5 @@
 SET PAGESIZE 100
+SET PAGESIZE 100
 SET LINESIZE 200
 COLUMN begin_time FORMAT A20
 COLUMN instance_name FORMAT A20
@@ -8,20 +9,19 @@ COLUMN db_time_mins FORMAT 999999.99
 COLUMN aas FORMAT 999.99
 COLUMN status FORMAT A10
 
-PROMPT === DATABASE LOAD (AAS PER MINUTE FROM AWR) - ORACLE RAC ===
+PROMPT === DATABASE LOAD (AAS PER MINUTE FROM AWR DELTAS) - ORACLE RAC ===
 
-WITH db_time_data AS (
-  SELECT s.snap_id,
-         s.instance_number,
+WITH dbtime_deltas AS (
+  SELECT s.instance_number,
+         s.snap_id,
          s.begin_interval_time,
          s.end_interval_time,
-         MAX(CASE WHEN tm.stat_name = 'DB time' THEN tm.value END) AS db_time
-    FROM dba_hist_sys_time_model tm
-    JOIN dba_hist_snapshot s
-      ON tm.snap_id = s.snap_id AND tm.instance_number = s.instance_number
-   WHERE s.begin_interval_time > SYSDATE - &DAYS_AGO
-     AND tm.stat_name = 'DB time'
-   GROUP BY s.snap_id, s.instance_number, s.begin_interval_time, s.end_interval_time
+         tm.value - LAG(tm.value) OVER (PARTITION BY s.instance_number ORDER BY s.snap_id) AS db_time
+    FROM dba_hist_snapshot s
+    JOIN dba_hist_sys_time_model tm
+      ON s.snap_id = tm.snap_id AND s.instance_number = tm.instance_number
+   WHERE tm.stat_name = 'DB time'
+     AND s.begin_interval_time > SYSDATE - &DAYS_AGO
 ),
 cpu_cores AS (
   SELECT instance_number,
@@ -49,9 +49,10 @@ load_data AS (
                       ((CAST(d.end_interval_time AS DATE) - CAST(d.begin_interval_time AS DATE)) * 24 * 60), 2) > c.cpu_count * 0.75 THEN 'WARNING'
            ELSE 'OK'
          END AS status
-    FROM db_time_data d
+    FROM dbtime_deltas d
     JOIN cpu_cores c ON d.instance_number = c.instance_number
     LEFT JOIN instance_names i ON d.instance_number = i.instance_number
+   WHERE d.db_time IS NOT NULL
 )
 SELECT TO_CHAR(begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
        instance_name,
@@ -63,6 +64,14 @@ SELECT TO_CHAR(begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
   FROM load_data
  ORDER BY begin_interval_time DESC, instance_name;
 
+PROMPT
+PROMPT === TOTAL AAS PER MINUTE ACROSS ALL INSTANCES ===
+
+SELECT TO_CHAR(begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
+       ROUND(SUM(aas), 2) AS total_aas
+  FROM load_data
+ GROUP BY begin_interval_time
+ ORDER BY begin_interval_time DESC;
 PROMPT
 PROMPT === TOTAL AAS PER MINUTE ACROSS ALL INSTANCES ===
 
