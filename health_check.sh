@@ -1,3 +1,63 @@
+58_rac_iops_trend.sql
+PROMPT === 1-DAY IOPS TREND PER INSTANCE (AWR: DBA_HIST_SYSSTAT) ===
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN snap_time FORMAT A20
+COLUMN instance_number FORMAT 99
+COLUMN iops FORMAT 999999.99
+
+WITH io_stats AS (
+  SELECT s.snap_id,
+         s.instance_number,
+         TO_CHAR(s.begin_interval_time, 'YYYY-MM-DD HH24:MI') AS snap_time,
+         MAX(CASE WHEN ss.stat_name = 'physical read IO requests' THEN ss.value END) AS read_io,
+         MAX(CASE WHEN ss.stat_name = 'physical write IO requests' THEN ss.value END) AS write_io,
+         s.begin_interval_time,
+         s.end_interval_time
+    FROM dba_hist_sysstat ss
+    JOIN dba_hist_snapshot s
+      ON ss.snap_id = s.snap_id AND ss.instance_number = s.instance_number
+   WHERE ss.stat_name IN ('physical read IO requests', 'physical write IO requests')
+     AND s.begin_interval_time > SYSDATE - 1
+   GROUP BY s.snap_id, s.instance_number, s.begin_interval_time, s.end_interval_time
+),
+deltas AS (
+  SELECT snap_time,
+         instance_number,
+         (read_io + write_io) -
+         LAG(read_io + write_io) OVER (PARTITION BY instance_number ORDER BY begin_interval_time) AS total_io,
+         (CAST(end_interval_time AS DATE) - CAST(begin_interval_time AS DATE)) * 24 * 60 * 60 AS elapsed_seconds
+    FROM io_stats
+)
+SELECT snap_time,
+       instance_number,
+       ROUND(total_io / NULLIF(elapsed_seconds, 0), 2) AS iops
+  FROM deltas
+ WHERE total_io IS NOT NULL
+ ORDER BY snap_time DESC, instance_number;
+
+PROMPT === REAL-TIME IOPS PER INSTANCE (GV$SYSSTAT) ===
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN inst_id FORMAT 99
+COLUMN name FORMAT A40
+COLUMN value FORMAT 999999999
+COLUMN iops FORMAT 999999
+
+SELECT inst_id,
+       'IOPS (Read+Write)' AS name,
+       reads + writes AS value,
+       ROUND((reads + writes) / 60) AS iops -- assuming ~60 sec snapshot
+  FROM (
+    SELECT inst_id,
+           SUM(CASE WHEN name LIKE 'physical read IO requests' THEN value ELSE 0 END) AS reads,
+           SUM(CASE WHEN name LIKE 'physical write IO requests' THEN value ELSE 0 END) AS writes
+      FROM gv$sysstat
+     WHERE name IN ('physical read IO requests', 'physical write IO requests')
+     GROUP BY inst_id
+  );
+
+
 File Name	Description
 53_rac_wait_skew.sql	RAC node wait skew detection from ASH
 PROMPT === TOP WAIT EVENTS PER INSTANCE (RAC SKEW CHECK) ===
