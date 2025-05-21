@@ -1,3 +1,29 @@
+select  cast(min (ash.SAMPLE_TIME) as date) as start#
+     ,round (24*60*(cast (max(ash.SAMPLE_TIME) as date) - cast(min (ash.SAMPLE_TIME) as date) ),2) as duration#
+     ,ash.sql_id,ash.top_level_sql_id,ash.BLOCKING_SESSION as B_SID,ash.BLOCKING_SESSION_SERIAL# as b_serial#
+     ,ash2.SQL_EXEC_ID b_sql_exec_id
+     ,ash.event,do.object_name
+     ,sum(decode(ash.session_state,'ON CPU',1,0))     "CPU"
+     ,sum(decode(ash.session_state,'WAITING',1,0))    -         sum(decode(ash.session_state,'WAITING', decode(ash.wait_class, 'User I/O',1,0),0))    "WAIT"
+     ,sum(decode(ash.session_state,'WAITING', decode(ash.wait_class, 'User I/O',1,0),0))    "IO"
+     ,sum(decode(ash.session_state,'ON CPU',1,1))     "TOTAL"
+     ,du.username,ash2.SQL_EXEC_ID,
+          dp.owner||nvl2(dp.object_name,'.'||dp.object_name,null) ||nvl2(dp.procedure_name,'.'||dp.procedure_name,null) as pl_sql_obj
+          ,ash2.machine as blocking_machine
+from dba_hist_active_sess_history ash
+  left join dba_objects do on do.object_id=ash.CURRENT_OBJ#
+  join dba_hist_active_sess_history ash2 on ash.BLOCKING_SESSION=ash2.session_id and ash.BLOCKING_SESSION_SERIAL#=ash2.session_serial# and ash.SNAP_ID=ash2.SNAP_ID
+    join dba_users du on du.USER_ID=ash2.USER_ID
+    left join dba_procedures dp on dp.object_id=ash2.PLSQL_ENTRY_OBJECT_ID and dp.subprogram_id=ash.PLSQL_ENTRY_SUBPROGRAM_ID
+where ash.SQL_ID is not NULL      
+and ash.SAMPLE_TIME >  trunc(sysdate)
+group by ash.SQL_EXEC_ID,ash2.SQL_EXEC_ID, ash2.machine, ash.session_id,ash.session_serial#,ash.event,ash.sql_id,ash.top_level_sql_id,ash.BLOCKING_SESSION,ash.BLOCKING_SESSION_SERIAL#, ash2.sql_id    ,du.username,
+          dp.owner||nvl2(dp.object_name,'.'||dp.object_name,null) ||nvl2(dp.procedure_name,'.'||dp.procedure_name,null)
+               ,do.object_name
+having  sum(decode(ash.session_state,'WAITING',1,0)) - sum(decode(ash.session_state,'WAITING', decode(ash.wait_class, 'User I/O',1,0),0))  >0
+and max(ash.SAMPLE_TIME) - min (ash.SAMPLE_TIME) > interval '3' minute
+order by 1,ash2.sql_exec_id;
+
 select t.start#,t.end#,t.sql_id,t.plan_hash_value,t.execs,t.avg_sec,u.username,s.sql_text from (
 select min(begin_interval_time) start#,max(begin_interval_time) end#, sql_id, plan_hash_value,
 sum(nvl(executions_delta,0)) execs,
