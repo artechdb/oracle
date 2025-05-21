@@ -1,3 +1,23 @@
+select * from (
+select s.sql_id,
+sum( nvl(s.executions_delta,0)) execs,TO_CHAR (ss.begin_interval_time, ‘DD.MM.YYYY HH24’) date#
+— sum((buffer_gets_delta/decode(nvl(buffer_gets_delta,0),0,1,executions_delta))) avg_lio
+from DBA_HIST_SQLSTAT S, DBA_HIST_SNAPSHOT SS, dba_hist_sqltext st
+where ss.snap_id = S.snap_id
+and ss.instance_number = S.instance_number
+and executions_delta > 0
+and elapsed_time_delta > 0
+and st.sql_id=s.sql_id
+— and st.sql_text not like ‘/* SQL Analyze%’
+— and s.sql_id in ( select p.sql_id from dba_hist_sql_plan p where p.object_name=’OPN_HIS’)
+and ss.begin_interval_time > sysdate-7
+group by TO_CHAR (ss.begin_interval_time, ‘DD.MM.YYYY HH24’),s.sql_id )
+pivot ( sum(execs) for sql_id in (
+‘8xjwqbfwwppuf’ )
+) order by 1;
+ashtop.sql sql_id,u.username,event "sql_plan_operation='TABLE ACCESS' and sql_plan_options='FULL'" sysdate-1/24 sysdate
+
+
 58_rac_iops_trend.sql
 PROMPT === 1-DAY IOPS TREND PER INSTANCE (AWR: DBA_HIST_SYSSTAT) ===
 SET PAGESIZE 100
