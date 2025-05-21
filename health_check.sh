@@ -1,3 +1,27 @@
+
+is_exadata() {
+  local db_connect="$1"
+
+  # Query V$VERSION or V$PARAMETER to detect Exadata features
+  local result
+  result=$(sqlplus -s "$db_connect" <<EOF
+SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+SELECT 'YES'
+  FROM v\$parameter
+ WHERE name = 'cell_offload_processing'
+   AND value = 'TRUE';
+EXIT;
+EOF
+)
+
+  if [[ "$result" == "YES" ]]; then
+    return 0  # true: it's Exadata
+  else
+    return 1  # false
+  fi
+}
+
+
 44_rac_gc_waits.sql – Global cache contention (top events)
 
 45_rac_gc_waits_by_instance.sql – GC wait breakdown per node
