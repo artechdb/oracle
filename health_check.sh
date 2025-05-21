@@ -1,3 +1,23 @@
+select t.start#,t.end#,t.sql_id,t.plan_hash_value,t.execs,t.avg_sec,u.username,s.sql_text from (
+select min(begin_interval_time) start#,max(begin_interval_time) end#, sql_id, plan_hash_value,
+sum(nvl(executions_delta,0)) execs,
+round ((sum(elapsed_time_delta)/(sum(executions_delta)))/1000000) avg_sec
+,PARSING_SCHEMA_ID
+,PARSING_USER_ID
+from DBA_HIST_SQLSTAT S, DBA_HIST_SNAPSHOT SS
+where 1=1
+and ss.snap_id = S.snap_id
+and ss.instance_number = S.instance_number
+and executions_delta > 0
+and (elapsed_time_delta/decode(nvl(executions_delta,0),0,1,executions_delta))/1000000 > 5
+group by sql_id, plan_hash_value
+,PARSING_SCHEMA_ID,PARSING_USER_ID
+)t
+join dba_hist_sqltext s on s.sql_id=t.sql_id
+join dba_users u on t.parsing_user_id=u.user_id
+order by execs desc;
+
+
 select * from (
 select s.sql_id,
 sum( nvl(s.executions_delta,0)) execs,TO_CHAR (ss.begin_interval_time, ‘DD.MM.YYYY HH24’) date#
