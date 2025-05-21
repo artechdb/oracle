@@ -3,54 +3,68 @@ SET LINESIZE 200
 COLUMN begin_time FORMAT A20
 COLUMN instance_name FORMAT A20
 COLUMN cpu_count FORMAT 99
+COLUMN db_time FORMAT 999999999
+COLUMN db_time_mins FORMAT 999999.99
 COLUMN aas FORMAT 999.99
 COLUMN status FORMAT A10
 
-PROMPT === DATABASE LOAD - AAS BASED ON DELTA DB TIME (CORRECTED) ===
+PROMPT === DATABASE LOAD (AAS PER MINUTE FROM AWR) - ORACLE RAC ===
 
 WITH db_time_data AS (
   SELECT s.snap_id,
          s.instance_number,
-         MIN(s.begin_interval_time) AS begin_time,
-         MAX(s.end_interval_time) AS end_time,
-         SUM(tm.value) AS db_time
+         s.begin_interval_time,
+         s.end_interval_time,
+         MAX(CASE WHEN tm.stat_name = 'DB time' THEN tm.value END) AS db_time
     FROM dba_hist_sys_time_model tm
     JOIN dba_hist_snapshot s
-      ON tm.snap_id = s.snap_id
-     AND tm.instance_number = s.instance_number
-   WHERE tm.stat_name = 'DB time'
-     AND s.begin_interval_time > SYSDATE - &DAYS_AGO
-   GROUP BY s.snap_id, s.instance_number
+      ON tm.snap_id = s.snap_id AND tm.instance_number = s.instance_number
+   WHERE s.begin_interval_time > SYSDATE - &DAYS_AGO
+     AND tm.stat_name = 'DB time'
+   GROUP BY s.snap_id, s.instance_number, s.begin_interval_time, s.end_interval_time
 ),
 cpu_cores AS (
   SELECT instance_number,
-         MAX(VALUE) AS cpu_count
+         MAX(value) AS cpu_count
     FROM dba_hist_osstat
    WHERE stat_name = 'NUM_CPUS'
    GROUP BY instance_number
 ),
 instance_names AS (
-  SELECT DISTINCT instance_number, instance_name FROM gv$instance
+  SELECT DISTINCT inst_id AS instance_number, instance_name FROM gv$instance
+),
+load_data AS (
+  SELECT d.begin_interval_time,
+         d.end_interval_time,
+         i.instance_name,
+         c.cpu_count,
+         d.db_time,
+         ROUND(d.db_time / 1e6, 2) AS db_time_mins,
+         ROUND((d.db_time / 1e6) /
+               ((CAST(d.end_interval_time AS DATE) - CAST(d.begin_interval_time AS DATE)) * 24 * 60), 2) AS aas,
+         CASE
+           WHEN ROUND((d.db_time / 1e6) /
+                      ((CAST(d.end_interval_time AS DATE) - CAST(d.begin_interval_time AS DATE)) * 24 * 60), 2) > c.cpu_count THEN 'CRITICAL'
+           WHEN ROUND((d.db_time / 1e6) /
+                      ((CAST(d.end_interval_time AS DATE) - CAST(d.begin_interval_time AS DATE)) * 24 * 60), 2) > c.cpu_count * 0.75 THEN 'WARNING'
+           ELSE 'OK'
+         END AS status
+    FROM db_time_data d
+    JOIN cpu_cores c ON d.instance_number = c.instance_number
+    LEFT JOIN instance_names i ON d.instance_number = i.instance_number
 )
-SELECT TO_CHAR(d.begin_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
-       i.instance_name,
-       c.cpu_count,
-       ROUND((d.db_time / 1000000) /
-             ((CAST(d.end_time AS DATE) - CAST(d.begin_time AS DATE)) * 24 * 60 * 60), 2) AS aas,
-       CASE
-         WHEN ROUND((d.db_time / 1000000) /
-                    ((CAST(d.end_time AS DATE) - CAST(d.begin_time AS DATE)) * 24 * 60 * 60), 2) > c.cpu_count * 1.0 THEN 'CRITICAL'
-         WHEN ROUND((d.db_time / 1000000) /
-                    ((CAST(d.end_time AS DATE) - CAST(d.begin_time AS DATE)) * 24 * 60 * 60), 2) > c.cpu_count * 0.75 THEN 'WARNING'
-         ELSE 'OK'
-       END AS status
-  FROM db_time_data d
-  JOIN cpu_cores c ON d.instance_number = c.instance_number
-  LEFT JOIN instance_names i ON d.instance_number = i.instance_number
- ORDER BY d.begin_time DESC, i.instance_name;
+SELECT TO_CHAR(begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
+       instance_name,
+       cpu_count,
+       db_time,
+       db_time_mins,
+       aas,
+       status
+  FROM load_data
+ ORDER BY begin_interval_time DESC, instance_name;
 
 PROMPT
-PROMPT === TOTAL AAS PER SNAPSHOT (ALL INSTANCES COMBINED) ===
+PROMPT === TOTAL AAS PER MINUTE ACROSS ALL INSTANCES ===
 
 SELECT TO_CHAR(begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
        ROUND(SUM(aas), 2) AS total_aas
