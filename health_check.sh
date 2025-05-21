@@ -1,3 +1,91 @@
+File Name	Description
+53_rac_wait_skew.sql	RAC node wait skew detection from ASH
+PROMPT === TOP WAIT EVENTS PER INSTANCE (RAC SKEW CHECK) ===
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN inst_id FORMAT 99
+COLUMN event FORMAT A50
+COLUMN wait_count FORMAT 9999999
+
+SELECT inst_id,
+       event,
+       COUNT(*) AS wait_count
+  FROM gv$active_session_history
+ WHERE sample_time > SYSDATE - 5/1440
+   AND session_state = 'WAITING'
+ GROUP BY inst_id, event
+ ORDER BY inst_id, wait_count DESC;
+ 
+54_exadata_smart_scan_stats.sql	Smart scan stats from V$SYSSTAT
+PROMPT === EXADATA SMART SCAN UTILIZATION (V$SYSSTAT) ===
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN name FORMAT A50
+COLUMN value FORMAT 999999999
+
+SELECT name,
+       value
+  FROM v$sysstat
+ WHERE name LIKE 'cell smart%scan%';
+ 
+55_interconnect_latency.sql	Exadata interconnect performance
+PROMPT === INTERCONNECT LATENCY (GV$CELL_GLOBAL_STATISTICS) ===
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN inst_id FORMAT 99
+COLUMN name FORMAT A60
+COLUMN value_mb FORMAT 999999999.99
+
+SELECT inst_id,
+       name,
+       ROUND(value/1024/1024, 2) AS value_mb
+  FROM gv$cell_global_statistics
+ WHERE name IN (
+       'CLO read retries due to stalling',
+       'IO bytes sent via Smart Interconnect to cells',
+       'IO bytes sent via non-Smart Interconnect to cells'
+ )
+ ORDER BY inst_id, name;
+56_gc_contention.sql	Global cache contention (gc waits)
+PROMPT === RAC GLOBAL CACHE CONTENTION EVENTS (GV$EVENT_HISTOGRAM) ===
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN inst_id FORMAT 99
+COLUMN event FORMAT A50
+COLUMN wait_time_milli FORMAT 999
+COLUMN wait_count FORMAT 999999
+
+SELECT inst_id,
+       event,
+       wait_time_milli,
+       wait_count
+  FROM gv$event_histogram
+ WHERE event IN (
+       'gc buffer busy acquire',
+       'gc buffer busy release',
+       'gc cr block busy'
+ )
+   AND wait_count > 0
+ ORDER BY inst_id, event, wait_time_milli;
+57_exadata_offload_ratio.sql	Offload vs logical I/O ratio from AWR
+PROMPT === EXADATA OFFLOAD SQL STATS (AWR: DBA_HIST_SQLSTAT) ===
+SET PAGESIZE 100
+SET LINESIZE 200
+COLUMN sql_id FORMAT A15
+COLUMN offload_gb FORMAT 999999.99
+COLUMN logical_gb FORMAT 999999.99
+COLUMN offload_ratio FORMAT 9.99
+
+SELECT sql_id,
+       SUM(cell_offload_elig_bytes) / 1024 / 1024 / 1024 AS offload_gb,
+       SUM(cell_uncompressed_bytes) / 1024 / 1024 / 1024 AS logical_gb,
+       ROUND(SUM(cell_offload_elig_bytes) / NULLIF(SUM(cell_uncompressed_bytes), 0), 2) AS offload_ratio
+  FROM dba_hist_sqlstat
+ WHERE snap_id IN (
+       SELECT snap_id FROM dba_hist_snapshot WHERE begin_interval_time > SYSDATE - 1
+ )
+ GROUP BY sql_id
+ ORDER BY offload_ratio DESC NULLS LAST;
 SET PAGESIZE 100
 SET PAGESIZE 100
 SET LINESIZE 200
