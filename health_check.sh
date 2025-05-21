@@ -1,3 +1,16 @@
+select start_time,round (100*"'LOAD'"/"'NUM_CPU_CORES'") AS LOAD from
+(
+select os.INSTANCE_NUMBER,stat_name,sum(os.value) as load,
+min(to_date(to_char(s.begin_interval_time,'DD.MM.YYYY hh24.mi.ss'))) as START_TIME,max(to_date(to_char(s.end_interval_time,'DD.MM.YYYY hh24.mi.ss'))) end_time
+from DBA_HIST_OSSTAT os join
+DBA_HIST_SNAPSHOT s on s.snap_id= os.SNAP_ID
+where os.stat_name in ('LOAD','NUM_CPU_CORES','INSTANCE_NUMBER')
+group by os.stat_name, (trunc(to_date(to_char(s.begin_interval_time,'DD.MM.YYYY hh24.mi.ss')),'HH24')),os.INSTANCE_NUMBER   
+)
+  pivot( max(LOAD) for stat_name in ('LOAD','NUM_CPU_CORES') )
+  where instance_number=2
+order by instance_number,start_time asc ;
+
 select  cast(min (ash.SAMPLE_TIME) as date) as start#
      ,round (24*60*(cast (max(ash.SAMPLE_TIME) as date) - cast(min (ash.SAMPLE_TIME) as date) ),2) as duration#
      ,ash.sql_id,ash.top_level_sql_id,ash.BLOCKING_SESSION as B_SID,ash.BLOCKING_SESSION_SERIAL# as b_serial#
