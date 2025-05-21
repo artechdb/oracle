@@ -7,7 +7,7 @@ COLUMN db_time_mins FORMAT 999999.99
 COLUMN aas FORMAT 999.99
 COLUMN status FORMAT A10
 
-PROMPT === DATABASE LOAD (AAS PER INSTANCE FROM AWR) - ORACLE RAC ===
+PROMPT === DATABASE LOAD (AAS PER MINUTE FROM AWR) - ORACLE RAC ===
 
 WITH db_time_data AS (
   SELECT s.snap_id,
@@ -35,13 +35,13 @@ instance_names AS (
 SELECT TO_CHAR(d.begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_time,
        i.instance_name,
        c.cpu_count,
-       ROUND(d.db_time / 1e6 / 60, 2) AS db_time_mins,
-       ROUND((d.db_time / 1e6 / 60) /
+       ROUND(d.db_time / 1e6, 2) AS db_time_mins,
+       ROUND((d.db_time / 1e6) /
              ((CAST(d.end_interval_time AS DATE) - CAST(d.begin_interval_time AS DATE)) * 24 * 60), 2) AS aas,
        CASE
-         WHEN ROUND((d.db_time / 1e6 / 60) /
+         WHEN ROUND((d.db_time / 1e6) /
                     ((CAST(d.end_interval_time AS DATE) - CAST(d.begin_interval_time AS DATE)) * 24 * 60), 2) > c.cpu_count THEN 'CRITICAL'
-         WHEN ROUND((d.db_time / 1e6 / 60) /
+         WHEN ROUND((d.db_time / 1e6) /
                     ((CAST(d.end_interval_time AS DATE) - CAST(d.begin_interval_time AS DATE)) * 24 * 60), 2) > c.cpu_count * 0.75 THEN 'WARNING'
          ELSE 'OK'
        END AS status
