@@ -1,3 +1,180 @@
+
+pdb_precheck/
+├── bin/
+│   └── pdb_precheck_main.sh
+├── lib/
+│   ├── precheck_config.sh
+│   ├── precheck_html.sh
+│   └── precheck_validation.sh
+├── templates/
+│   └── summary.html
+└── input.cfg
+1. precheck_config.sh:
+
+bash
+#!/bin/bash
+# Configuration
+REPORT_DIR="./reports"
+SQLPLUS="/u01/app/oracle/product/19c/dbhome_1/bin/sqlplus -s"
+HTML_HEADER="<!DOCTYPE html><html><head><title>PDB Precheck Report</title>
+<style>...(keep previous styles)...</style></head><body>"
+declare -A REPORT_STATUS
+2. precheck_html.sh:
+
+bash
+#!/bin/bash
+# HTML Generation Functions
+
+start_html() {
+    echo "$HTML_HEADER" > "$1"
+}
+
+add_summary_row() {
+    echo "<tr><td>$1</td><td>$2</td><td class='$3'><a href='$4'>$5</a></td></tr>" >> "$2"
+}
+
+end_html() {
+    echo "</body></html>" >> "$1"
+}
+3. precheck_validation.sh:
+
+bash
+#!/bin/bash
+# Validation Functions
+
+validate_connection() {
+    local conn_str="$1"
+    $SQLPLUS -S "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+connect $conn_str
+SELECT 1 FROM DUAL;
+exit
+EOF
+    return $?
+}
+
+check_tde_compatibility() {
+    local src_conn="$1" tgt_conn="$2" report_file="$3"
+    # TDE validation logic
+}
+
+check_parameters() {
+    local src_conn="$1" tgt_conn="$2" report_file="$3"
+    # Parameter comparison logic
+}
+4. pdb_precheck_main.sh:
+
+bash
+#!/bin/bash
+# Main Execution Script
+
+source ./lib/precheck_config.sh
+source ./lib/precheck_html.sh
+source ./lib/precheck_validation.sh
+
+INPUT_FILE="$1"
+SUMMARY_REPORT="$REPORT_DIR/summary_$(date +%Y%m%d_%H%M%S).html"
+
+process_pdb_pair() {
+    local src_host=$1 src_port=$2 src_cdb=$3 src_pdb=$4
+    local tgt_host=$5 tgt_port=$6 tgt_cdb=$7 tgt_pdb=$8
+    
+    local report_file="$REPORT_DIR/${src_pdb}_to_${tgt_pdb}_$(date +%s).html"
+    local status="PASS"
+    
+    start_html "$report_file"
+    
+    # Connection checks
+    if ! validate_connection "/@//${src_host}:${src_port}/${src_cdb} as sysdba"; then
+        echo "<div class='fail'>Source CDB connection failed</div>" >> "$report_file"
+        status="FAIL"
+    fi
+    
+    if ! validate_connection "/@//${tgt_host}:${tgt_port}/${tgt_cdb} as sysdba"; then
+        echo "<div class='fail'>Target CDB connection failed</div>" >> "$report_file"
+        status="FAIL"
+    fi
+
+    # Only proceed with checks if connections succeeded
+    if [ "$status" == "PASS" ]; then
+        check_tde_compatibility "/@//${src_host}:${src_port}/${src_cdb}" \
+                              "/@//${tgt_host}:${tgt_port}/${tgt_cdb}" \
+                              "$report_file" || status="FAIL"
+                              
+        check_parameters "/@//${src_host}:${src_port}/${src_cdb}" \
+                        "/@//${tgt_host}:${tgt_port}/${tgt_cdb}" \
+                        "$report_file" || status="FAIL"
+    fi
+
+    end_html "$report_file"
+    REPORT_STATUS["${src_pdb}_${tgt_pdb}"]="$status|$report_file"
+}
+
+generate_summary() {
+    start_html "$SUMMARY_REPORT"
+    echo "<h2>PDB Clone Precheck Summary</h2><table><tr><th>Source PDB</th><th>Target PDB</th><th>Status</th></tr>" >> "$SUMMARY_REPORT"
+    
+    for pair in "${!REPORT_STATUS[@]}"; do
+        IFS='|' read -r status report_file <<< "${REPORT_STATUS[$pair]}"
+        src_pdb=${pair%%_*}
+        tgt_pdb=${pair#*_}
+        add_summary_row "$src_pdb" "$tgt_pdb" "$status" "./$(basename "$report_file")" "$status" "$SUMMARY_REPORT"
+    done
+    
+    echo "</table>" >> "$SUMMARY_REPORT"
+    end_html "$SUMMARY_REPORT"
+}
+
+# Main execution
+mkdir -p "$REPORT_DIR"
+while IFS="|" read -r src_host src_port src_cdb src_pdb tgt_host tgt_port tgt_cdb tgt_pdb; do
+    [[ "$src_host" =~ ^# ]] && continue
+    process_pdb_pair "$src_host" "$src_port" "$src_cdb" "$src_pdb" \
+                     "$tgt_host" "$tgt_port" "$tgt_cdb" "$tgt_pdb"
+done < "$INPUT_FILE"
+
+generate_summary
+echo "Summary report: $SUMMARY_REPORT"
+Sample Input File Format (input.cfg):
+
+# Format:
+# source_host|source_port|source_cdb|source_pdb|target_host|target_port|target_cdb|target_pdb
+dbhost01|1521|CDB1|HRPDB|dbhost02|1521|CDB2|HRCLONE
+dbhost01|1521|CDB1|FINPDB|dbhost03|1521|CDB3|FINCLONE
+Key Features:
+
+Multiple PDB Pair Processing:
+
+bash
+while IFS="|" read -r src_host ...; do
+    process_pdb_pair ...
+done < "$INPUT_FILE"
+Individual Reports with Hyperlinks:
+
+bash
+REPORT_STATUS["${src_pdb}_${tgt_pdb}"]="$status|$report_file"
+add_summary_row ... "./$(basename "$report_file")" ...
+Comprehensive Status Tracking:
+
+bash
+local status="PASS"
+check_tde_compatibility ... || status="FAIL"
+Connection Validation:
+
+bash
+validate_connection "/@//${src_host}:${src_port}/${src_cdb} as sysdba"
+Usage:
+
+bash
+chmod +x bin/pdb_precheck_main.sh
+./bin/pdb_precheck_main.sh input.cfg
+Sample Output Structure:
+
+reports/
+├── HRPDB_to_HRCLONE_1620000000.html
+├── FINPDB_to_FINCLONE_1620000001.html
+└── summary_20231101_1430.html
+
 #!/bin/bash
 # Enhanced MAX_STRING_SIZE Check (precheck_db_checks.sh)
 
