@@ -1,3 +1,47 @@
+#!/bin/bash
+# Enhanced MAX_STRING_SIZE Check (precheck_db_checks.sh)
+
+check_max_string_size() {
+    local src_cdb="$1"
+    local tgt_cdb="$2"
+    
+    # Get MAX_STRING_SIZE with fallback to Oracle default
+    src_size=$(run_sql "/@$src_cdb as sysdba" "
+        SELECT COALESCE(
+            (SELECT value FROM v\$parameter WHERE name = 'max_string_size'),
+            'STANDARD'  -- Oracle 19c default if parameter not set
+        ) FROM DUAL;")
+
+    tgt_size=$(run_sql "/@$tgt_cdb as sysdba" "
+        SELECT COALESCE(
+            (SELECT value FROM v\$parameter WHERE name = 'max_string_size'),
+            'STANDARD'
+        ) FROM DUAL;")
+
+    # Explicit comparison check
+    if [ "$src_size" != "$tgt_size" ]; then
+        html_add_row "MAX_STRING_SIZE" "$src_size" "$tgt_size" "FAIL" "Critical mismatch - CDBs must have identical settings"
+        return 1
+    else
+        # Additional check for actual extended data usage
+        if [ "$src_size" == "STANDARD" ]; then
+            src_ext_count=$(run_sql "/@$src_cdb as sysdba" "
+                SELECT COUNT(*) FROM dba_tab_columns
+                WHERE (data_type = 'VARCHAR2' AND char_used = 'C' AND char_length > 4000)
+                   OR (data_type = 'NVARCHAR2' AND char_used = 'C' AND char_length > 2000)
+                   OR (data_type = 'RAW' AND data_length > 2000);")
+            
+            if [ "$src_ext_count" -gt 0 ]; then
+                html_add_row "MAX_STRING_SIZE" "STANDARD" "STANDARD" "FAIL" "Source contains $src_ext_count extended-size columns while in STANDARD mode"
+                return 1
+            fi
+        fi
+        
+        html_add_row "MAX_STRING_SIZE" "$src_size" "$tgt_size" "PASS" "Configuration compatible"
+        return 0
+    fi
+}
+
 col object_name for a35
 col cnt for 99999
  
