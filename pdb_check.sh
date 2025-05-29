@@ -1,4 +1,141 @@
 #!/bin/bash
+# Oracle PDB Clone Precheck with Enhanced Connection Handling
+# Usage: ./pdb_precheck.sh <input_file.txt> [email@domain.com]
+
+# Configuration
+SQLPLUS="/u01/app/oracle/product/19c/dbhome_1/bin/sqlplus -s"
+REPORT_DIR="./reports"
+HTML_FILE="$REPORT_DIR/pdb_precheck_$(date +%Y%m%d_%H%M%S).html"
+EMAIL_TO="${2:-}"
+EMAIL_FROM="dba@company.com"
+EMAIL_SUBJECT="PDB Clone Precheck Report"
+CONN_RETRIES=3
+CONN_TIMEOUT=5
+
+# Portable uppercase conversion
+to_upper() {
+    echo "$1" | awk '{print toupper($0)}'
+}
+
+# Try multiple connection methods
+resolve_connection() {
+    local cdb=$(to_upper "$1")
+    local host port
+    
+    # Method 1: Try tnsping first
+    if command -v tnsping >/dev/null; then
+        local tnsping_output=$(timeout $CONN_TIMEOUT tnsping "$cdb" 2>/dev/null)
+        host=$(echo "$tnsping_output" | awk '/HOST = / {for(i=1;i<=NF;i++) if ($i=="HOST") {print $(i+2)}; exit}' | tr -d ')(,')
+        port=$(echo "$tnsping_output" | awk '/PORT = / {for(i=1;i<=NF;i++) if ($i=="PORT") {print $(i+2)}; exit}' | tr -d ')(,')
+    fi
+    
+    # Method 2: Try tnsnames.ora lookup (if file exists)
+    if [[ -z "$host" && -f "$TNS_ADMIN/tnsnames.ora" ]]; then
+        local tns_entry=$(awk -v cdb="$cdb" 'BEGIN{IGNORECASE=1} $0 ~ cdb {p=1} p && /HOST *=/ {print; exit}' "$TNS_ADMIN/tnsnames.ora")
+        host=$(echo "$tns_entry" | awk -F'=' '{print $2}' | tr -d ' )(,' | cut -d'.' -f1)
+        port=$(echo "$tns_entry" | awk -F'PORT *= *' '{print $2}' | tr -d ' )(,')
+    fi
+    
+    # Method 3: Try default ports if CDB is known
+    if [[ -z "$host" ]]; then
+        case "$cdb" in
+            "CDB1") host="oracle-host1"; port="1521" ;;
+            "CDB2") host="oracle-host2"; port="1521" ;;
+            # Add more default mappings as needed
+        esac
+    fi
+    
+    # Final validation
+    if [[ -n "$host" && -n "$port" && "$port" =~ ^[0-9]+$ ]]; then
+        echo "SUCCESS|$host|$port"
+    else
+        echo "ERROR|Failed to resolve $cdb (Tried tnsping, tnsnames.ora, and default mappings)"
+        return 1
+    fi
+}
+
+# SQL execution with retries
+run_sql() {
+    local conn_str="$1"
+    local query="$2"
+    local attempt=0
+    
+    while [ $attempt -lt $CONN_RETRIES ]; do
+        result=$($SQLPLUS -S "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+set heading off feedback off verify off
+connect $conn_str
+$query
+exit
+EOF
+        )
+        
+        [ $? -eq 0 ] && echo "$result" && return 0
+        ((attempt++))
+        sleep 1
+    done
+    
+    echo "ERROR|SQL execution failed after $CONN_RETRIES attempts"
+    return 1
+}
+
+# Main validation function
+validate_pdb_pair() {
+    local src_cdb=$(to_upper "$1")
+    local tgt_cdb=$(to_upper "$2")
+    local pdb=$(to_upper "$3")
+    
+    # Resolve source connection
+    src_info=$(resolve_connection "$src_cdb") || {
+        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Connection" "fail" "${src_info#*|}" ""
+        return 1
+    }
+    IFS='|' read -r _ src_host src_port <<< "$src_info"
+    src_conn="/@//${src_host}:${src_port}/${src_cdb} as sysdba"
+    
+    # Resolve target connection
+    tgt_info=$(resolve_connection "$tgt_cdb") || {
+        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Connection" "fail" "${tgt_info#*|}" ""
+        return 1
+    }
+    IFS='|' read -r _ tgt_host tgt_port <<< "$tgt_info"
+    tgt_conn="/@//${tgt_host}:${tgt_port}/${tgt_cdb} as sysdba"
+    
+    # Perform checks
+    checks=(
+        "PDB Existence" "$(check_pdb_exists "$src_conn" "$pdb")"
+        "Local Undo" "$(check_local_undo "$src_conn")"
+        "TDE Config" "$(check_tde_config "$src_conn" "$tgt_conn")"
+        "Patch Level" "$(check_patch_level "$src_conn" "$tgt_conn")"
+        "DB Components" "$(check_db_components "$src_conn" "$tgt_conn")"
+    )
+    
+    # Generate report rows
+    for ((i=0; i<${#checks[@]}; i+=2)); do
+        IFS='|' read -r status details <<< "${checks[i+1]}"
+        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "${checks[i]}" "${status:-ERROR}" "${details:-Check failed}"
+    done
+}
+
+# Main execution
+[ $# -lt 1 ] && { echo "Usage: $0 <input_file.txt> [email]"; exit 1; }
+
+mkdir -p "$REPORT_DIR"
+html_header
+
+while IFS="|" read -r src_cdb tgt_cdb pdb; do
+    [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+    echo "Processing: $src_cdb => $tgt_cdb (PDB: $pdb)"
+    validate_pdb_pair "$src_cdb" "$tgt_cdb" "$pdb"
+done < "$1"
+
+html_footer
+
+# Email handling
+[ -n "$EMAIL_TO" ] && mailx -s "$EMAIL_SUBJECT" -a "Content-Type: text/html" -r "$EMAIL_FROM" "$EMAIL_TO" < "$HTML_FILE"
+
+echo "Report generated: $HTML_FILE"
+#!/bin/bash
 # Oracle PDB Clone Precheck with Portable Host/Port Extraction
 # Usage: ./pdb_precheck.sh <input_file.txt> [email@domain.com]
 
