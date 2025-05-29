@@ -1,4 +1,169 @@
 #!/bin/bash
+# Oracle PDB Clone Precheck with Connection Validation
+# Usage: ./pdb_precheck.sh <input_file.txt> [email@domain.com]
+
+# Configuration
+SQLPLUS="/u01/app/oracle/product/19c/dbhome_1/bin/sqlplus -s"
+REPORT_DIR="./reports"
+HTML_FILE="$REPORT_DIR/pdb_precheck_$(date +%Y%m%d_%H%M%S).html"
+EMAIL_TO="${2:-}"
+EMAIL_FROM="dba@company.com"
+EMAIL_SUBJECT="PDB Clone Precheck Report"
+CONN_RETRIES=3
+CONN_TIMEOUT=5
+
+# Ensure TNS_ADMIN is set
+export TNS_ADMIN="${TNS_ADMIN:-$ORACLE_HOME/network/admin}"
+
+# Helper functions
+to_upper() {
+    echo "$1" | tr '[:lower:]' '[:upper:]'
+}
+
+html_header() {
+    cat <<EOF > "$HTML_FILE"
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  /* ... (keep existing styles) ... */
+</style>
+<title>PDB Clone Precheck Report</title>
+</head>
+<body>
+<h1>Oracle PDB Clone Precheck Report</h1>
+<p>Generated: $(date)</p>
+<table>
+<tr>
+  <th>Source CDB</th>
+  <th>Target CDB</th>
+  <th>PDB</th>
+  <th>Check</th>
+  <th>Status</th>
+  <th>Details</th>
+</tr>
+EOF
+}
+
+html_add_row() {
+    echo "<tr>
+      <td>$1</td>
+      <td>$2</td>
+      <td>$3</td>
+      <td>$4</td>
+      <td class=\"$5\">$6</td>
+      <td>$7</td>
+    </tr>" >> "$HTML_FILE"
+}
+
+html_footer() {
+    echo "</table></body></html>" >> "$HTML_FILE"
+}
+
+# Validate database connection
+validate_db_connection() {
+    local conn_str="$1"
+    local cdb_name="$2"
+    local attempt=0
+    local result
+    
+    while [ $attempt -lt $CONN_RETRIES ]; do
+        result=$($SQLPLUS -S "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+set heading off feedback off verify off pagesize 0
+connect $conn_str
+SELECT 'CONNECTION_VALID' FROM DUAL;
+exit
+EOF
+        )
+        
+        if [[ "$result" == *"CONNECTION_VALID"* ]]; then
+            echo "PASS|Connection successful"
+            return 0
+        fi
+        
+        ((attempt++))
+        sleep 1
+    done
+    
+    echo "FAIL|Failed to connect to $cdb_name after $CONN_RETRIES attempts"
+    return 1
+}
+
+# Main validation function with connection validation
+validate_pdb_pair() {
+    local src_cdb=$(to_upper "$1")
+    local tgt_cdb=$(to_upper "$2")
+    local pdb=$(to_upper "$3")
+    
+    echo "Processing: $src_cdb => $tgt_cdb (PDB: $pdb)"
+    
+    # Resolve source connection
+    src_info=$(resolve_connection "$src_cdb") || {
+        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Connection" "fail" "${src_info#*|}" ""
+        return 1
+    }
+    IFS='|' read -r _ src_host src_port <<< "$src_info"
+    src_conn="/@//${src_host}:${src_port}/${src_cdb} as sysdba"
+    
+    # Resolve target connection
+    tgt_info=$(resolve_connection "$tgt_cdb") || {
+        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Connection" "fail" "${tgt_info#*|}" ""
+        return 1
+    }
+    IFS='|' read -r _ tgt_host tgt_port <<< "$tgt_info"
+    tgt_conn="/@//${tgt_host}:${tgt_port}/${tgt_cdb} as sysdba"
+    
+    # Validate connections before proceeding
+    src_conn_result=$(validate_db_connection "$src_conn" "$src_cdb")
+    tgt_conn_result=$(validate_db_connection "$tgt_conn" "$tgt_cdb")
+    
+    IFS='|' read -r src_status src_details <<< "$src_conn_result"
+    IFS='|' read -r tgt_status tgt_details <<< "$tgt_conn_result"
+    
+    html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Source Connection" "$src_status" "$src_details" ""
+    html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Target Connection" "$tgt_status" "$tgt_details" ""
+    
+    # Abort if any connection failed
+    if [[ "$src_status" != "PASS" || "$tgt_status" != "PASS" ]]; then
+        return 1
+    fi
+    
+    # Perform other checks only if connections succeeded
+    checks=(
+        "PDB Existence" "$(check_pdb_exists "$src_conn" "$pdb")"
+        "Local Undo" "$(check_local_undo "$src_conn")"
+        "TDE Config" "$(check_tde_config "$src_conn" "$tgt_conn")"
+        "Patch Level" "$(check_patch_level "$src_conn" "$tgt_conn")"
+        "DB Components" "$(check_db_components "$src_conn" "$tgt_conn")"
+    )
+    
+    # Generate report rows
+    for ((i=0; i<${#checks[@]}; i+=2)); do
+        IFS='|' read -r status details <<< "${checks[i+1]}"
+        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "${checks[i]}" "${status:-ERROR}" "${details:-Check failed}" ""
+    done
+}
+
+# Main execution
+[ $# -lt 1 ] && { echo "Usage: $0 <input_file.txt> [email]"; exit 1; }
+
+mkdir -p "$REPORT_DIR"
+html_header
+
+while IFS="|" read -r src_cdb tgt_cdb pdb; do
+    [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+    validate_pdb_pair "$src_cdb" "$tgt_cdb" "$pdb"
+done < "$1"
+
+html_footer
+
+# Email handling
+[ -n "$EMAIL_TO" ] && mailx -s "$EMAIL_SUBJECT" -a "Content-Type: text/html" -r "$EMAIL_FROM" "$EMAIL_TO" < "$HTML_FILE"
+
+echo "Report generated: $HTML_FILE"
+
+#!/bin/bash
 # Oracle PDB Clone Precheck with Guaranteed Connection Resolution
 # Usage: ./pdb_precheck.sh <input_file.txt> [email@domain.com]
 
