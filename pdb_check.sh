@@ -1,5 +1,5 @@
 #!/bin/bash
-# Oracle PDB Clone Precheck Script with Automatic Host Discovery
+# Oracle PDB Clone Precheck Script with Comprehensive Checks
 # Usage: ./pdb_precheck.sh <input_file.txt> [email@domain.com]
 
 # Configuration
@@ -33,11 +33,27 @@ html_header() {
 <body>
 <h1>Oracle PDB Clone Precheck Report</h1>
 <p>Generated: $(date)</p>
+<table>
+<tr>
+  <th>Source CDB</th>
+  <th>Target CDB</th>
+  <th>PDB</th>
+  <th>Check</th>
+  <th>Status</th>
+  <th>Details</th>
+</tr>
 EOF
 }
 
 html_add_row() {
-    echo "<tr><td>$1</td><td>$2</td><td>$3</td><td class=\"$4\">$5</td><td>$6</td></tr>" >> "$HTML_FILE"
+    echo "<tr>
+      <td>$1</td>
+      <td>$2</td>
+      <td>$3</td>
+      <td>$4</td>
+      <td class=\"$5\">$6</td>
+      <td>$7</td>
+    </tr>" >> "$HTML_FILE"
 }
 
 html_footer() {
@@ -61,24 +77,72 @@ get_db_connection() {
 }
 
 # Database validation functions
-check_pdb_status() {
-    local conn_str="$1" pdb="$2"
+run_sql() {
+    local conn_str="$1"
+    local query="$2"
     $SQLPLUS -S "/ as sysdba" <<EOF
 whenever sqlerror exit failure
+set heading off feedback off verify off
 connect $conn_str
-SELECT open_mode FROM v\$pdbs WHERE name = '$pdb';
+$query
 exit
 EOF
 }
 
-check_max_string_size() {
+check_local_undo() {
     local conn_str="$1"
-    $SQLPLUS -S "/ as sysdba" <<EOF
-whenever sqlerror exit failure
-connect $conn_str
-SELECT value FROM v\$parameter WHERE name = 'max_string_size';
-exit
-EOF
+    local result=$(run_sql "$conn_str" "SELECT value FROM v\$parameter WHERE name = 'local_undo_enabled';")
+    if [ "$result" != "TRUE" ]; then
+        echo "FAIL|Local undo not enabled"
+    else
+        echo "PASS|Local undo enabled"
+    fi
+}
+
+check_tde_config() {
+    local src_conn="$1" tgt_conn="$2"
+    local src_wallet=$(run_sql "$src_conn" "SELECT wallet_type FROM v\$encryption_wallet;")
+    local tgt_wallet=$(run_sql "$tgt_conn" "SELECT wallet_type FROM v\$encryption_wallet;")
+    
+    if [ "$src_wallet" != "$tgt_wallet" ]; then
+        echo "FAIL|TDE mismatch (Source: $src_wallet, Target: $tgt_wallet)"
+    else
+        echo "PASS|TDE configuration matches ($src_wallet)"
+    fi
+}
+
+check_patch_level() {
+    local src_conn="$1" tgt_conn="$2"
+    local src_patch=$(run_sql "$src_conn" "
+        SELECT TO_CHAR(MAX(action_time), MAX(version), MAX(patch_id) 
+        FROM dba_registry_sqlpatch;")
+    
+    local tgt_patch=$(run_sql "$tgt_conn" "
+        SELECT TO_CHAR(MAX(action_time)), MAX(version), MAX(patch_id) 
+        FROM dba_registry_sqlpatch;")
+    
+    if [[ "$src_patch" > "$tgt_patch" ]]; then
+        echo "FAIL|Target patch level lower than source (Source: $src_patch, Target: $tgt_patch)"
+    else
+        echo "PASS|Patch level compatible (Source: $src_patch, Target: $tgt_patch)"
+    fi
+}
+
+check_db_components() {
+    local src_conn="$1" tgt_conn="$2"
+    local src_comps=$(run_sql "$src_conn" "
+        SELECT LISTAGG(comp_name, ', ') WITHIN GROUP (ORDER BY comp_name) 
+        FROM dba_registry;")
+    
+    local tgt_comps=$(run_sql "$tgt_conn" "
+        SELECT LISTAGG(comp_name, ', ') WITHIN GROUP (ORDER BY comp_name) 
+        FROM dba_registry;")
+    
+    if [ "$src_comps" != "$tgt_comps" ]; then
+        echo "FAIL|Components differ (Source: $src_comps, Target: $tgt_comps)"
+    else
+        echo "PASS|All components match ($src_comps)"
+    fi
 }
 
 # Main validation function
@@ -88,7 +152,7 @@ validate_pdb_pair() {
     # Resolve source connection
     local src_info=$(get_db_connection "$src_cdb")
     if [[ "$src_info" == ERROR* ]]; then
-        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "fail" "Connection Failed" "${src_info#*|}"
+        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Connection" "fail" "${src_info#*|}" ""
         return 1
     fi
     local src_host=$(echo "$src_info" | cut -d'|' -f2)
@@ -98,43 +162,27 @@ validate_pdb_pair() {
     # Resolve target connection
     local tgt_info=$(get_db_connection "$tgt_cdb")
     if [[ "$tgt_info" == ERROR* ]]; then
-        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "fail" "Connection Failed" "${tgt_info#*|}"
+        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Connection" "fail" "${tgt_info#*|}" ""
         return 1
     fi
     local tgt_host=$(echo "$tgt_info" | cut -d'|' -f2)
     local tgt_port=$(echo "$tgt_info" | cut -d'|' -f3)
     local tgt_conn="/@//${tgt_host}:${tgt_port}/${tgt_cdb} as sysdba"
     
-    # Start validation
-    local status="pass"
-    local details=""
-    local errors=""
+    # Perform all checks
+    local checks=(
+        "Local Undo" "$(check_local_undo "$src_conn")"
+        "TDE Config" "$(check_tde_config "$src_conn" "$tgt_conn")"
+        "Patch Level" "$(check_patch_level "$src_conn" "$tgt_conn")"
+        "DB Components" "$(check_db_components "$src_conn" "$tgt_conn")"
+    )
     
-    # 1. Check PDB exists in source
-    if ! check_pdb_status "$src_conn" "$pdb" >/dev/null; then
-        errors+="Source PDB $pdb not found. "
-        status="fail"
-    fi
-    
-    # 2. Check PDB doesn't exist in target
-    if check_pdb_status "$tgt_conn" "$pdb" >/dev/null; then
-        errors+="Target PDB $pdb already exists. "
-        status="fail"
-    fi
-    
-    # 3. Compare MAX_STRING_SIZE
-    local src_size=$(check_max_string_size "$src_conn")
-    local tgt_size=$(check_max_string_size "$tgt_conn")
-    if [ "$src_size" != "$tgt_size" ]; then
-        errors+="MAX_STRING_SIZE mismatch (Source: $src_size, Target: $tgt_size). "
-        status="fail"
-    fi
-    
-    # Add results to report
-    html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "$status" "$([ -z "$errors" ] && echo "All checks passed" || echo "$errors")" \
-                "Source: ${src_host}:${src_port}<br>Target: ${tgt_host}:${tgt_port}"
-    
-    return $([ "$status" == "pass" ] && echo 0 || echo 1)
+    # Process check results
+    for ((i=0; i<${#checks[@]}; i+=2)); do
+        local check_name="${checks[i]}"
+        IFS='|' read -r status details <<< "${checks[i+1]}"
+        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "$check_name" "$status" "$details" ""
+    done
 }
 
 # Main execution
@@ -142,7 +190,6 @@ validate_pdb_pair() {
 
 mkdir -p "$REPORT_DIR"
 html_header
-echo "<table><tr><th>Source CDB</th><th>Target CDB</th><th>PDB</th><th>Status</th><th>Details</th><th>Connection Info</th></tr>" >> "$HTML_FILE"
 
 while IFS="|" read -r src_cdb tgt_cdb pdb; do
     # Skip comments and empty lines
