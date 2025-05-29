@@ -1,3 +1,85 @@
+validate_pdb_connection() {
+    local conn_str="$1"
+    local expected_cdb=$(to_upper "$2")
+    local expected_pdb=$(to_upper "$3")
+    local attempt=0
+    local result
+
+    while [ $attempt -lt $CONN_RETRIES ]; do
+        # Get connection status, CDB name and PDB name in one query
+        result=$($SQLPLUS -S "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+set heading off feedback off verify off pagesize 0
+connect $conn_str
+DECLARE
+    v_cdb_match VARCHAR2(10);
+    v_pdb_match VARCHAR2(10);
+    v_pdb_open VARCHAR2(10);
+BEGIN
+    -- Check CDB name match
+    SELECT CASE WHEN UPPER('$expected_cdb') = UPPER(value) THEN 'Y' ELSE 'N' END
+    INTO v_cdb_match
+    FROM v\\$parameter 
+    WHERE name = 'db_unique_name';
+
+    -- Check PDB exists and name matches
+    BEGIN
+        SELECT 
+            CASE WHEN UPPER(name) = UPPER('$expected_pdb') THEN 'Y' ELSE 'N' END,
+            open_mode
+        INTO v_pdb_match, v_pdb_open
+        FROM v\\$pdbs
+        WHERE UPPER(name) = UPPER('$expected_pdb');
+
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                v_pdb_match := 'N';
+                v_pdb_open := 'CLOSED';
+    END;
+
+    -- Return consolidated status
+    IF v_cdb_match = 'N' THEN
+        DBMS_OUTPUT.PUT_LINE('CDB_MISMATCH');
+    ELSIF v_pdb_match = 'N' THEN
+        DBMS_OUTPUT.PUT_LINE('PDB_NOT_FOUND');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('CONNECTION_VALID|' || v_pdb_open);
+    END IF;
+END;
+/
+exit
+EOF
+        )
+
+        # Parse results
+        case "$result" in
+            *"CDB_MISMATCH"*)
+                actual_cdb=$(run_sql "$conn_str" "SELECT value FROM v\\$parameter WHERE name = 'db_unique_name'")
+                echo "FAIL|CDB name mismatch (Expected: $expected_cdb, Actual: ${actual_cdb:-UNKNOWN})"
+                return 1
+                ;;
+            *"PDB_NOT_FOUND"*)
+                available_pdbs=$(run_sql "$conn_str" "SELECT LISTAGG(name, ', ') WITHIN GROUP (ORDER BY name) FROM v\\$pdbs")
+                echo "FAIL|PDB $expected_pdb not found. Available PDBs: ${available_pdbs:-NONE}"
+                return 1
+                ;;
+            *"CONNECTION_VALID"*)
+                pdb_status=$(echo "$result" | awk -F'|' '{print $2}')
+                echo "PASS|Connection valid (PDB Status: $pdb_status)"
+                return 0
+                ;;
+            *)
+                ((attempt++))
+                sleep 1
+                ;;
+        esac
+    done
+
+    echo "FAIL|Connection failed after $CONN_RETRIES attempts"
+    return 1
+}
+
+#######
 validate_db_connection() {
     local conn_str="$1"
     local expected_cdb=$(to_upper "$2")
