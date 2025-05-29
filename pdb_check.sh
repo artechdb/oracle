@@ -290,6 +290,297 @@ fi
 echo "Report generated: $HTML_FILE"
 
 #!/bin/bash
+# Oracle PDB Clone Precheck with Guaranteed Connection Resolution
+# Usage: ./pdb_precheck.sh <input_file.txt> [email@domain.com]
+
+# Configuration
+SQLPLUS="/u01/app/oracle/product/19c/dbhome_1/bin/sqlplus -s"
+REPORT_DIR="./reports"
+HTML_FILE="$REPORT_DIR/pdb_precheck_$(date +%Y%m%d_%H%M%S).html"
+EMAIL_TO="${2:-}"
+EMAIL_FROM="dba@company.com"
+EMAIL_SUBJECT="PDB Clone Precheck Report"
+CONN_RETRIES=3
+CONN_TIMEOUT=5
+
+# Ensure TNS_ADMIN is set if tnsnames.ora exists in non-standard location
+export TNS_ADMIN="${TNS_ADMIN:-$ORACLE_HOME/network/admin}"
+
+# Helper functions
+to_upper() {
+    echo "$1" | tr '[:lower:]' '[:upper:]'
+}
+
+html_header() {
+    cat <<EOF > "$HTML_FILE"
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+  th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+  th { background-color: #f2f2f2; }
+  .pass { background-color: #dfffdf; }
+  .fail { background-color: #ffe8e8; }
+  .warning { background-color: #fff3e0; }
+</style>
+<title>PDB Clone Precheck Report</title>
+</head>
+<body>
+<h1>Oracle PDB Clone Precheck Report</h1>
+<p>Generated: $(date)</p>
+<table>
+<tr>
+  <th>Source CDB</th>
+  <th>Target CDB</th>
+  <th>PDB</th>
+  <th>Check</th>
+  <th>Status</th>
+  <th>Details</th>
+</tr>
+EOF
+}
+
+html_add_row() {
+    echo "<tr>
+      <td>$1</td>
+      <td>$2</td>
+      <td>$3</td>
+      <td>$4</td>
+      <td class=\"$5\">$6</td>
+      <td>$7</td>
+    </tr>" >> "$HTML_FILE"
+}
+
+html_footer() {
+    echo "</table></body></html>" >> "$HTML_FILE"
+}
+
+# Most reliable connection resolution method
+resolve_connection() {
+    local cdb=$(to_upper "$1")
+    local host port
+    
+    # Method 1: Directly from tnsnames.ora (most reliable)
+    if [ -f "$TNS_ADMIN/tnsnames.ora" ]; then
+        local tns_entry=$(awk -v cdb="$cdb" '
+            BEGIN {IGNORECASE=1; found=0}
+            /^'"$cdb"'[[:space:]]*=/,/\)$/ {
+                if ($0 ~ /HOST[[:space:]]*=/) {
+                    gsub(/.*HOST[[:space:]]*=[[:space:]]*/, "")
+                    gsub(/[[:space:]]*\).*/, "")
+                    host=$0
+                }
+                if ($0 ~ /PORT[[:space:]]*=/) {
+                    gsub(/.*PORT[[:space:]]*=[[:space:]]*/, "")
+                    gsub(/[[:space:]]*\).*/, "")
+                    port=$0
+                }
+                if ($0 ~ /\)$/) found=1
+            }
+            END {if (found && host && port) print host "|" port}
+        ' "$TNS_ADMIN/tnsnames.ora")
+        
+        host=$(echo "$tns_entry" | cut -d'|' -f1)
+        port=$(echo "$tns_entry" | cut -d'|' -f2)
+    fi
+    
+    # Method 2: Try tnsping if tnsnames.ora method failed
+    if [[ -z "$host" ]] && command -v tnsping >/dev/null; then
+        local tnsping_output=$(timeout $CONN_TIMEOUT tnsping "$cdb" 2>&1)
+        host=$(echo "$tnsping_output" | grep -A1 "HOST =" | tail -1 | awk '{print $1}' | tr -d '(),')
+        port=$(echo "$tnsping_output" | grep "PORT =" | awk '{print $NF}' | tr -d '),')
+    fi
+    
+    # Method 3: Hardcoded fallback (edit with your values)
+    if [[ -z "$host" ]]; then
+        case "$cdb" in
+            "CDB1") host="oracle-host1.company.com"; port="1521" ;;
+            "CDB2") host="oracle-host2.company.com"; port="1521" ;;
+            "PRODDB") host="prod-db.company.com"; port="1522" ;;
+            *) host=""; port="" ;;
+        esac
+    fi
+    
+    # Final validation
+    if [[ -n "$host" && -n "$port" && "$port" =~ ^[0-9]+$ ]]; then
+        echo "SUCCESS|$host|$port"
+    else
+        echo "ERROR|Failed to resolve $cdb after all methods"
+        return 1
+    fi
+}
+
+# SQL execution with error handling
+run_sql() {
+    local conn_str="$1"
+    local query="$2"
+    local attempt=0
+    
+    while [ $attempt -lt $CONN_RETRIES ]; do
+        result=$($SQLPLUS -S "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+set heading off feedback off verify off pagesize 0
+connect $conn_str
+$query
+exit
+EOF
+        )
+        
+        if [ $? -eq 0 ]; then
+            # Clean SQL*Plus output
+            echo "$result" | sed '/^$/d' | head -1
+            return 0
+        fi
+        
+        ((attempt++))
+        sleep 1
+    done
+    
+    echo "ERROR|SQL execution failed after $CONN_RETRIES attempts"
+    return 1
+}
+
+# Validation checks
+check_pdb_exists() {
+    local conn_str="$1"
+    local pdb=$(to_upper "$2")
+    
+    result=$(run_sql "$conn_str" "
+        SELECT name FROM v\\$pdbs WHERE UPPER(name) = '$pdb'")
+    
+    if [[ "$result" == "$pdb" ]]; then
+        echo "PASS|PDB exists"
+    else
+        echo "FAIL|PDB not found"
+    fi
+}
+
+check_local_undo() {
+    local conn_str="$1"
+    result=$(run_sql "$conn_str" "SELECT value FROM v\\$parameter WHERE name = 'local_undo_enabled'")
+    
+    if [[ "$result" == "TRUE" ]]; then
+        echo "PASS|Local undo enabled"
+    else
+        echo "FAIL|Local undo not enabled (Value: ${result:-NOT_SET})"
+    fi
+}
+
+check_tde_config() {
+    local src_conn="$1" tgt_conn="$2"
+    src_wallet=$(run_sql "$src_conn" "SELECT wallet_type FROM v\\$encryption_wallet")
+    tgt_wallet=$(run_sql "$tgt_conn" "SELECT wallet_type FROM v\\$encryption_wallet")
+    
+    if [[ "$src_wallet" == "$tgt_wallet" ]]; then
+        echo "PASS|TDE matches ($src_wallet)"
+    else
+        echo "FAIL|TDE mismatch (Source: $src_wallet, Target: $tgt_wallet)"
+    fi
+}
+
+check_patch_level() {
+    local src_conn="$1" tgt_conn="$2"
+    src_patch=$(run_sql "$src_conn" "
+        SELECT version || ':' || patch_id 
+        FROM (SELECT version, patch_id FROM dba_registry_sqlpatch ORDER BY action_time DESC)
+        WHERE ROWNUM = 1")
+    tgt_patch=$(run_sql "$tgt_conn" "
+        SELECT version || ':' || patch_id 
+        FROM (SELECT version, patch_id FROM dba_registry_sqlpatch ORDER BY action_time DESC)
+        WHERE ROWNUM = 1")
+    
+    if [[ "$src_patch" == "$tgt_patch" ]]; then
+        echo "PASS|Patch levels match ($src_patch)"
+    elif [[ -z "$src_patch" || -z "$tgt_patch" ]]; then
+        echo "FAIL|Could not determine patch level (Source: $src_patch, Target: $tgt_patch)"
+    else
+        echo "FAIL|Patch level mismatch (Source: $src_patch, Target: $tgt_patch)"
+    fi
+}
+
+check_db_components() {
+    local src_conn="$1" tgt_conn="$2"
+    src_comps=$(run_sql "$src_conn" "
+        SELECT LISTAGG(comp_name, ', ') WITHIN GROUP (ORDER BY comp_name) 
+        FROM dba_registry")
+    tgt_comps=$(run_sql "$tgt_conn" "
+        SELECT LISTAGG(comp_name, ', ') WITHIN GROUP (ORDER BY comp_name) 
+        FROM dba_registry")
+    
+    if [[ "$src_comps" == "$tgt_comps" ]]; then
+        echo "PASS|Components match"
+    else
+        echo "FAIL|Components differ (Source: $src_comps, Target: $tgt_comps)"
+    fi
+}
+
+# Main validation function
+validate_pdb_pair() {
+    local src_cdb=$(to_upper "$1")
+    local tgt_cdb=$(to_upper "$2")
+    local pdb=$(to_upper "$3")
+    
+    echo "Processing: $src_cdb => $tgt_cdb (PDB: $pdb)"
+    
+    # Resolve source connection
+    src_info=$(resolve_connection "$src_cdb") || {
+        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Connection" "fail" "${src_info#*|}" ""
+        return 1
+    }
+    IFS='|' read -r _ src_host src_port <<< "$src_info"
+    src_conn="/@//${src_host}:${src_port}/${src_cdb} as sysdba"
+    
+    # Resolve target connection
+    tgt_info=$(resolve_connection "$tgt_cdb") || {
+        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Connection" "fail" "${tgt_info#*|}" ""
+        return 1
+    }
+    IFS='|' read -r _ tgt_host tgt_port <<< "$tgt_info"
+    tgt_conn="/@//${tgt_host}:${tgt_port}/${tgt_cdb} as sysdba"
+    
+    # Perform checks
+    checks=(
+        "PDB Existence" "$(check_pdb_exists "$src_conn" "$pdb")"
+        "Local Undo" "$(check_local_undo "$src_conn")"
+        "TDE Config" "$(check_tde_config "$src_conn" "$tgt_conn")"
+        "Patch Level" "$(check_patch_level "$src_conn" "$tgt_conn")"
+        "DB Components" "$(check_db_components "$src_conn" "$tgt_conn")"
+    )
+    
+    # Generate report rows
+    for ((i=0; i<${#checks[@]}; i+=2)); do
+        IFS='|' read -r status details <<< "${checks[i+1]}"
+        html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "${checks[i]}" "${status:-ERROR}" "${details:-Check failed}" ""
+    done
+}
+
+# Main execution
+[ $# -lt 1 ] && { echo "Usage: $0 <input_file.txt> [email]"; exit 1; }
+
+mkdir -p "$REPORT_DIR"
+html_header
+
+while IFS="|" read -r src_cdb tgt_cdb pdb; do
+    [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+    validate_pdb_pair "$src_cdb" "$tgt_cdb" "$pdb"
+done < "$1"
+
+html_footer
+
+# Email handling
+if [ -n "$EMAIL_TO" ]; then
+    if mailx -s "$EMAIL_SUBJECT" -a "Content-Type: text/html" -r "$EMAIL_FROM" "$EMAIL_TO" < "$HTML_FILE"; then
+        echo "Report sent to $EMAIL_TO"
+    else
+        echo "Failed to send email report"
+    fi
+fi
+
+echo "Report generated: $HTML_FILE"
+
+#!/bin/bash
 # Oracle PDB Clone Precheck with Enhanced Connection Handling
 # Usage: ./pdb_precheck.sh <input_file.txt> [email@domain.com]
 
