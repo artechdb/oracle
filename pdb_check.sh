@@ -1,3 +1,63 @@
+validate_db_connection() {
+    local conn_str="$1"
+    local expected_cdb=$(to_upper "$2")
+    local attempt=0
+    local result
+    
+    while [ $attempt -lt $CONN_RETRIES ]; do
+        # Get both connection status and db_unique_name in one query
+        result=$($SQLPLUS -S "/ as sysdba" <<EOF
+whenever sqlerror exit failure
+set heading off feedback off verify off pagesize 0
+connect $conn_str
+SELECT 
+    CASE 
+        WHEN UPPER('$expected_cdb') = UPPER(value) THEN 'CONNECTION_VALID'
+        ELSE 'DB_NAME_MISMATCH'
+    END
+FROM v\\$parameter 
+WHERE name = 'db_unique_name'
+UNION ALL
+SELECT 'ERROR' FROM DUAL WHERE NOT EXISTS (
+    SELECT 1 FROM v\\$parameter WHERE name = 'db_unique_name'
+);
+exit
+EOF
+        )
+        
+        # Check results
+        if [[ "$result" == *"CONNECTION_VALID"* ]]; then
+            echo "PASS|Connection successful to $expected_cdb"
+            return 0
+        elif [[ "$result" == *"DB_NAME_MISMATCH"* ]]; then
+            actual_db=$(run_sql "$conn_str" "SELECT value FROM v\\$parameter WHERE name = 'db_unique_name'")
+            echo "FAIL|CDB name mismatch (Expected: $expected_cdb, Actual: ${actual_db:-UNKNOWN})"
+            return 1
+        fi
+        
+        ((attempt++))
+        sleep 1
+    done
+    
+    # If we get here, connection failed completely
+    echo "FAIL|Failed to connect after $CONN_RETRIES attempts"
+    return 1
+}
+elif [[ "$result" == *"DB_NAME_MISMATCH"* ]]; then
+    actual_db=$(run_sql "$conn_str" "SELECT value FROM v\\$parameter WHERE name = 'db_unique_name'")
+    echo "FAIL|CDB name mismatch (Expected: $expected_cdb, Actual: ${actual_db:-UNKNOWN})"
+
+    # Validate connections before proceeding
+src_conn_result=$(validate_db_connection "$src_conn" "$src_cdb")
+tgt_conn_result=$(validate_db_connection "$tgt_conn" "$tgt_cdb")
+
+IFS='|' read -r src_status src_details <<< "$src_conn_result"
+IFS='|' read -r tgt_status tgt_details <<< "$tgt_conn_result"
+
+html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Source Connection" "$src_status" "$src_details" ""
+html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Target Connection" "$tgt_status" "$tgt_details" ""
+
+
 #!/bin/bash
 # Oracle PDB Clone Precheck with Connection Validation
 # Usage: ./pdb_precheck.sh <input_file.txt> [email@domain.com]
