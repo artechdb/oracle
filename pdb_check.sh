@@ -78,7 +78,30 @@ EOF
     echo "FAIL|Connection failed after $CONN_RETRIES attempts"
     return 1
 }
+####
+validate_pdb_pair() {
+    local src_cdb=$(to_upper "$1")
+    local tgt_cdb=$(to_upper "$2")
+    local pdb=$(to_upper "$3")
+    
+    # Resolve connections (existing code)
+    # ...
 
+    # Validate source PDB connection
+    src_conn_result=$(validate_pdb_connection "$src_conn" "$src_cdb" "$pdb")
+    IFS='|' read -r src_status src_details <<< "$src_conn_result"
+    html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Source PDB Connection" "$src_status" "$src_details" ""
+
+    # Validate target CDB connection (without PDB check)
+    tgt_conn_result=$(validate_db_connection "$tgt_conn" "$tgt_cdb")
+    IFS='|' read -r tgt_status tgt_details <<< "$tgt_conn_result"
+    html_add_row "$src_cdb" "$tgt_cdb" "$pdb" "Target CDB Connection" "$tgt_status" "$tgt_details" ""
+
+    # Abort if any connection failed
+    [[ "$src_status" != "PASS" || "$tgt_status" != "PASS" ]] && return 1
+
+    # Proceed with other checks...
+}
 #######
 validate_db_connection() {
     local conn_str="$1"
