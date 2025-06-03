@@ -1,4 +1,84 @@
+#!/bin/bash
+# Oracle PDB Clone Precheck - Main Execution Script
+# Usage: ./pdb_precheck.sh <input_file.txt> [email@domain.com]
 
+# Load configuration and functions
+source ./pdb_precheck_config.sh
+source ./pdb_precheck_functions.sh
+
+# Main execution function
+main() {
+    local input_file="$1"
+    local email_to="${2:-}"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    
+    # Initialize directories and files
+    REPORT_DIR="./reports/$timestamp"
+    HTML_FILE="$REPORT_DIR/detailed_report.html"
+    SUMMARY_FILE="$REPORT_DIR/summary_report.html"
+    mkdir -p "$REPORT_DIR"
+    
+    # Start detailed report
+    html_header > "$HTML_FILE"
+    
+    # Process each PDB pair
+    local pair_count=0
+    local success_count=0
+    local fail_count=0
+    
+    while IFS="|" read -r src_cdb tgt_cdb pdb; do
+        # Skip comments and empty lines
+        [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+        
+        echo "Processing: $src_cdb => $tgt_cdb (PDB: $pdb)"
+        ((pair_count++))
+        
+        # Validate the PDB pair
+        if validate_pdb_pair "$src_cdb" "$tgt_cdb" "$pdb"; then
+            ((success_count++))
+        else
+            ((fail_count++))
+        fi
+        
+    done < "$input_file"
+    
+    # Complete detailed report
+    html_footer >> "$HTML_FILE"
+    
+    # Generate summary report
+    generate_summary_report "$input_file" "$SUMMARY_FILE" "$pair_count" "$success_count" "$fail_count"
+    
+    # Send notification
+    if [[ -n "$email_to" ]]; then
+        send_notification "$email_to" "$SUMMARY_FILE" "$pair_count" "$success_count"
+    fi
+    
+    # Final status
+    if [[ "$fail_count" -gt 0 ]]; then
+        echo "Validation completed with $fail_count failure(s)"
+        return 1
+    else
+        echo "All $pair_count PDB pairs validated successfully"
+        return 0
+    fi
+}
+
+# Helper function to send email notification
+send_notification() {
+    local email_to="$1"
+    local report_file="$2"
+    local total="$3"
+    local success="$4"
+    
+    local subject="PDB Precheck Report: $success/$total successful"
+    local body="Oracle PDB clone precheck completed. See attached report."
+    
+    echo "$body" | mailx -s "$subject" -a "$report_file" -r "$EMAIL_FROM" "$email_to"
+}
+
+# Execute main function
+main "$@"
+exit $?
 generate_summary_report() {
     local input_file="$1"
     local report_file="$REPORT_DIR/summary_report_$(date +%Y%m%d_%H%M%S).html"
