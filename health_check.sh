@@ -4,6 +4,76 @@ validate_pdb_pair() {
     local pdb=$(to_upper "$3")
     local report_file="$4"
     
+    # ... [previous connection validation code remains unchanged] ...
+
+    # 5. Perform compatibility checks (existing checks remain unchanged)
+    local checks=(
+        "Local Undo" "$(check_local_undo "$src_conn")"
+        "TDE Configuration" "$(check_tde_config "$src_conn" "$tgt_conn")"
+        # ... [other checks] ...
+    )
+
+    # ... [process check results as before] ...
+
+    # 6. Add parameter discrepancy report (reference only)
+    echo "<h3>Parameter Discrepancies (Reference Only)</h3>" >> "$report_file"
+    echo "<table>" >> "$report_file"
+    echo "<tr><th>Parameter</th><th>Source Value</th><th>Target Value</th></tr>" >> "$report_file"
+    
+    # Get parameter differences (exclude common excluded parameters)
+    diff_params=$(compare_parameters "$src_conn" "$tgt_conn")
+    if [[ -n "$diff_params" ]]; then
+        while IFS='|' read -r param src_val tgt_val; do
+            echo "<tr><td>$param</td><td>$src_val</td><td>$tgt_val</td></tr>" >> "$report_file"
+        done <<< "$diff_params"
+    else
+        echo "<tr><td colspan='3'>No significant parameter differences found</td></tr>" >> "$report_file"
+    fi
+    
+    echo "</table>" >> "$report_file"
+
+    # ... [final status determination remains unchanged] ...
+}
+
+# Helper function to compare parameters
+compare_parameters() {
+    local src_conn="$1"
+    local tgt_conn="$2"
+    
+    # Exclude these parameters from comparison
+    local excluded_params="db_name|db_unique_name|instance_name|control_files|local_listener"
+    
+    # Get source parameters
+    src_params=$(mktemp)
+    run_sql "$src_conn" "
+        SELECT name, value FROM v\\$parameter 
+        WHERE name NOT LIKE '%dump%'
+        AND name NOT IN (${excluded_params//|/,})
+        ORDER BY name" > "$src_params"
+    
+    # Get target parameters
+    tgt_params=$(mktemp)
+    run_sql "$tgt_conn" "
+        SELECT name, value FROM v\\$parameter 
+        WHERE name NOT LIKE '%dump%'
+        AND name NOT IN (${excluded_params//|/,})
+        ORDER BY name" > "$tgt_params"
+    
+    # Compare and format differences
+    diff --unchanged-line-format='' --old-line-format='' \
+         --new-line-format='%L' "$src_params" "$tgt_params" | \
+    awk -F'|' '{print $1 "|" $2 "|" $4}'
+    
+    # Cleanup
+    rm -f "$src_params" "$tgt_params"
+}
+
+validate_pdb_pair() {
+    local src_cdb=$(to_upper "$1")
+    local tgt_cdb=$(to_upper "$2")
+    local pdb=$(to_upper "$3")
+    local report_file="$4"
+    
     # Initialize HTML report for this pair
     html_header "$report_file"
     echo "<h2>PDB Clone Validation: $src_cdb/$pdb → $tgt_cdb</h2>" >> "$report_file"
