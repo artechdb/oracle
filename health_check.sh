@@ -1,3 +1,66 @@
+send_notification() {
+    local email_to="$1"
+    local zip_file="$2"
+    local total="$3"
+    local success="$4"
+    local fail_count=$((total - success))
+    
+    # Generate a boundary string
+    local boundary="$(uuidgen)"
+    local subject="PDB Precheck Report: $success/$total successful"
+    
+    # Create temporary email file
+    local email_file=$(mktemp)
+    
+    # Build email headers
+    cat <<EOF > "$email_file"
+To: $email_to
+From: $EMAIL_FROM
+Subject: $subject
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="$boundary"
+
+--${boundary}
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 7bit
+
+Oracle PDB clone precheck completed.
+
+Summary:
+- Total PDB pairs checked: $total
+- Successful prechecks: $success
+- Failed prechecks: $fail_count
+
+The attached ZIP file contains all validation reports.
+Extract the ZIP to view the HTML reports with working hyperlinks.
+
+--${boundary}
+Content-Type: application/zip
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="$(basename "$zip_file")"
+
+EOF
+    
+    # Add the zip file as base64 encoded attachment
+    base64 "$zip_file" >> "$email_file"
+    
+    # Close the email
+    echo "--${boundary}--" >> "$email_file"
+    
+    # Send the email using sendmail
+    /usr/sbin/sendmail -t -oi < "$email_file"
+    
+    # Clean up
+    rm -f "$email_file"
+    
+    # Verify delivery
+    if [ $? -eq 0 ]; then
+        echo "Notification sent to $email_to"
+    else
+        echo "Failed to send notification email"
+        return 1
+    fi
+}
 html_add_row() {
     local report_file="$1"
     local check_name="$2"
