@@ -1,3 +1,34 @@
+html_add_row() {
+    local report_file="$1"
+    local check_name="$2"
+    local status="$3"
+    local details="$4"
+    local extra_info="$5"
+    
+    # Determine CSS class based on status
+    local status_class
+    case "$status" in
+        "pass") status_class="pass" ;;
+        "fail") status_class="fail" ;;
+        *) status_class="warning" ;;
+    esac
+    
+    # Escape HTML special characters in details
+    details=$(echo "$details" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+    
+    # Write the table row
+    cat <<EOF >> "$report_file"
+<tr>
+  <td>$check_name</td>
+  <td class="$status_class">${status^^}</td>
+  <td>${details:-N/A}</td>
+  <td>${extra_info:-}</td>
+</tr>
+EOF
+    
+    # Add status-specific icons
+    sed -i "s|>${status^^}</td>|><span class=\"status-icon\">${status^^}</span></td>|g" "$report_file"
+}
 validate_pdb_pair() {
     local src_cdb=$(to_upper "$1")
     local tgt_cdb=$(to_upper "$2")
