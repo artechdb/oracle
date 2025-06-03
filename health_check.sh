@@ -1,3 +1,6 @@
+echo "td.missing { color: #666; font-style: italic; }" >> "$report_file"
+echo "h4 { margin-top: 20px; color: #2c3e50; }" >> "$report_file"
+
 compare_parameters() {
     local src_conn="$1"
     local tgt_conn="$2"
