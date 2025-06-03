@@ -1,4 +1,109 @@
 
+generate_summary_report() {
+    local input_file="$1"
+    local report_file="$REPORT_DIR/summary_report_$(date +%Y%m%d_%H%M%S).html"
+    local overall_status="PASS"
+    local total_pairs=0
+    local passed_pairs=0
+    local failed_pairs=0
+
+    # Start HTML report
+    cat <<EOF > "$report_file"
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; }
+  h1 { color: #333; }
+  .summary-table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+  .summary-table th, .summary-table td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+  .summary-table th { background-color: #f2f2f2; }
+  .pass { background-color: #dfffdf; }
+  .fail { background-color: #ffe8e8; }
+  .warning { background-color: #fff3e0; }
+  .status-header { width: 100px; }
+  .details-header { width: 300px; }
+  .summary-stats { margin: 20px 0; padding: 15px; background-color: #f8f9fa; border-radius: 5px; }
+  .timestamp { color: #666; font-size: 0.9em; }
+</style>
+<title>PDB Clone Precheck Summary Report</title>
+</head>
+<body>
+<h1>Oracle PDB Clone Precheck Summary Report</h1>
+<div class="timestamp">Generated: $(date)</div>
+<div class="summary-stats">
+EOF
+
+    # Process each PDB pair and collect results
+    while IFS="|" read -r src_cdb tgt_cdb pdb; do
+        [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+        ((total_pairs++))
+        
+        # Get the detailed report filename for this pair
+        report_filename="${REPORT_DIR}/${src_cdb}_to_${tgt_cdb}_${pdb}_report.html"
+        
+        # Check if detailed report exists and get status
+        if [[ -f "$report_filename" ]]; then
+            status=$(grep -oP '(?<=<td class=")[^"]+' "$report_filename" | head -1)
+            if [[ "$status" == "pass" ]]; then
+                ((passed_pairs++))
+                status_label="PASS"
+                status_class="pass"
+            else
+                ((failed_pairs++))
+                status_label="FAIL"
+                status_class="fail"
+                overall_status="FAIL"
+            fi
+        else
+            ((failed_pairs++))
+            status_label="MISSING"
+            status_class="fail"
+            overall_status="FAIL"
+        fi
+
+        # Add row to summary table
+        cat <<EOF >> "$report_file"
+<table class="summary-table">
+<tr>
+  <th>Source CDB</th>
+  <th>Target CDB</th>
+  <th>PDB</th>
+  <th class="status-header">Status</th>
+  <th class="details-header">Details</th>
+</tr>
+<tr>
+  <td>$(to_upper "$src_cdb")</td>
+  <td>$(to_upper "$tgt_cdb")</td>
+  <td>$(to_upper "$pdb")</td>
+  <td class="$status_class">$status_label</td>
+  <td><a href="$(basename "$report_filename")">View Details</a></td>
+</tr>
+</table>
+EOF
+
+    done < "$input_file"
+
+    # Add summary statistics
+    cat <<EOF >> "$report_file"
+</div>
+<div class="summary-stats">
+  <h3>Summary Statistics</h3>
+  <p>Total PDB Pairs Checked: $total_pairs</p>
+  <p>Successful Prechecks: <span class="pass">$passed_pairs</span></p>
+  <p>Failed Prechecks: <span class="fail">$failed_pairs</span></p>
+  <p>Overall Status: <span class="${overall_status,,}">$overall_status</span></p>
+</div>
+
+<h3>Precheck Details</h3>
+<p>Click on 'View Details' links above to see individual precheck reports.</p>
+</body>
+</html>
+EOF
+
+    echo "Summary report generated: $report_file"
+}
+
 pdb_precheck/
 ├── bin/
 │   └── pdb_precheck_main.sh
