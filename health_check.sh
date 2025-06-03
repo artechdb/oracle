@@ -5,8 +5,8 @@ generate_summary_report() {
     local success_count="$4"
     local fail_count="$5"
     
-    # Calculate percentages
-    local success_percent=$(( success_count * 100 / total_pairs ))
+    # Calculate percentages (treat warnings as passes)
+    local success_percent=$(( (success_count + warning_count) * 100 / total_pairs ))
     local fail_percent=$(( fail_count * 100 / total_pairs ))
     
     # Start HTML report
@@ -106,10 +106,12 @@ generate_summary_report() {
 <div class="summary-card">
   <h2>Validation Summary</h2>
   <p>Total PDB Pairs Checked: <strong>$total_pairs</strong></p>
+  <p>Successful/Warning Prechecks: <strong>$success_count</strong></p>
+  <p>Failed Prechecks: <strong>$fail_count</strong></p>
   
   <div class="progress-container">
-    <div class="progress-bar success-bar">$success_count Successful ($success_percent%)</div>
-    <div class="progress-bar fail-bar">$fail_count Failed ($fail_percent%)</div>
+    <div class="progress-bar success-bar">$success_percent% Valid</div>
+    <div class="progress-bar fail-bar">$fail_percent% Failed</div>
   </div>
 </div>
 
@@ -133,15 +135,15 @@ EOF
         local report_filename="detailed/${src_cdb}_to_${tgt_cdb}_${pdb}.html"
         local status status_class
         
-        # Check if report exists and get status
+        # Check if report exists and get status (treat warnings as passes)
         if [[ -f "$REPORT_DIR/$report_filename" ]]; then
-            status=$(grep -oP '(?<=<td class="status-)(pass|fail)' "$REPORT_DIR/$report_filename" | head -1)
-            if [[ "$status" == "pass" ]]; then
-                status="PASS"
-                status_class="status-pass"
-            else
+            status=$(grep -oP '(?<=<td class="status-)(pass|fail|warning)' "$REPORT_DIR/$report_filename" | head -1)
+            if [[ "$status" == "fail" ]]; then
                 status="FAIL"
                 status_class="status-fail"
+            else
+                status="PASS"
+                status_class="status-pass"
             fi
         else
             status="MISSING"
@@ -169,8 +171,8 @@ EOF
   <h3>Next Steps</h3>
   <ul>
     <li>Review failed validations in the detailed reports</li>
+    <li>Warnings are treated as passing checks in this summary</li>
     <li>All hyperlinks will work when extracted from the ZIP archive</li>
-    <li>Contact DBA team for any questions</li>
   </ul>
 </div>
 
