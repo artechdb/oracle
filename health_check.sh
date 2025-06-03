@@ -1,3 +1,72 @@
+compare_parameters() {
+    local src_conn="$1"
+    local tgt_conn="$2"
+    
+    # Parameters to exclude from comparison
+    local excluded_params="db_name|db_unique_name|instance_name|control_files|local_listener|remote_login_passwordfile"
+    local excluded_prefixes="audit_|event|_dump_|trace_|hidden|_statistics"
+
+    # Compare v$system_parameter (memory)
+    echo "<h4>System Parameters (v\$system_parameter)</h4>" >> "$report_file"
+    compare_param_set "$src_conn" "$tgt_conn" "
+        SELECT name, value FROM v\$parameter 
+        WHERE name NOT REGEXP '$excluded_prefixes'
+        AND name NOT IN (${excluded_params//|/,})
+        AND (isdefault = 'FALSE' OR value != default_value)"
+    
+    # Compare v$spparameter (spfile)
+    echo "<h4>SPFile Parameters (v\$spparameter)</h4>" >> "$report_file"
+    compare_param_set "$src_conn" "$tgt_conn" "
+        SELECT name, value FROM v\$spparameter 
+        WHERE name NOT REGEXP '$excluded_prefixes'
+        AND name NOT IN (${excluded_params//|/,})
+        AND value IS NOT NULL
+        AND sid = '*'"
+    
+    # Compare database properties
+    echo "<h4>Database Properties</h4>" >> "$report_file"
+    compare_param_set "$src_conn" "$tgt_conn" "
+        SELECT property_name, property_value 
+        FROM database_properties
+        WHERE property_name NOT LIKE 'DEFAULT%'"
+}
+
+compare_param_set() {
+    local src_conn="$1"
+    local tgt_conn="$2"
+    local query="$3"
+    
+    # Get source parameters
+    local src_params=$(mktemp)
+    run_sql "$src_conn" "$query" | tr -d ' ' > "$src_params"
+    
+    # Get target parameters
+    local tgt_params=$(mktemp)
+    run_sql "$tgt_conn" "$query" | tr -d ' ' > "$tgt_params"
+    
+    # Compare and format differences
+    echo "<table><tr><th>Parameter</th><th>Source Value</th><th>Target Value</th></tr>" >> "$report_file"
+    
+    diff --unchanged-line-format='' \
+         --old-line-format="<tr><td>%1\$s</td><td>%2\$s</td><td class=\"missing\">(Not Set)</td></tr>" \
+         --new-line-format="<tr><td>%1\$s</td><td class=\"missing\">(Not Set)</td><td>%2\$s</td></tr>" \
+         "$src_params" "$tgt_params" | \
+    awk -F'|' '{print $1 "|" $2 "|" $4}' >> "$report_file"
+    
+    # Show value differences for common parameters
+    comm -12 <(cut -d'|' -f1 "$src_params" | sort) <(cut -d'|' -f1 "$tgt_params" | sort) | while read param; do
+        src_val=$(grep "^${param}|" "$src_params" | cut -d'|' -f2)
+        tgt_val=$(grep "^${param}|" "$tgt_params" | cut -d'|' -f2)
+        
+        if [[ "$src_val" != "$tgt_val" ]]; then
+            echo "<tr><td>$param</td><td>$src_val</td><td>$tgt_val</td></tr>" >> "$report_file"
+        fi
+    done
+    
+    echo "</table>" >> "$report_file"
+    rm -f "$src_params" "$tgt_params"
+}
+
 validate_pdb_pair() {
     local src_cdb=$(to_upper "$1")
     local tgt_cdb=$(to_upper "$2")
