@@ -1,3 +1,72 @@
+main() {
+    local input_file="$1"
+    local email_to="${2:-}"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    
+    # Initialize directories and counters
+    REPORT_DIR="./reports/$timestamp"
+    DETAILED_DIR="$REPORT_DIR/detailed"
+    mkdir -p "$DETAILED_DIR"
+    
+    local pair_count=0
+    local success_count=0
+    local warning_count=0
+    local fail_count=0
+    
+    # Process each PDB pair
+    while IFS="|" read -r src_cdb tgt_cdb pdb; do
+        [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+        
+        echo "Processing: $src_cdb => $tgt_cdb (PDB: $pdb)"
+        ((pair_count++))
+        
+        # Generate individual report
+        report_file="$DETAILED_DIR/${src_cdb}_to_${tgt_cdb}_${pdb}.html"
+        html_header > "$report_file"
+        
+        # Validate and capture output
+        if validate_pdb_pair "$src_cdb" "$tgt_cdb" "$pdb" "$report_file"; then
+            ((success_count++))
+        else
+            # Check if the failure was just warnings
+            if grep -q "class=\"status-warning\"" "$report_file" && \
+               ! grep -q "class=\"status-fail\"" "$report_file"; then
+                ((warning_count++))
+            else
+                ((fail_count++))
+            fi
+        fi
+        
+        html_footer >> "$report_file"
+    done < "$input_file"
+    
+    # Generate summary report (treat warnings as passes in summary)
+    SUMMARY_FILE="$REPORT_DIR/summary_report.html"
+    generate_summary_report "$input_file" "$SUMMARY_FILE" "$pair_count" \
+                          "$((success_count + warning_count))" "$fail_count"
+    
+    # Create zip archive
+    ZIP_FILE="$REPORT_DIR/pdb_precheck_reports.zip"
+    zip -jqr "$ZIP_FILE" "$REPORT_DIR"/*.html "$DETAILED_DIR"/
+    
+    # Send notification (count warnings as successes)
+    if [[ -n "$email_to" ]]; then
+        send_notification "$email_to" "$ZIP_FILE" "$pair_count" \
+                        "$((success_count + warning_count))"
+    fi
+    
+    # Final status (only fail if actual failures exist)
+    if [[ "$fail_count" -gt 0 ]]; then
+        echo "Validation completed with $fail_count failure(s) and $warning_count warning(s)"
+        echo "Reports available: $ZIP_FILE"
+        return 1
+    else
+        echo "All $pair_count PDB pairs validated successfully ($warning_count with warnings)"
+        echo "Reports available: $ZIP_FILE"
+        return 0
+    fi
+}
+
 generate_summary_report() {
     local input_file="$1"
     local summary_file="$2"
