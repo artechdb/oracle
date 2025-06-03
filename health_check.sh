@@ -1,4 +1,86 @@
-
+validate_pdb_pair() {
+    local src_cdb=$(to_upper "$1")
+    local tgt_cdb=$(to_upper "$2")
+    local pdb=$(to_upper "$3")
+    local report_file="$4"
+    
+    # Initialize HTML report for this pair
+    html_header "$report_file"
+    echo "<h2>PDB Clone Validation: $src_cdb/$pdb → $tgt_cdb</h2>" >> "$report_file"
+    echo "<table>" >> "$report_file"
+    
+    # 1. Resolve connections
+    local src_info=$(resolve_connection "$src_cdb")
+    local tgt_info=$(resolve_connection "$tgt_cdb")
+    
+    # 2. Validate connections
+    local src_conn tgt_conn
+    if [[ "$src_info" == ERROR* ]]; then
+        html_add_row "$report_file" "Source Connection" "fail" "${src_info#*|}" ""
+        return 1
+    else
+        IFS='|' read -r _ src_host src_port <<< "$src_info"
+        src_conn="/@//${src_host}:${src_port}/${src_cdb} as sysdba"
+        html_add_row "$report_file" "Source Connection" "pass" "Connected to ${src_host}:${src_port}" ""
+    fi
+    
+    if [[ "$tgt_info" == ERROR* ]]; then
+        html_add_row "$report_file" "Target Connection" "fail" "${tgt_info#*|}" ""
+        return 1
+    else
+        IFS='|' read -r _ tgt_host tgt_port <<< "$tgt_info"
+        tgt_conn="/@//${tgt_host}:${tgt_port}/${tgt_cdb} as sysdba"
+        html_add_row "$report_file" "Target Connection" "pass" "Connected to ${tgt_host}:${tgt_port}" ""
+    fi
+    
+    # 3. Validate PDB in source
+    local pdb_status=$(validate_pdb_connection "$src_conn" "$src_cdb" "$pdb")
+    IFS='|' read -r status details <<< "$pdb_status"
+    html_add_row "$report_file" "Source PDB Validation" "$status" "$details" ""
+    [[ "$status" != "pass" ]] && return 1
+    
+    # 4. Validate target PDB doesn't exist
+    local target_pdb_check=$(run_sql "$tgt_conn" "
+        SELECT 'EXISTS' FROM v\\$pdbs WHERE UPPER(name) = UPPER('$pdb')")
+    if [[ -n "$target_pdb_check" ]]; then
+        html_add_row "$report_file" "Target PDB Check" "fail" "PDB $pdb already exists in target" ""
+        return 1
+    else
+        html_add_row "$report_file" "Target PDB Check" "pass" "PDB $pdb available" ""
+    fi
+    
+    # 5. Perform compatibility checks
+    local checks=(
+        "Local Undo" "$(check_local_undo "$src_conn")"
+        "TDE Configuration" "$(check_tde_config "$src_conn" "$tgt_conn")"
+        "Patch Level" "$(check_patch_level "$src_conn" "$tgt_conn")"
+        "DB Components" "$(check_db_components "$src_conn" "$tgt_conn")"
+        "Character Set" "$(check_charset "$src_conn" "$tgt_conn")"
+        "Parameters" "$(check_parameters "$src_conn" "$tgt_conn")"
+    )
+    
+    # Process check results
+    local all_checks_passed=true
+    for ((i=0; i<${#checks[@]}; i+=2)); do
+        local check_name="${checks[i]}"
+        IFS='|' read -r status details <<< "${checks[i+1]}"
+        
+        html_add_row "$report_file" "$check_name" "$status" "$details" ""
+        
+        if [[ "$status" != "pass" ]]; then
+            all_checks_passed=false
+        fi
+    done
+    
+    # Final status
+    if $all_checks_passed; then
+        html_add_row "$report_file" "Overall Status" "pass" "All prechecks passed" ""
+        return 0
+    else
+        html_add_row "$report_file" "Overall Status" "fail" "One or more prechecks failed" ""
+        return 1
+    fi
+}
 #!/bin/bash
 # Oracle PDB Clone Precheck with Zipped Reports
 # Usage: ./pdb_precheck.sh <input_file.txt> [email@domain.com]
