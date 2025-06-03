@@ -1,3 +1,43 @@
+html_header() {
+    cat <<EOF > "$1"
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+  th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+  th { background-color: #f2f2f2; }
+  .pass { background-color: #e8f5e9; color: #2e7d32; }
+  .fail { background-color: #ffebee; color: #c62828; }
+  .warning { background-color: #fff8e1; color: #f57f17; }
+  .status-icon {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    margin-right: 5px;
+    border-radius: 50%;
+    text-align: center;
+    line-height: 20px;
+    font-weight: bold;
+  }
+  .pass .status-icon { background-color: #4caf50; color: white; }
+  .fail .status-icon { background-color: #f44336; color: white; }
+  .warning .status-icon { background-color: #ffc107; color: black; }
+</style>
+<title>PDB Precheck Report</title>
+</head>
+<body>
+<h2>Oracle PDB Clone Precheck Report</h2>
+<table>
+<tr>
+  <th>Check</th>
+  <th>Status</th>
+  <th>Details</th>
+  <th>Additional Info</th>
+</tr>
+EOF
+}
 send_notification() {
     local email_to="$1"
     local zip_file="$2"
