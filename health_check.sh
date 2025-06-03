@@ -1,3 +1,103 @@
+
+#!/bin/bash
+# Oracle PDB Clone Precheck with Zipped Reports
+# Usage: ./pdb_precheck.sh <input_file.txt> [email@domain.com]
+
+# Load configuration and functions
+source ./pdb_precheck_config.sh
+source ./pdb_precheck_functions.sh
+
+# Main execution function
+main() {
+    local input_file="$1"
+    local email_to="${2:-}"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    
+    # Initialize directories
+    REPORT_DIR="./reports/$timestamp"
+    DETAILED_DIR="$REPORT_DIR/detailed"
+    mkdir -p "$DETAILED_DIR"
+    
+    # Process each PDB pair
+    local pair_count=0
+    local success_count=0
+    local fail_count=0
+    
+    while IFS="|" read -r src_cdb tgt_cdb pdb; do
+        [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+        
+        echo "Processing: $src_cdb => $tgt_cdb (PDB: $pdb)"
+        ((pair_count++))
+        
+        # Generate individual report
+        report_file="$DETAILED_DIR/${src_cdb}_to_${tgt_cdb}_${pdb}.html"
+        html_header > "$report_file"
+        
+        if validate_pdb_pair "$src_cdb" "$tgt_cdb" "$pdb" >> "$report_file"; then
+            ((success_count++))
+        else
+            ((fail_count++))
+        fi
+        
+        html_footer >> "$report_file"
+    done < "$input_file"
+    
+    # Generate summary report
+    SUMMARY_FILE="$REPORT_DIR/summary_report.html"
+    generate_summary_report "$input_file" "$SUMMARY_FILE" "$pair_count" "$success_count" "$fail_count"
+    
+    # Create zip archive
+    ZIP_FILE="$REPORT_DIR/pdb_precheck_reports.zip"
+    zip -jqr "$ZIP_FILE" "$REPORT_DIR"/*.html "$DETAILED_DIR"/
+    
+    # Send notification
+    if [[ -n "$email_to" ]]; then
+        send_notification "$email_to" "$ZIP_FILE" "$pair_count" "$success_count"
+    fi
+    
+    # Final status
+    if [[ "$fail_count" -gt 0 ]]; then
+        echo "Validation completed with $fail_count failure(s)"
+        echo "Reports available: $ZIP_FILE"
+        return 1
+    else
+        echo "All $pair_count PDB pairs validated successfully"
+        echo "Reports available: $ZIP_FILE"
+        return 0
+    fi
+}
+
+# Enhanced email function with zip attachment
+send_notification() {
+    local email_to="$1"
+    local zip_file="$2"
+    local total="$3"
+    local success="$4"
+    
+    local subject="PDB Precheck Report: $success/$total successful"
+    local body=$(cat <<EOF
+Oracle PDB clone precheck completed.
+
+Summary:
+- Total PDB pairs checked: $total
+- Successful prechecks: $success
+- Failed prechecks: $((total - success))
+
+The attached ZIP file contains:
+1. summary_report.html - Executive summary
+2. detailed/*.html - Individual validation reports
+
+All internal hyperlinks will work when extracted from the ZIP archive.
+EOF
+    )
+    
+    echo "$body" | mailx -s "$subject" -a "$zip_file" -r "$EMAIL_FROM" "$email_to"
+}
+
+# Execute main function
+main "$@"
+exit $?
+
 #!/bin/bash
 # Oracle PDB Clone Precheck - Main Execution Script
 # Usage: ./pdb_precheck.sh <input_file.txt> [email@domain.com]
