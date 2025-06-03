@@ -1,3 +1,185 @@
+generate_summary_report() {
+    local input_file="$1"
+    local summary_file="$2"
+    local total_pairs="$3"
+    local success_count="$4"
+    local fail_count="$5"
+    
+    # Calculate percentages
+    local success_percent=$(( success_count * 100 / total_pairs ))
+    local fail_percent=$(( fail_count * 100 / total_pairs ))
+    
+    # Start HTML report
+    cat <<EOF > "$summary_file"
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>PDB Clone Precheck Summary Report</title>
+<style>
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    line-height: 1.6;
+    margin: 0;
+    padding: 20px;
+    color: #333;
+  }
+  .header {
+    background-color: #2c3e50;
+    color: white;
+    padding: 20px;
+    margin-bottom: 30px;
+    border-radius: 5px;
+  }
+  .summary-card {
+    background-color: #f8f9fa;
+    border-radius: 5px;
+    padding: 20px;
+    margin-bottom: 30px;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+  }
+  .progress-container {
+    width: 100%;
+    background-color: #e9ecef;
+    border-radius: 5px;
+    margin: 15px 0;
+  }
+  .progress-bar {
+    height: 30px;
+    border-radius: 5px;
+    text-align: center;
+    line-height: 30px;
+    color: white;
+    font-weight: bold;
+  }
+  .success-bar {
+    background-color: #28a745;
+    width: ${success_percent}%;
+  }
+  .fail-bar {
+    background-color: #dc3545;
+    width: ${fail_percent}%;
+  }
+  .report-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 20px;
+  }
+  .report-table th, .report-table td {
+    border: 1px solid #ddd;
+    padding: 12px;
+    text-align: left;
+  }
+  .report-table th {
+    background-color: #2c3e50;
+    color: white;
+  }
+  .status-pass {
+    background-color: #d4edda;
+    color: #155724;
+  }
+  .status-fail {
+    background-color: #f8d7da;
+    color: #721c24;
+  }
+  .view-link {
+    color: #007bff;
+    text-decoration: none;
+    font-weight: bold;
+  }
+  .view-link:hover {
+    text-decoration: underline;
+  }
+  .timestamp {
+    color: #6c757d;
+    font-size: 0.9em;
+    margin-top: 10px;
+  }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Oracle PDB Clone Precheck Summary Report</h1>
+  <div class="timestamp">Generated: $(date "+%Y-%m-%d %H:%M:%S")</div>
+</div>
+
+<div class="summary-card">
+  <h2>Validation Summary</h2>
+  <p>Total PDB Pairs Checked: <strong>$total_pairs</strong></p>
+  
+  <div class="progress-container">
+    <div class="progress-bar success-bar">$success_count Successful ($success_percent%)</div>
+    <div class="progress-bar fail-bar">$fail_count Failed ($fail_percent%)</div>
+  </div>
+</div>
+
+<table class="report-table">
+  <thead>
+    <tr>
+      <th>Source CDB</th>
+      <th>Target CDB</th>
+      <th>PDB Name</th>
+      <th>Status</th>
+      <th>Details</th>
+    </tr>
+  </thead>
+  <tbody>
+EOF
+
+    # Process each PDB pair and add to summary
+    while IFS="|" read -r src_cdb tgt_cdb pdb; do
+        [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+        
+        local report_filename="detailed/${src_cdb}_to_${tgt_cdb}_${pdb}.html"
+        local status status_class
+        
+        # Check if report exists and get status
+        if [[ -f "$REPORT_DIR/$report_filename" ]]; then
+            status=$(grep -oP '(?<=<td class="status-)(pass|fail)' "$REPORT_DIR/$report_filename" | head -1)
+            if [[ "$status" == "pass" ]]; then
+                status="PASS"
+                status_class="status-pass"
+            else
+                status="FAIL"
+                status_class="status-fail"
+            fi
+        else
+            status="MISSING"
+            status_class="status-fail"
+        fi
+        
+        # Add row to summary table
+        cat <<EOF >> "$summary_file"
+    <tr>
+      <td>$(to_upper "$src_cdb")</td>
+      <td>$(to_upper "$tgt_cdb")</td>
+      <td>$(to_upper "$pdb")</td>
+      <td class="$status_class">$status</td>
+      <td><a class="view-link" href="$report_filename">View Full Report</a></td>
+    </tr>
+EOF
+    done < "$input_file"
+
+    # Close HTML
+    cat <<EOF >> "$summary_file"
+  </tbody>
+</table>
+
+<div class="summary-card">
+  <h3>Next Steps</h3>
+  <ul>
+    <li>Review failed validations in the detailed reports</li>
+    <li>All hyperlinks will work when extracted from the ZIP archive</li>
+    <li>Contact DBA team for any questions</li>
+  </ul>
+</div>
+
+</body>
+</html>
+EOF
+
+    echo "Summary report generated: $summary_file"
+}
 html_header() {
     cat <<EOF > "$1"
 <!DOCTYPE html>
