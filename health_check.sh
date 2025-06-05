@@ -1,3 +1,117 @@
+get_report_status() {
+    local report_file="$1"
+    
+    # Check for explicit status classes in the HTML
+    if grep -q '<td class="status-fail"' "$report_file"; then
+        echo "fail"
+    elif grep -q '<td class="status-warning"' "$report_file"; then
+        echo "warning"
+    elif grep -q '<td class="status-pass"' "$report_file"; then
+        echo "pass"
+    else
+        echo "fail"  # Default to fail if no status found
+    fi
+}
+
+generate_summary_report() {
+    local input_file="$1"
+    local summary_file="$2"
+    local total_pairs="$3"
+    local success_count="$4"
+    local fail_count="$5"
+    
+    # Calculate percentages (warnings counted as passes in stats)
+    local success_percent=$(( (success_count + warning_count) * 100 / total_pairs ))
+    local fail_percent=$(( fail_count * 100 / total_pairs ))
+    
+    # Start HTML report
+    cat <<EOF > "$summary_file"
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  /* ... (existing styles) ... */
+  .status-warning {
+    background-color: #fff3cd;
+    color: #856404;
+  }
+</style>
+</head>
+<body>
+<!-- ... (existing header content) ... -->
+EOF
+
+    # Process each PDB pair
+    while IFS="|" read -r src_cdb tgt_cdb pdb; do
+        [[ "$src_cdb" =~ ^# || -z "$src_cdb" ]] && continue
+        
+        local report_filename="detailed/${src_cdb}_to_${tgt_cdb}_${pdb}.html"
+        local status status_class
+        
+        if [[ -f "$REPORT_DIR/$report_filename" ]]; then
+            status=$(get_report_status "$REPORT_DIR/$report_filename")
+            case "$status" in
+                "fail")
+                    status="FAIL"
+                    status_class="status-fail"
+                    ;;
+                "warning")
+                    status="WARNING"
+                    status_class="status-warning"
+                    ;;
+                *)
+                    status="PASS"
+                    status_class="status-pass"
+                    ;;
+            esac
+        else
+            status="MISSING"
+            status_class="status-fail"
+        fi
+        
+        # Add row to summary table
+        cat <<EOF >> "$summary_file"
+    <tr>
+      <td>$(to_upper "$src_cdb")</td>
+      <td>$(to_upper "$tgt_cdb")</td>
+      <td>$(to_upper "$pdb")</td>
+      <td class="$status_class">$status</td>
+      <td><a class="view-link" href="$report_filename">View Details</a></td>
+    </tr>
+EOF
+    done < "$input_file"
+
+    # Close HTML
+    cat <<EOF >> "$summary_file"
+</table>
+
+<div class="summary-card">
+  <h3>Status Legend</h3>
+  <ul>
+    <li><span class="status-pass">PASS</span> - All checks passed</li>
+    <li><span class="status-warning">WARNING</span> - Non-critical issues found</li>
+    <li><span class="status-fail">FAIL</span> - Critical failures found</li>
+  </ul>
+  <p>Note: Warnings are treated as passing in overall status</p>
+</div>
+</body>
+</html>
+EOF
+}
+
+# In your main processing loop:
+warning_count=0
+while IFS="|" read -r src_cdb tgt_cdb pdb; do
+    # ... validation code ...
+    
+    status=$(get_report_status "$report_file")
+    case "$status" in
+        "fail") ((fail_count++)) ;;
+        "warning") ((warning_count++)) ;;
+        *) ((success_count++)) ;;
+    esac
+done < "$input_file"
+
 echo "td.missing { color: #666; font-style: italic; }" >> "$report_file"
 echo "h4 { margin-top: 20px; color: #2c3e50; }" >> "$report_file"
 
