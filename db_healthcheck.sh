@@ -1,3 +1,39 @@
+SET MARKUP HTML ON
+SET ECHO OFF FEEDBACK OFF
+SET LINESIZE 120 PAGESIZE 100
+COLUMN begin_hour FORMAT A20 HEADING "Hour"
+COLUMN instance_number FORMAT 99 HEADING "Inst#"
+COLUMN average_active_sessions FORMAT 9999.99 HEADING "AAS"
+COLUMN status FORMAT A10 HEADING "Status"
+SPOOL hourly_instance_aas.html
+
+PROMPT <h2>Hourly Average Active Sessions per Instance (Last 24 Hours)</h2>
+
+WITH interval_data AS (
+  SELECT
+    TRUNC(begin_time,'HH24') AS begin_hour,
+    instance_number,
+    MAX(CASE WHEN metric_name = 'Average Active Sessions' THEN average END) AS aas
+  FROM dba_hist_con_sysmetric_summ
+  WHERE begin_time >= SYSDATE - 1
+    AND metric_name = 'Average Active Sessions'
+  GROUP BY TRUNC(begin_time,'HH24'), instance_number
+)
+SELECT
+  TO_CHAR(begin_hour, 'YYYY-MM-DD HH24:MI') AS begin_hour,
+  instance_number,
+  ROUND(aas, 2) AS average_active_sessions,
+  CASE
+    WHEN aas >= 10 THEN 'CRITICAL'
+    WHEN aas >= 5 THEN 'WARNING'
+    ELSE 'OK'
+  END AS status
+FROM interval_data
+ORDER BY begin_hour, instance_number;
+
+SPOOL OFF;
+
+
 SET LINESIZE 200
 SET PAGESIZE 100
 COLUMN inst_id FORMAT 99
