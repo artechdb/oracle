@@ -1,9 +1,254 @@
-SET MARKUP HTML ON
-SET ECHO OFF
-SET FEEDBACK OFF
-SET PAGESIZE 100
 SET LINESIZE 200
-SPOOL 63_top_fullscan_high_io.html
+SET PAGESIZE 100
+COLUMN inst_id FORMAT 99
+COLUMN event FORMAT A50
+COLUMN wait_time_milli FORMAT 999
+COLUMN wait_count FORMAT 999999
+
+SELECT inst_id,
+       event,
+       wait_time_milli,
+       wait_count
+  FROM gv$event_histogram
+ WHERE event IN (
+       'gc buffer busy acquire',
+       'gc buffer busy release',
+       'gc cr block busy'
+ )
+   AND wait_count > 0
+ ORDER BY inst_id, event, wait_time_milli;
+
+SET LINESIZE 200
+SET PAGESIZE 100
+COLUMN inst_id FORMAT 99
+COLUMN event FORMAT A50
+COLUMN wait_count FORMAT 9999999
+
+SELECT inst_id,
+       event,
+       COUNT(*) AS wait_count
+  FROM gv$active_session_history
+ WHERE sample_time > SYSDATE - 5/1440
+   AND session_state = 'WAITING'
+ GROUP BY inst_id, event
+ ORDER BY inst_id, wait_count DESC;
+
+
+SET LINESIZE 200
+SET PAGESIZE 100
+COLUMN snap_time FORMAT A20
+COLUMN instance_number FORMAT 99
+COLUMN iops FORMAT 999999.99
+
+WITH io_stats AS (
+  SELECT s.snap_id,
+         s.instance_number,
+         TO_CHAR(s.begin_interval_time, 'YYYY-MM-DD HH24:MI') AS snap_time,
+         MAX(CASE WHEN ss.stat_name = 'physical read IO requests' THEN ss.value END) AS read_io,
+         MAX(CASE WHEN ss.stat_name = 'physical write IO requests' THEN ss.value END) AS write_io,
+         s.begin_interval_time,
+         s.end_interval_time
+    FROM dba_hist_sysstat ss
+    JOIN dba_hist_snapshot s
+      ON ss.snap_id = s.snap_id AND ss.instance_number = s.instance_number
+   WHERE ss.stat_name IN ('physical read IO requests', 'physical write IO requests')
+     AND s.begin_interval_time > SYSDATE - 1
+   GROUP BY s.snap_id, s.instance_number, s.begin_interval_time, s.end_interval_time
+),
+deltas AS (
+  SELECT snap_time,
+         instance_number,
+         (read_io + write_io) -
+         LAG(read_io + write_io) OVER (PARTITION BY instance_number ORDER BY begin_interval_time) AS total_io,
+         (CAST(end_interval_time AS DATE) - CAST(begin_interval_time AS DATE)) * 24 * 60 * 60 AS elapsed_seconds
+    FROM io_stats
+)
+SELECT snap_time,
+       instance_number,
+       ROUND(total_io / NULLIF(elapsed_seconds, 0), 2) AS iops
+  FROM deltas
+ WHERE total_io IS NOT NULL
+ ORDER BY snap_time DESC, instance_number;
+
+-- 59_gc_contention_19c.sql - Identify global cache contention in RAC
+SET ECHO OFF FEEDBACK OFF PAGES 50 LINES 167 TRIMSPOOL ON
+SET MARKUP HTML ON
+SPOOL 59_gc_contention_19c.html
+
+PROMPT <h2>Global Cache Contention Events (RAC Only)</h2>
+
+COLUMN event FORMAT A30
+SELECT inst_id AS "Inst#", event AS "Event",
+       total_waits AS "# Waits",
+       ROUND(time_waited*10) AS "Time (ms)",
+       ROUND((time_waited*10)/DECODE(total_waits, 0, 1, total_waits), 1) AS "Avg Wait (ms)"
+FROM gv$system_event
+WHERE event IN ('gc buffer busy acquire','gc buffer busy release','gc cr block busy')
+ORDER BY inst_id, time_waited DESC;
+
+SPOOL OFF;
+
+
+-- 60_interconnect_19c.sql - Monitor RAC interconnect usage and latency
+SET ECHO OFF FEEDBACK OFF PAGES 100 LINES 200 TRIMSPOOL ON
+SET MARKUP HTML ON
+SPOOL 60_interconnect_19c.html
+
+PROMPT <h2>Interconnect Statistics (RAC Only)</h2>
+
+-- Global Cache Block Transfers and Lost Blocks
+PROMPT <h3>Global Cache Block Transfers &amp; Lost Blocks (cumulative)</h3>
+COLUMN Lost FORMAT 9999999
+COLUMN LostPct FORMAT 990.00
+SELECT inst_id AS "Inst#", 
+       MAX(CASE WHEN name='gc cr blocks received' THEN value END)    AS "CR_Rcvd",
+       MAX(CASE WHEN name='gc current blocks received' THEN value END) AS "CUR_Rcvd",
+       MAX(CASE WHEN name='gc cr blocks served' THEN value END)      AS "CR_Sent",
+       MAX(CASE WHEN name='gc current blocks served' THEN value END) AS "CUR_Sent",
+       MAX(CASE WHEN name='global cache blocks lost' THEN value END) AS "Lost",
+       ROUND( 100 * MAX(CASE WHEN name='global cache blocks lost' THEN value END)
+                / GREATEST( MAX(CASE WHEN name='gc cr blocks served' THEN value END)
+                          + MAX(CASE WHEN name='gc current blocks served' THEN value END), 1)
+             , 2) AS "LostPct"
+FROM gv$sysstat
+WHERE name IN (
+    'gc cr blocks received','gc current blocks received',
+    'gc cr blocks served','gc current blocks served',
+    'global cache blocks lost'
+)
+GROUP BY inst_id
+ORDER BY inst_id;
+
+-- Global Cache Transfer Latency (Average receive times in ms)
+PROMPT <h3>Global Cache Transfer Latency (Avg Receive Time per Inst)</h3>
+COLUMN "Avg CR (ms)"  FORMAT 99990.00
+COLUMN "Avg CUR (ms)" FORMAT 99990.00
+SELECT inst_id AS "Inst#",
+       ROUND( MAX(CASE WHEN name='gc cr block receive time' THEN value END)
+            / GREATEST(MAX(CASE WHEN name='gc cr blocks received' THEN value END), 1) * 10, 2) 
+            AS "Avg CR (ms)",
+       ROUND( MAX(CASE WHEN name='gc current block receive time' THEN value END)
+            / GREATEST(MAX(CASE WHEN name='gc current blocks received' THEN value END), 1) * 10, 2) 
+            AS "Avg CUR (ms)"
+FROM gv$sysstat
+WHERE name IN (
+    'gc cr block receive time','gc cr blocks received',
+    'gc current block receive time','gc current blocks received'
+)
+GROUP BY inst_id
+ORDER BY inst_id;
+
+SPOOL OFF;
+
+
+
+-- 61_iops_trend_19c.sql - 24-hour IOPS trend per instance (uses AWR data)
+SET ECHO OFF FEEDBACK OFF PAGES 200 LINES 200 TRIMSPOOL ON
+SET MARKUP HTML ON
+SPOOL 61_iops_trend_19c.html
+
+PROMPT <h2>IOPS Trend (Last 24 Hours per Instance)</h2>
+
+COLUMN "Time" FORMAT A17
+-- Note: PIVOT for up to 8 instances; extend if more instances in the RAC
+SELECT TO_CHAR(begin_interval_time, 'DD-Mon HH24:MI') AS "Time",
+       ROUND(NVL(inst1,0),2) AS "Inst1", ROUND(NVL(inst2,0),2) AS "Inst2",
+       ROUND(NVL(inst3,0),2) AS "Inst3", ROUND(NVL(inst4,0),2) AS "Inst4",
+       ROUND(NVL(inst5,0),2) AS "Inst5", ROUND(NVL(inst6,0),2) AS "Inst6",
+       ROUND(NVL(inst7,0),2) AS "Inst7", ROUND(NVL(inst8,0),2) AS "Inst8"
+FROM (
+  SELECT s.begin_interval_time, t.instance_number,
+         -- Sum average IO request rates (reads + writes + redo writes) for each instance snapshot
+         SUM(CASE WHEN t.metric_name = 'Physical Read Total IO Requests Per Sec' THEN t.average ELSE 0 END
+           + CASE WHEN t.metric_name = 'Physical Write Total IO Requests Per Sec' THEN t.average ELSE 0 END
+           + CASE WHEN t.metric_name = 'Redo Writes Per Sec' THEN t.average ELSE 0 END) AS total_iops
+  FROM dba_hist_sysmetric_summary t
+  JOIN dba_hist_snapshot s 
+    ON t.snap_id = s.snap_id AND t.dbid = s.dbid AND t.instance_number = s.instance_number
+  WHERE t.metric_name IN (
+    'Physical Read Total IO Requests Per Sec',
+    'Physical Write Total IO Requests Per Sec',
+    'Redo Writes Per Sec'
+  )
+    AND s.begin_interval_time >= SYSDATE - 1
+  GROUP BY s.begin_interval_time, t.instance_number
+) pivot_data
+PIVOT (
+  MAX(total_iops) FOR instance_number IN (
+    1 AS inst1, 2 AS inst2, 3 AS inst3, 4 AS inst4,
+    5 AS inst5, 6 AS inst6, 7 AS inst7, 8 AS inst8
+  )
+)
+ORDER BY "Time";
+
+SPOOL OFF;
+
+-- 61_iops_trend_19c.sql - 24-hour IOPS trend per instance (uses AWR data)
+SET ECHO OFF FEEDBACK OFF PAGES 200 LINES 200 TRIMSPOOL ON
+SET MARKUP HTML ON
+SPOOL 61_iops_trend_19c.html
+
+PROMPT <h2>IOPS Trend (Last 24 Hours per Instance)</h2>
+
+COLUMN "Time" FORMAT A17
+-- Note: PIVOT for up to 8 instances; extend if more instances in the RAC
+SELECT TO_CHAR(begin_interval_time, 'DD-Mon HH24:MI') AS "Time",
+       ROUND(NVL(inst1,0),2) AS "Inst1", ROUND(NVL(inst2,0),2) AS "Inst2",
+       ROUND(NVL(inst3,0),2) AS "Inst3", ROUND(NVL(inst4,0),2) AS "Inst4",
+       ROUND(NVL(inst5,0),2) AS "Inst5", ROUND(NVL(inst6,0),2) AS "Inst6",
+       ROUND(NVL(inst7,0),2) AS "Inst7", ROUND(NVL(inst8,0),2) AS "Inst8"
+FROM (
+  SELECT s.begin_interval_time, t.instance_number,
+         -- Sum average IO request rates (reads + writes + redo writes) for each instance snapshot
+         SUM(CASE WHEN t.metric_name = 'Physical Read Total IO Requests Per Sec' THEN t.average ELSE 0 END
+           + CASE WHEN t.metric_name = 'Physical Write Total IO Requests Per Sec' THEN t.average ELSE 0 END
+           + CASE WHEN t.metric_name = 'Redo Writes Per Sec' THEN t.average ELSE 0 END) AS total_iops
+  FROM dba_hist_sysmetric_summary t
+  JOIN dba_hist_snapshot s 
+    ON t.snap_id = s.snap_id AND t.dbid = s.dbid AND t.instance_number = s.instance_number
+  WHERE t.metric_name IN (
+    'Physical Read Total IO Requests Per Sec',
+    'Physical Write Total IO Requests Per Sec',
+    'Redo Writes Per Sec'
+  )
+    AND s.begin_interval_time >= SYSDATE - 1
+  GROUP BY s.begin_interval_time, t.instance_number
+) pivot_data
+PIVOT (
+  MAX(total_iops) FOR instance_number IN (
+    1 AS inst1, 2 AS inst2, 3 AS inst3, 4 AS inst4,
+    5 AS inst5, 6 AS inst6, 7 AS inst7, 8 AS inst8
+  )
+)
+ORDER BY "Time";
+
+-- 62_top_waits_19c.sql - Show top 5 wait events per RAC instance (excluding idle waits)
+SET ECHO OFF FEEDBACK OFF PAGES 100 LINES 180 TRIMSPOOL ON
+SET MARKUP HTML ON
+SPOOL 62_top_waits_19c.html
+
+PROMPT <h2>Top 5 Wait Events per Instance</h2>
+
+COLUMN "Wait Event" FORMAT A40
+SELECT inst_id AS "Inst#",
+       event AS "Wait Event",
+       ROUND(time_waited/100, 2) AS "Time (s)",
+       total_waits AS "# Waits",
+       ROUND((time_waited*10)/DECODE(total_waits, 0, 1, total_waits), 2) AS "Avg Wait (ms)"
+FROM (
+  SELECT e.inst_id, e.event, e.time_waited, e.total_waits,
+         RANK() OVER (PARTITION BY e.inst_id ORDER BY e.time_waited DESC) AS rk
+  FROM gv$system_event e
+  WHERE e.event NOT IN (
+    SELECT name FROM v$event_name WHERE wait_class = 'Idle'
+  )
+)
+WHERE rk <= 5
+ORDER BY inst_id, "Time (s)" DESC;
+
+SPOOL OFF;
+
+
 
 PROMPT <h2>Top 10 Full Table Scan SQLs (Non-SYS) with High Logical Reads</h2>
 
