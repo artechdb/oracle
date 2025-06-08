@@ -1,4 +1,240 @@
 SET MARKUP HTML ON
+SET ECHO OFF
+SET FEEDBACK OFF
+SET PAGESIZE 100
+SET LINESIZE 200
+SPOOL 63_top_fullscan_high_io.html
+
+PROMPT <h2>Top 10 Full Table Scan SQLs (Non-SYS) with High Logical Reads</h2>
+
+SELECT *
+FROM (
+  SELECT
+    sql_id,
+    username,
+    ROUND(buffer_gets / DECODE(executions, 0, 1, executions)) AS avg_buffer_gets,
+    executions,
+    buffer_gets,
+    CASE
+      WHEN ROUND(buffer_gets / DECODE(executions, 0, 1, executions)) > 100000 THEN 'CRITICAL'
+      WHEN ROUND(buffer_gets / DECODE(executions, 0, 1, executions)) > 50000 THEN 'WARNING'
+      ELSE 'OK'
+    END AS status,
+    sql_text
+  FROM (
+    SELECT
+      ss.sql_id,
+      st.sql_text,
+      ss.executions,
+      ss.buffer_gets,
+      u.username
+    FROM dba_hist_sqlstat ss
+    JOIN dba_hist_sqltext st ON ss.sql_id = st.sql_id
+    JOIN dba_users u ON ss.parsing_schema_id = u.user_id
+    WHERE ss.snap_id > (
+      SELECT MAX(snap_id) - 48 FROM dba_hist_snapshot
+    )
+      AND u.username NOT IN ('SYS', 'SYSTEM')
+      AND EXISTS (
+        SELECT 1
+        FROM dba_hist_sql_plan p
+        WHERE p.sql_id = ss.sql_id
+          AND p.operation = 'TABLE ACCESS'
+          AND p.options = 'FULL'
+      )
+  )
+  ORDER BY buffer_gets DESC
+)
+WHERE ROWNUM <= 10;
+
+SPOOL OFF;
+
+
+PROMPT <h2>Peak DB Time per Instance in the Last 24 Hours</h2>
+
+WITH recent_snaps AS (
+  SELECT snap_id, dbid, instance_number, begin_interval_time, end_interval_time
+  FROM dba_hist_snapshot
+  WHERE begin_interval_time >= SYSDATE - 1
+),
+db_time_data AS (
+  SELECT
+    s.instance_number AS inst_id,
+    s.snap_id,
+    s.begin_interval_time,
+    s.end_interval_time,
+    ROUND((t.value / 1000000), 2) AS db_time_sec
+  FROM recent_snaps s
+  JOIN dba_hist_sys_time_model t
+    ON s.snap_id = t.snap_id
+   AND s.dbid = t.dbid
+   AND s.instance_number = t.instance_number
+  WHERE t.stat_name = 'DB time'
+)
+SELECT *
+FROM (
+  SELECT
+    inst_id,
+    snap_id,
+    begin_interval_time,
+    end_interval_time,
+    db_time_sec,
+    CASE
+      WHEN db_time_sec > 3600 THEN 'CRITICAL'
+      WHEN db_time_sec > 1800 THEN 'WARNING'
+      ELSE 'OK'
+    END AS status
+  FROM db_time_data
+  ORDER BY db_time_sec DESC
+)
+WHERE ROWNUM <= 10;
+
+SPOOL OFF;
+
+SET LINESIZE 200
+SET PAGESIZE 100
+SET MARKUP HTML ON
+SPOOL db_time_peak.html
+
+PROMPT <h2>Top 30 DB Time Intervals per Instance in the Last 24 Hours</h2>
+
+WITH db_time_deltas AS (
+  SELECT
+    s.instance_number AS inst_id,
+    s.snap_id,
+    s.begin_interval_time,
+    s.end_interval_time,
+    t.value,
+    LAG(t.value) OVER (PARTITION BY s.instance_number ORDER BY s.snap_id) AS prev_value
+  FROM
+    dba_hist_snapshot s
+    JOIN dba_hist_sys_time_model t
+      ON s.snap_id = t.snap_id
+     AND s.dbid = t.dbid
+     AND s.instance_number = t.instance_number
+  WHERE
+    s.begin_interval_time >= SYSDATE - 1
+    AND t.stat_name = 'DB time'
+),
+db_time_calc AS (
+  SELECT
+    inst_id,
+    snap_id,
+    begin_interval_time,
+    end_interval_time,
+    ROUND(NVL(value - prev_value, 0) / 1e6 / 60, 2) AS db_time_min
+  FROM
+    db_time_deltas
+)
+SELECT *
+FROM (
+  SELECT
+    inst_id,
+    snap_id,
+    begin_interval_time,
+    end_interval_time,
+    db_time_min,
+    CASE
+      WHEN db_time_min > 60 THEN 'CRITICAL'
+      WHEN db_time_min > 30 THEN 'WARNING'
+      ELSE 'OK'
+    END AS status
+  FROM
+    db_time_calc
+  ORDER BY
+    db_time_min DESC
+)
+WHERE ROWNUM <= 30;
+
+SPOOL OFF;
+
+##
+SELECT
+    inst_id,
+    ROUND(COUNT(*) / (24 * 60 * 60), 2) AS average_active_sessions,
+    CASE
+        WHEN ROUND(COUNT(*) / (24 * 60 * 60), 2) >= 10 THEN 'CRITICAL'
+        WHEN ROUND(COUNT(*) / (24 * 60 * 60), 2) >= 5 THEN 'WARNING'
+        ELSE 'OK'
+    END AS status
+FROM
+    gv$active_session_history
+WHERE
+    sample_time >= SYSDATE - 1
+GROUP BY
+    inst_id
+ORDER BY
+    inst_id;
+
+##
+SET LINESIZE 200
+SET PAGESIZE 100
+SET MARKUP HTML ON
+SPOOL open_cursor_stats.html
+
+PROMPT <h2>Open Cursor Statistics per RAC Instance</h2>
+
+SELECT
+    inst_id,
+    TO_CHAR(execute_count, '999G999G999G999') AS "SQL Execution",
+    TO_CHAR(parse_count, '999G999G999G999') AS "Parse Count",
+    TO_CHAR(cursor_hits, '999G999G999G999') AS "Cursor Hits",
+    ROUND((parse_count / NULLIF(execute_count, 0)) * 100, 2) AS "Parse % Total",
+    ROUND((cursor_hits / NULLIF(parse_count, 0)) * 100, 2) AS "Cursor Cache % Total",
+    CASE
+        WHEN ROUND((cursor_hits / NULLIF(parse_count, 0)) * 100, 2) >= 90 THEN 'OK'
+        WHEN ROUND((cursor_hits / NULLIF(parse_count, 0)) * 100, 2) >= 80 THEN 'WARNING'
+        ELSE 'CRITICAL'
+    END AS status
+FROM (
+    SELECT
+        inst_id,
+        MAX(CASE WHEN name = 'execute count' THEN value END) AS execute_count,
+        MAX(CASE WHEN name = 'parse count (total)' THEN value END) AS parse_count,
+        MAX(CASE WHEN name = 'session cursor cache hits' THEN value END) AS cursor_hits
+    FROM
+        gv$sysstat
+    WHERE
+        name IN ('execute count', 'parse count (total)', 'session cursor cache hits')
+    GROUP BY
+        inst_id
+)
+ORDER BY
+    inst_id;
+
+SPOOL OFF;
+
+====
+SELECT
+    inst_id,
+    ROUND(COUNT(*) / (EXTRACT(DAY FROM (MAX(sample_time) - MIN(sample_time))) * 24 * 60 * 60 +
+                      EXTRACT(HOUR FROM (MAX(sample_time) - MIN(sample_time))) * 60 * 60 +
+                      EXTRACT(MINUTE FROM (MAX(sample_time) - MIN(sample_time))) * 60 +
+                      EXTRACT(SECOND FROM (MAX(sample_time) - MIN(sample_time)))
+         ), 2) AS average_active_sessions,
+    CASE
+        WHEN ROUND(COUNT(*) / (EXTRACT(DAY FROM (MAX(sample_time) - MIN(sample_time))) * 24 * 60 * 60 +
+                               EXTRACT(HOUR FROM (MAX(sample_time) - MIN(sample_time))) * 60 * 60 +
+                               EXTRACT(MINUTE FROM (MAX(sample_time) - MIN(sample_time))) * 60 +
+                               EXTRACT(SECOND FROM (MAX(sample_time) - MIN(sample_time)))
+             ), 2) >= 10 THEN 'CRITICAL'
+        WHEN ROUND(COUNT(*) / (EXTRACT(DAY FROM (MAX(sample_time) - MIN(sample_time))) * 24 * 60 * 60 +
+                               EXTRACT(HOUR FROM (MAX(sample_time) - MIN(sample_time))) * 60 * 60 +
+                               EXTRACT(MINUTE FROM (MAX(sample_time) - MIN(sample_time))) * 60 +
+                               EXTRACT(SECOND FROM (MAX(sample_time) - MIN(sample_time)))
+             ), 2) >= 5 THEN 'WARNING'
+        ELSE 'OK'
+    END AS status
+FROM
+    gv$active_session_history
+WHERE
+    sample_time BETWEEN TO_DATE('2025-06-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')
+                    AND TO_DATE('2025-06-01 23:59:59', 'YYYY-MM-DD HH24:MI:SS')
+GROUP BY
+    inst_id
+ORDER BY
+    inst_id;
+
 SET ECHO OFF FEEDBACK OFF
 SET LINESIZE 200 PAGESIZE 100
 COLUMN INST_ID                FORMAT 99
