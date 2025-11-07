@@ -1,19 +1,1 @@
-Subject: Update on Oracle Backup Testing – Potential Impact on Production Migration Timeline
 
-Dear [Client Name],
-
-I hope you’re doing well. I wanted to provide an update on our ongoing Oracle backup and migration activities.
-
-As part of our recent testing for multi-node RAC databases, our DBAs identified a few issues with the original NetBackup (NBU) configuration:
-
-The database backups were not RAC-aware.
-
-There were inconsistencies in restoring such backups.
-
-While backups for most single-node Oracle databases have already been transitioned successfully to NBU, these RAC-related restore limitations could potentially affect our production migration schedule.
-
-To address this, the EDP team has engaged the Cohesity vendor to review the configuration and provide input on a remediation path. We’ll update you once we have confirmation that RAC-aware backup and restore functionality is working as expected.
-
-At this stage, we wanted to proactively flag that the production migration date might be impacted depending on the outcome and timing of these fixes.
-
-Please let us know if you’d like to set up a quick sync to review the mitigation plan and discuss alternative options if delays occur.
