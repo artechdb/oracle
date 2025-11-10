@@ -1,1590 +1,1497 @@
-
-it includes everything:
-
-generate_standby_conf.sh
-
-standby_create.conf (template/generated)
-
-functions_standby_rac.sh
-
-standby_create_driver.sh
-
-README_standby_create.md
-################################
-echo "Select Standby Mode:"
-echo "1) Single Instance Standby"
-echo "2) RAC Standby (Multi-Instance)"
-read -rp "Enter choice [1-2]: " mode_choice
-
-if [ "$mode_choice" == "1" ]; then
-    IS_RAC=false
-else
-    IS_RAC=true
-fi
-
-read -rp "Enter Primary Database Hostname: " PRIMARY_HOST
-read -rp "Enter Primary Database Name (SID): " PRIMARY_DB_NAME
-read -rp "Enter Primary TNS Connection Name: " PRIMARY_DB_CONN
-
-read -rp "Enter Standby Database Name (SID): " STANDBY_DB_NAME
-read -rp "Enter Standby Database Unique Name: " STANDBY_DB_UNIQUE_NAME
-
-if [ "$IS_RAC" == "true" ]; then
-    echo "Enter Standby Hostnames (space separated): "
-    read -ra STANDBY_HOSTS_ARRAY
-else
-    read -rp "Enter Standby Hostname: " STANDBY_HOST_SINGLE
-    STANDBY_HOSTS_ARRAY=("$STANDBY_HOST_SINGLE")
-fi
-
-read -rp "Enter SYS Password: " SYS_PASS
-
-read -rp "Enter ASM Diskgroup for Datafiles (ex: +DATA01): " ASM_DISKGROUP_DATA
-read -rp "Enter ASM Diskgroup for Redo Logs (ex: +DATA01): " ASM_DISKGROUP_REDO
-
-#########################
-validate_rman_connections() {
-  local PRIMARY_CONN="$1"
-  local STANDBY_CONN="$2"
-
-  echo "Validating RMAN connection to Primary Database ($PRIMARY_CONN)..."
-  rman target sys/$SYS_PASS@$PRIMARY_CONN auxiliary / <<EOF
-exit
-EOF
-  if [ $? -ne 0 ]; then
-    echo "ERROR: RMAN connection to Primary failed."
-    exit 1
-  fi
-
-  echo "Validating RMAN connection to Standby Database ($STANDBY_CONN)..."
-  rman target / auxiliary sys/$SYS_PASS@$STANDBY_CONN <<EOF
-exit
-EOF
-  if [ $? -ne 0 ]; then
-    echo "ERROR: RMAN connection to Standby failed."
-    exit 1
-  fi
-
-  echo "RMAN connection validation successful."
-}
-
-#################
-
-# standby_create_driver.sh
-
-#!/bin/bash
+#!/usr/bin/env bash
+# =============================================================================
+# dp_migrate.sh (v4as) - Oracle 19c Data Pump migration & compare toolkit
+# =============================================================================
+# Fixes in v4as:
+# - Resolved "version: unbound variable" by removing any risky 'version:' usage
+#   under 'set -u' and printing tool version safely.
+# - Added DEBUG tracing for compare schema functions (start/end and each step).
+# - Retains inline-HTML email after expdp/impdp runs, DDL extraction suite,
+#   robust parfile placement, and local (jumper) compare with rich HTML header.
+# =============================================================================
 
 set -euo pipefail
 
-# Load configuration and functions
-source ./standby_create.conf
-source ./functions_standby_rac.sh
+CONFIG_FILE="${1:-dp_migrate.conf}"
+SCRIPT_NAME="$(basename "$0")"
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
 
-log "Starting Standby Creation Process"
+# ------------------------------ Paths -----------------------------------------
+WORK_DIR="${WORK_DIR:-/tmp/dp_migrate_${RUN_ID}}"
+LOG_DIR="${LOG_DIR:-${WORK_DIR}/logs}"
+PAR_DIR="${PAR_DIR:-${WORK_DIR}/parfiles}"
+DDL_DIR="${DDL_DIR:-${WORK_DIR}/ddls}"
+COMPARE_DIR="${COMPARE_DIR:-${WORK_DIR}/compare}"
+COMMON_DIR_NAME="${COMMON_DIR_NAME:-DP_DIR}"
+LOCAL_COMPARE_DIR="${LOCAL_COMPARE_DIR:-/tmp/dp_compare}"
 
-# Step 1: Perform pre-checks
-precheck_standby_environment
+mkdir -p "$WORK_DIR" "$LOG_DIR" "$PAR_DIR" "$DDL_DIR" "$COMPARE_DIR" "$LOCAL_COMPARE_DIR"
 
-# Step 2: Create required adump directories dynamically for each host
-create_required_directories_standby "$STANDBY_DB_UNIQUE_NAME"
+# ------------------------ Pretty print & debug helpers -------------------------
+ce()   { printf "%b\n" "$*"; }
+ok()   { ce "\e[32m✔ $*\e[0m"; }
+warn() { ce "\e[33m! $*\e[0m"; }
+err()  { ce "\e[31m✘ $*\e[0m"; }
+DEBUG="${DEBUG:-Y}"
+debug() { if [[ "${DEBUG^^}" == "Y" ]]; then ce "\e[36m[DEBUG]\e[0m $*" >&2; fi; }
 
-# Step 3: Check for Password File
-check_password_file
+say_to_user() { if [[ -w /dev/tty ]]; then cat >/dev/tty; else cat 1>&2; fi; }
 
-# Step 4: Validate RMAN Connections
-validate_rman_connections "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME"
-
-# Step 5: Prepare and start RMAN DUPLICATE in nohup
-log "Preparing RMAN DUPLICATE command for Standby creation."
-
-cat > duplicate_standby.rman <<EOF
-CONNECT TARGET sys/$SYS_PASS@$PRIMARY_DB_CONN
-CONNECT AUXILIARY sys/$SYS_PASS@$STANDBY_DB_NAME
-
-DUPLICATE TARGET DATABASE
-  FOR STANDBY
-  FROM ACTIVE DATABASE
-  DORECOVER
-  SPFILE
-  SET DB_UNIQUE_NAME='$STANDBY_DB_UNIQUE_NAME'
-  SET CLUSTER_DATABASE='${IS_RAC,,}'
-  SET LOG_FILE_NAME_CONVERT='$PRIMARY_REDO_PATH','$ASM_DISKGROUP_REDO'
-  SET DB_FILE_NAME_CONVERT='$PRIMARY_DATAFILE_PATH','$ASM_DISKGROUP_DATA'
-  NOFILENAMECHECK;
-EXIT;
-EOF
-
-log "Starting RMAN DUPLICATE in background using nohup..."
-nohup rman cmdfile=duplicate_standby.rman log=duplicate_standby.log &
-RMAN_PID=$!
-
-log "Waiting for RMAN process (PID=$RMAN_PID) to finish..."
-wait $RMAN_PID || true
-
-# Step 6: Check completion and send email notification
-STATUS=$(check_rman_duplicate_completion duplicate_standby.log)
-send_email_notification duplicate_standby.log "$STATUS" "$EMAIL_TO"
-
-if [ "$STATUS" != "SUCCESS" ]; then
-  log "RMAN duplicate failed. Exiting."
-  exit 1
-fi
-
-# Step 7: Add standby database and start it to mount stage
-add_and_start_standby_database "$STANDBY_DB_NAME" "$STANDBY_DB_UNIQUE_NAME" "$ORACLE_HOME" "$PRIMARY_REDO_PATH" "$ASM_DISKGROUP_REDO"
-
-# Step 8: Create redo and standby redo logs
-create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP_REDO"
-
-# Step 9: Start MRP process
-start_mrp_via_dgmgrl
-
-# Step 10: Check Data Guard sync status
-check_dg_sync_status
-
-# Step 11: Post Steps Reminder
-log "Post Steps Reminder:"
-echo "- Verify all instances registered correctly with srvctl if RAC."
-echo "- Data Guard sync status already validated."
-
-log "Standby Creation Process Completed Successfully"
-
-#############################
-
-#!/bin/bash
-
-set -euo pipefail
-
-# Load configuration and functions
-source ./standby_create.conf
-
-# Perform Precheck
-precheck_standby_environment
-
-# Create required directories on both standby nodes
-create_required_directories_standby "$STANDBY_HOST1" "$STANDBY_HOST2" "$STANDBY_DB_UNIQUE_NAME"
-
-# Startup NOMOUNT standby instance manually (assumed done externally if using RAC)
-
-# RMAN DUPLICATE FOR STANDBY (Manual step assumed or can be scripted separately)
-
-# After RMAN duplication and spfile adjustments, create redo and standby redo logs
-create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP"
-
-# Post-configuration instructions
-cat <<EOF
-
-##########################################
-# Post Steps
-##########################################
-- Ensure RMAN DUPLICATE completed successfully.
-- Verify the RAC standby database is registered with SRVCTL.
-- Register standby database into Data Guard Broker:
-  dgmgrl sys/\$SYS_PASS@\$PRIMARY_DB_CONN
-  ADD DATABASE '$STANDBY_DB_UNIQUE_NAME' AS CONNECT IDENTIFIER IS '$STANDBY_DB_NAME' MAINTAINED AS PHYSICAL;
-  ENABLE DATABASE '$STANDBY_DB_UNIQUE_NAME';
-- Start Managed Recovery:
-  dgmgrl> EDIT DATABASE '$STANDBY_DB_UNIQUE_NAME' SET STATE='APPLY-ON';
-
-EOF
-
-exit 0
-##
-# functions_standby_rac.sh
-
-set -euo pipefail
-
-log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+toggle_debug() {
+  if [[ "${DEBUG^^}" == "Y" ]]; then DEBUG="N"; ok "DEBUG turned OFF"; else DEBUG="Y"; ok "DEBUG turned ON"; fi
+  ce "Current DEBUG=${DEBUG}"
 }
 
-exec_sqlplus() {
-  local CONN="$1"
-  local SQL="$2"
-  sqlplus -s /nolog <<EOF
-CONNECT $CONN
-SET HEAD OFF FEEDBACK OFF PAGES 0 VERIFY OFF
-WHENEVER SQLERROR EXIT SQL.SQLCODE;
-$SQL
-EXIT;
-EOF
-}
-
-precheck_standby_environment() {
-  log "Performing Pre-checks..."
-
-  log "Checking connectivity to Primary Database..."
-  if ! echo "exit" | sqlplus -s sys/$SYS_PASS@$PRIMARY_DB_CONN as sysdba >/dev/null; then
-    log "ERROR: Cannot connect to Primary Database ($PRIMARY_DB_CONN). Exiting."
-    exit 1
-  fi
-
-  log "Checking connectivity to Standby Node1 ($STANDBY_HOST1)..."
-  if ! ping -c 2 "$STANDBY_HOST1" >/dev/null; then
-    log "ERROR: Cannot ping Standby Node1 ($STANDBY_HOST1). Exiting."
-    exit 1
-  fi
-
-  log "Checking connectivity to Standby Node2 ($STANDBY_HOST2)..."
-  if ! ping -c 2 "$STANDBY_HOST2" >/dev/null; then
-    log "ERROR: Cannot ping Standby Node2 ($STANDBY_HOST2). Exiting."
-    exit 1
-  fi
-
-  log "Checking ORACLE_HOME exists..."
-  if [ ! -d "$ORACLE_HOME" ]; then
-    log "ERROR: ORACLE_HOME ($ORACLE_HOME) does not exist. Exiting."
-    exit 1
-  fi
-
-  log "Pre-checks completed successfully."
-}
-
-create_required_directories_standby() {
-  local HOST1="$1"
-  local HOST2="$2"
-  local DBNAME="$3"
-
-  log "Creating adump directory on $HOST1"
-  ssh oracle@"$HOST1" bash <<EOF
-mkdir -p /u01/app/oracle/admin/${DBNAME}/adump
-chown -R oracle:oinstall /u01/app/oracle/admin/${DBNAME}/adump
-EOF
-
-  log "Creating adump directory on $HOST2"
-  ssh oracle@"$HOST2" bash <<EOF
-mkdir -p /u01/app/oracle/admin/${DBNAME}/adump
-chown -R oracle:oinstall /u01/app/oracle/admin/${DBNAME}/adump
-EOF
-
-  log "Adump directories created on both nodes."
-}
-
-create_all_logs_from_primary_info() {
-  local PRIMARY_CONN="$1"
-  local STANDBY_SID="$2"
-  local ASM_DISKGROUP="$3"
-
-  export ORACLE_SID="$STANDBY_SID"
-
-  log "Fetching redo size from Primary Database."
-  local REDO_SIZE_MB=$(exec_sqlplus "$PRIMARY_CONN" "SELECT bytes/1024/1024 FROM v\$log WHERE rownum = 1;" | xargs)
-
-  log "Fetching redo group counts per thread from Primary."
-  local THREAD_COUNTS=$(exec_sqlplus "$PRIMARY_CONN" "SELECT thread#||':'||COUNT(group#) FROM v\$log GROUP BY thread#;" | xargs)
-
-  for entry in $THREAD_COUNTS; do
-    local thread=$(echo "$entry" | cut -d':' -f1)
-    local redo_count=$(echo "$entry" | cut -d':' -f2)
-
-    log "Creating Redo Logs for Thread $thread"
-    for ((i=1; i<=redo_count; i++)); do
-      sqlplus -s / as sysdba <<EOF
-ALTER DATABASE ADD LOGFILE THREAD $thread ('$ASM_DISKGROUP/$STANDBY_SID/ONLINELOG/redo_t${thread}_g${i}.log') SIZE ${REDO_SIZE_MB}M;
-EXIT;
-EOF
-    done
-
-    log "Creating Standby Redo Logs for Thread $thread"
-    standby_count=$((redo_count + 1))
-    for ((i=1; i<=standby_count; i++)); do
-      sqlplus -s / as sysdba <<EOF
-ALTER DATABASE ADD STANDBY LOGFILE THREAD $thread ('$ASM_DISKGROUP/$STANDBY_SID/STANDBYLOG/standby_t${thread}_g${i}.log') SIZE ${REDO_SIZE_MB}M;
-EXIT;
-EOF
-    done
-  done
-
-  log "Redo and Standby Redo Logs created successfully."
-}
-
-################################
-File	Purpose
-standby_create.conf	Configuration variables (primary, standby, paths, ASM, SYS password)
-functions_standby_rac.sh	Functions (precheck, directory creation, redo/standby redo setup)
-standby_create_driver.sh	Main driver script (load config + functions + step execution)
-
-#################################
-
-log "Preparing RMAN DUPLICATE command for Standby creation."
-
-# Create RMAN command file
-cat > duplicate_standby.rman <<EOF
-CONNECT TARGET sys/$SYS_PASS@$PRIMARY_DB_CONN
-CONNECT AUXILIARY sys/$SYS_PASS@$STANDBY_DB_NAME
-
-DUPLICATE TARGET DATABASE
-  FOR STANDBY
-  FROM ACTIVE DATABASE
-  DORECOVER
-  SPFILE
-  SET DB_UNIQUE_NAME='$STANDBY_DB_UNIQUE_NAME'
-  SET CLUSTER_DATABASE='true'
-  SET LOG_FILE_NAME_CONVERT='$PRIMARY_REDO_PATH','$STANDBY_REDO_PATH'
-  SET DB_FILE_NAME_CONVERT='$PRIMARY_DATAFILE_PATH','$STANDBY_DATAFILE_PATH'
-  NOFILENAMECHECK;
-EXIT;
-EOF
-
-# Run RMAN DUPLICATE in nohup
-log "Starting RMAN DUPLICATE in nohup mode..."
-nohup rman cmdfile=duplicate_standby.rman log=duplicate_standby.log &
-
-log "RMAN DUPLICATE started. Monitor progress with: tail -f duplicate_standby.log"
-
-##############
-
-create_required_directories_standby() {
-  local DBNAME="$1"
-
-  for host in "${STANDBY_HOSTS[@]}"; do
-    log "Creating adump directory on $host"
-    ssh oracle@"$host" bash <<EOF
-mkdir -p /u01/app/oracle/admin/${DBNAME}/adump
-chown -R oracle:oinstall /u01/app/oracle/admin/${DBNAME}/adump
-EOF
-  done
-
-  log "Adump directories created on all standby nodes."
-}
-create_single_standby() {
-  precheck_standby_environment
-  create_required_directories_standby "$STANDBY_HOST1" "$STANDBY_HOST1" "$STANDBY_DB_UNIQUE_NAME"
-  
-  start_rman_duplicate
-
-  STATUS=$(check_rman_duplicate_completion duplicate_standby.log)
-  send_email_notification duplicate_standby.log "$STATUS" "$EMAIL_TO"
-
-  if [ "$STATUS" != "SUCCESS" ]; then
-    log "RMAN duplicate failed for single standby. Exiting."
-    exit 1
-  fi
-
-  create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP"
-}
-create_multiple_standby() {
-  # You may loop over multiple standby DB names/hosts loaded from a file or array
-  for standby in "${STANDBY_LIST[@]}"; do
-    log "Starting creation for Standby Database: $standby"
-
-    # Adjust STANDBY_DB_NAME etc dynamically here
-    # (Load from file, or input parameters)
-
-    precheck_standby_environment
-    create_required_directories_standby "$STANDBY_HOST1" "$STANDBY_HOST2" "$STANDBY_DB_UNIQUE_NAME"
-
-    start_rman_duplicate
-
-    STATUS=$(check_rman_duplicate_completion duplicate_standby.log)
-    send_email_notification duplicate_standby.log "$STATUS" "$EMAIL_TO"
-
-    if [ "$STATUS" != "SUCCESS" ]; then
-      log "RMAN duplicate failed for standby $standby. Exiting."
-      exit 1
-    fi
-
-    create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP"
-  done
-}
-create_single_standby() {
-  precheck_standby_environment
-  create_required_directories_standby "$STANDBY_HOST1" "$STANDBY_HOST2" "$STANDBY_DB_UNIQUE_NAME"
-  
-  start_rman_duplicate
-
-  STATUS=$(check_rman_duplicate_completion duplicate_standby.log)
-  send_email_notification duplicate_standby.log "$STATUS" "$EMAIL_TO"
-
-  if [ "$STATUS" != "SUCCESS" ]; then
-    log "RMAN duplicate failed for single standby. Exiting."
-    exit 1
-  fi
-
-  create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP"
-}
-log "Please select standby creation mode:"
-echo "1) Single Standby Database"
-echo "2) Multiple Standby Databases"
-read -rp "Enter your choice [1-2]: " standby_choice
-
-case "$standby_choice" in
-  1)
-    log "Single Standby Database creation selected."
-    create_single_standby
-    ;;
-  2)
-    log "Multiple Standby Databases creation selected."
-    create_multiple_standby
-    ;;
-  *)
-    echo "Invalid selection. Exiting."
-    exit 1
-    ;;
-esac
-# After starting RMAN nohup
-log "Waiting for RMAN duplicate to complete..."
-wait
-
-log "Checking RMAN duplicate completion..."
-STATUS=$(check_rman_duplicate_completion duplicate_standby.log)
-
-log "Sending email notification..."
-send_email_notification duplicate_standby.log "$STATUS" "DBA@example.com"
-
-if [ "$STATUS" = "SUCCESS" ]; then
-  log "RMAN duplicate completed successfully. Proceeding to redo creation."
-  create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP"
-else
-  log "RMAN duplicate failed. Please check duplicate_standby.log manually."
-  exit 1
-fi
-send_email_notification() {
-  local LOGFILE=$1
-  local STATUS=$2
-  local MAIL_TO=$3
-  local SUBJECT="Standby RAC RMAN DUPLICATE - $STATUS"
-
-  if [ -s "$LOGFILE" ]; then
-    if [ $(stat -c%s "$LOGFILE") -lt 1000000 ]; then
-      # If file size <1MB, send content in email
-      mailx -s "$SUBJECT" "$MAIL_TO" < "$LOGFILE"
-    else
-      # If file size >=1MB, attach the file
-      uuencode "$LOGFILE" "$LOGFILE" | mailx -s "$SUBJECT" "$MAIL_TO"
-    fi
-  fi
-}
-check_rman_duplicate_completion() {
-  local LOGFILE=$1
-
-  if grep -q "Finished Duplicate Db" "$LOGFILE"; then
-    echo "SUCCESS"
-  else
-    echo "FAILURE"
-  fi
-}
-log "Preparing RMAN DUPLICATE command for Standby creation."
-
-# Create RMAN command file
-cat > duplicate_standby.rman <<EOF
-CONNECT TARGET sys/$SYS_PASS@$PRIMARY_DB_CONN
-CONNECT AUXILIARY sys/$SYS_PASS@$STANDBY_DB_NAME
-
-DUPLICATE TARGET DATABASE
-  FOR STANDBY
-  FROM ACTIVE DATABASE
-  DORECOVER
-  SPFILE
-  SET DB_UNIQUE_NAME='$STANDBY_DB_UNIQUE_NAME'
-  SET CLUSTER_DATABASE='true'
-  SET LOG_FILE_NAME_CONVERT='$PRIMARY_REDO_PATH','$STANDBY_REDO_PATH'
-  SET DB_FILE_NAME_CONVERT='$PRIMARY_DATAFILE_PATH','$STANDBY_DATAFILE_PATH'
-  NOFILENAMECHECK;
-EXIT;
-EOF
-
-# Run RMAN DUPLICATE in nohup
-log "Starting RMAN DUPLICATE in nohup mode..."
-nohup rman cmdfile=duplicate_standby.rman log=duplicate_standby.log &
-
-log "RMAN DUPLICATE started. Monitor progress with: tail -f duplicate_standby.log"
-# functions_standby_rac.sh
-
-set -euo pipefail
-
-log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-}
-
-exec_sqlplus() {
-  local CONN="$1"
-  local SQL="$2"
-  sqlplus -s /nolog <<EOF
-CONNECT $CONN
-SET HEAD OFF FEEDBACK OFF PAGES 0 VERIFY OFF
-WHENEVER SQLERROR EXIT SQL.SQLCODE;
-$SQL
-EXIT;
-EOF
-}
-
-precheck_standby_environment() {
-  log "Performing Pre-checks..."
-
-  log "Checking connectivity to Primary Database..."
-  if ! echo "exit" | sqlplus -s sys/$SYS_PASS@$PRIMARY_DB_CONN as sysdba >/dev/null; then
-    log "ERROR: Cannot connect to Primary Database ($PRIMARY_DB_CONN). Exiting."
-    exit 1
-  fi
-
-  log "Checking connectivity to Standby Node1 ($STANDBY_HOST1)..."
-  if ! ping -c 2 "$STANDBY_HOST1" >/dev/null; then
-    log "ERROR: Cannot ping Standby Node1 ($STANDBY_HOST1). Exiting."
-    exit 1
-  fi
-
-  log "Checking connectivity to Standby Node2 ($STANDBY_HOST2)..."
-  if ! ping -c 2 "$STANDBY_HOST2" >/dev/null; then
-    log "ERROR: Cannot ping Standby Node2 ($STANDBY_HOST2). Exiting."
-    exit 1
-  fi
-
-  log "Checking ORACLE_HOME exists..."
-  if [ ! -d "$ORACLE_HOME" ]; then
-    log "ERROR: ORACLE_HOME ($ORACLE_HOME) does not exist. Exiting."
-    exit 1
-  fi
-
-  log "Pre-checks completed successfully."
-}
-
-create_required_directories_standby() {
-  local HOST1="$1"
-  local HOST2="$2"
-  local DBNAME="$3"
-
-  log "Creating adump directory on $HOST1"
-  ssh oracle@"$HOST1" bash <<EOF
-mkdir -p /u01/app/oracle/admin/${DBNAME}/adump
-chown -R oracle:oinstall /u01/app/oracle/admin/${DBNAME}/adump
-EOF
-
-  log "Creating adump directory on $HOST2"
-  ssh oracle@"$HOST2" bash <<EOF
-mkdir -p /u01/app/oracle/admin/${DBNAME}/adump
-chown -R oracle:oinstall /u01/app/oracle/admin/${DBNAME}/adump
-EOF
-
-  log "Adump directories created on both nodes."
-}
-
-create_all_logs_from_primary_info() {
-  local PRIMARY_CONN="$1"
-  local STANDBY_SID="$2"
-  local ASM_DISKGROUP="$3"
-
-  export ORACLE_SID="$STANDBY_SID"
-
-  log "Fetching redo size from Primary Database."
-  local REDO_SIZE_MB=$(exec_sqlplus "$PRIMARY_CONN" "SELECT bytes/1024/1024 FROM v\$log WHERE rownum = 1;" | xargs)
-
-  log "Fetching redo group counts per thread from Primary."
-  local THREAD_COUNTS=$(exec_sqlplus "$PRIMARY_CONN" "SELECT thread#||':'||COUNT(group#) FROM v\$log GROUP BY thread#;" | xargs)
-
-  for entry in $THREAD_COUNTS; do
-    local thread=$(echo "$entry" | cut -d':' -f1)
-    local redo_count=$(echo "$entry" | cut -d':' -f2)
-
-    log "Creating Redo Logs for Thread $thread"
-    for ((i=1; i<=redo_count; i++)); do
-      sqlplus -s / as sysdba <<EOF
-ALTER DATABASE ADD LOGFILE THREAD $thread ('$ASM_DISKGROUP/$STANDBY_SID/ONLINELOG/redo_t${thread}_g${i}.log') SIZE ${REDO_SIZE_MB}M;
-EXIT;
-EOF
-    done
-
-    log "Creating Standby Redo Logs for Thread $thread"
-    standby_count=$((redo_count + 1))
-    for ((i=1; i<=standby_count; i++)); do
-      sqlplus -s / as sysdba <<EOF
-ALTER DATABASE ADD STANDBY LOGFILE THREAD $thread ('$ASM_DISKGROUP/$STANDBY_SID/STANDBYLOG/standby_t${thread}_g${i}.log') SIZE ${REDO_SIZE_MB}M;
-EXIT;
-EOF
-    done
-  done
-
-  log "Redo and Standby Redo Logs created successfully."
-}
-
-start_mrp_via_dgmgrl() {
-  log "Starting MRP via Data Guard Broker (dgmgrl)..."
-  dgmgrl sys/$SYS_PASS@$PRIMARY_DB_CONN <<EOF
-EDIT DATABASE "$STANDBY_DB_UNIQUE_NAME" SET STATE='APPLY-ON';
-EXIT;
-EOF
-}
-
-add_and_start_standby_database() {
-  local DBNAME="$1"
-  local DBUNIQUE="$2"
-  local ORACLE_HOME_PATH="$3"
-  local PRIMARY_REDO_PATH="$4"
-  local ASM_DISKGROUP_REDO="$5"
-
-  log "Adding Standby database into srvctl registry..."
-
-  srvctl add database \
-    -d "$DBUNIQUE" \
-    -o "$ORACLE_HOME_PATH" \
-    -p "$ORACLE_HOME_PATH/dbs/spfile${DBNAME}.ora" \
-    -r PHYSICAL_STANDBY \
-    -s MOUNT \
-    -t "$PRIMARY_REDO_PATH","$ASM_DISKGROUP_REDO"
-
-  log "Starting Standby database into mount stage..."
-  srvctl start database -d "$DBUNIQUE" -o mount
-}
-
-###
-validate_rman_connections() {
-  local PRIMARY_CONN="$1"
-  local STANDBY_CONN="$2"
-
-  echo "Validating RMAN connection to Primary Database ($PRIMARY_CONN)..."
-  rman target sys/$SYS_PASS@$PRIMARY_CONN auxiliary / <<EOF
-exit
-EOF
-  if [ $? -ne 0 ]; then
-    echo "ERROR: RMAN connection to Primary failed."
-    exit 1
-  fi
-
-  echo "Validating RMAN connection to Standby Database ($STANDBY_CONN)..."
-  rman target / auxiliary sys/$SYS_PASS@$STANDBY_CONN <<EOF
-exit
-EOF
-  if [ $? -ne 0 ]; then
-    echo "ERROR: RMAN connection to Standby failed."
-    exit 1
-  fi
-
-  echo "RMAN connection validation successful."
-}
-echo "Select Standby Mode:"
-echo "1) Single Instance Standby"
-echo "2) RAC Standby (Multi-Instance)"
-read -rp "Enter choice [1-2]: " mode_choice
-
-if [ "$mode_choice" == "1" ]; then
-    IS_RAC=false
-else
-    IS_RAC=true
-fi
-
-read -rp "Enter Primary Database Hostname: " PRIMARY_HOST
-read -rp "Enter Primary Database Name (SID): " PRIMARY_DB_NAME
-read -rp "Enter Primary TNS Connection Name: " PRIMARY_DB_CONN
-
-read -rp "Enter Standby Database Name (SID): " STANDBY_DB_NAME
-read -rp "Enter Standby Database Unique Name: " STANDBY_DB_UNIQUE_NAME
-
-if [ "$IS_RAC" == "true" ]; then
-    echo "Enter Standby Hostnames (space separated): "
-    read -ra STANDBY_HOSTS_ARRAY
-else
-    read -rp "Enter Standby Hostname: " STANDBY_HOST_SINGLE
-    STANDBY_HOSTS_ARRAY=("$STANDBY_HOST_SINGLE")
-fi
-
-read -rp "Enter SYS Password: " SYS_PASS
-
-read -rp "Enter ASM Diskgroup for Datafiles (ex: +DATA01): " ASM_DISKGROUP_DATA
-read -rp "Enter ASM Diskgroup for Redo Logs (ex: +DATA01): " ASM_DISKGROUP_REDO
-check_password_file() {
-  local pwfile="$ORACLE_HOME/dbs/orapw$STANDBY_DB_NAME"
-
-  if [ ! -f "$pwfile" ]; then
-    log "ERROR: Password file $pwfile not found."
-    log "Please manually copy the password file from Primary ASM:"
-    echo "1) Find password file on Primary:"
-    echo "   asmcmd find +DATA01 PROD/pwd*"
-    echo "2) Copy it locally:"
-    echo "   asmcmd cp +DATA01/PROD/PASSWORD/pwdPROD /tmp/orapwPROD"
-    echo "3) SCP to Standby and rename as needed:"
-    echo "   scp /tmp/orapwPROD standbyhost:/tmp/"
-    echo "   mv /tmp/orapwPROD \$ORACLE_HOME/dbs/orapw$STANDBY_DB_NAME"
-    echo "   chown oracle:oinstall \$ORACLE_HOME/dbs/orapw$STANDBY_DB_NAME"
-    echo "   chmod 600 \$ORACLE_HOME/dbs/orapw$STANDBY_DB_NAME"
-    exit 1
-  fi
-
-  log "Password file $pwfile found. Continuing..."
-}
-# standby_create.conf
-
-# Primary Database Info
-PRIMARY_DB_NAME=PROD
-PRIMARY_DB_CONN=PROD_TNS
-
-# Standby Database Info
-STANDBY_DB_NAME=PROD_STBY
-STANDBY_DB_UNIQUE_NAME=PROD_STBY
-# Standby Hosts - Flexible list
-STANDBY_HOSTS=("standbyhost1.example.com" "standbyhost2.example.com")
-STANDBY_PORT=1521
-
-# Oracle Environment
-ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
-SYS_PASS=MySysPassword123
-
-# ASM Diskgroup Paths
-ASM_DISKGROUP_DATA=+DATA01
-ASM_DISKGROUP_REDO=+DATA01
-
-# File Name Conversion (source filesystem if any)
-PRIMARY_REDO_PATH=/u01/oradata/PROD/
-PRIMARY_DATAFILE_PATH=/u01/oradata/PROD/
-
-# Single or RAC Standby
-IS_RAC=true
-
-# Email Notification
-EMAIL_TO=dba@example.com
-
-# Function to validate database connectivity and basic environment
-function precheck_standby_environment() {
-  echo "Performing pre-checks..."
-
-  echo "Checking connectivity to Primary Database..."
-  if ! echo "exit" | sqlplus -s sys/$SYS_PASS@$PRIMARY_DB_CONN as sysdba >/dev/null; then
-    echo "ERROR: Cannot connect to Primary Database ($PRIMARY_DB_CONN). Exiting."
-    exit 1
-  fi
-
-  for host in "${STANDBY_HOSTS[@]}"; do
-    echo "Checking connectivity to Standby Host: $host"
-    if ! ping -c 2 "$host" >/dev/null; then
-      echo "ERROR: Cannot ping Standby Host ($host). Exiting."
-      exit 1
-    fi
-  done
-
-  echo "Checking ORACLE_HOME exists..."
-  if [ ! -d "$ORACLE_HOME" ]; then
-    echo "ERROR: ORACLE_HOME ($ORACLE_HOME) does not exist. Exiting."
-    exit 1
-  fi
-
-  echo "Pre-checks completed successfully."
-}
-
-# Function to create required adump directory on standby hosts
-function create_required_directories_standby() {
-  local DBNAME="$1"
-
-  for host in "${STANDBY_HOSTS[@]}"; do
-    echo "Creating adump directory on $host"
-    ssh oracle@"$host" bash <<EOF
-mkdir -p /u01/app/oracle/admin/${DBNAME}/adump
-chown -R oracle:oinstall /u01/app/oracle/admin/${DBNAME}/adump
-EOF
-  done
-
-  echo "Adump directories created successfully."
-}
-
-# Function to create redo and standby redo logs matching primary using ASM
-function create_all_logs_from_primary_info() {
-  local PRIMARY_CONN="$1"
-  local STANDBY_SID="$2"
-  local ASM_DISKGROUP_REDO="$3"
-
-  export ORACLE_SID="$STANDBY_SID"
-
-  echo "Fetching redo log information from Primary..."
-  PRIMARY_REDO_SIZE_MB=$(sqlplus -s sys/$SYS_PASS@$PRIMARY_DB_CONN as sysdba <<EOF
-SET HEAD OFF FEEDBACK OFF;
-SELECT bytes/1024/1024 FROM v\$log WHERE rownum = 1;
-EXIT;
-EOF
-  | xargs)
-
-  THREAD_REDO_COUNTS=$(sqlplus -s sys/$SYS_PASS@$PRIMARY_DB_CONN as sysdba <<EOF
-SET HEAD OFF FEEDBACK OFF;
-SELECT thread# || ':' || COUNT(group#) FROM v\$log GROUP BY thread#;
-EXIT;
-EOF
-  | xargs)
-
-  for entry in $THREAD_REDO_COUNTS; do
-    thread=$(echo "$entry" | cut -d':' -f1)
-    redo_count=$(echo "$entry" | cut -d':' -f2)
-
-    echo "Creating Redo Logs for Thread $thread"
-    for ((i=1; i<=redo_count; i++)); do
-      sqlplus -s / as sysdba <<EOF
-ALTER DATABASE ADD LOGFILE THREAD $thread ('$ASM_DISKGROUP_REDO/$STANDBY_SID/ONLINELOG/redo_t${thread}_g${i}.log') SIZE ${PRIMARY_REDO_SIZE_MB}M;
-EXIT;
-EOF
-    done
-
-    echo "Creating Standby Redo Logs for Thread $thread"
-    standby_count=$((redo_count + 1))
-    for ((i=1; i<=standby_count; i++)); do
-      sqlplus -s / as sysdba <<EOF
-ALTER DATABASE ADD STANDBY LOGFILE THREAD $thread ('$ASM_DISKGROUP_REDO/$STANDBY_SID/STANDBYLOG/standby_t${thread}_g${i}.log') SIZE ${PRIMARY_REDO_SIZE_MB}M;
-EXIT;
-EOF
-    done
-  done
-
-  echo "Redo and Standby Redo logs created successfully."
-}
-
-
-# standby_create_driver.sh
-
-#!/bin/bash
-
-set -euo pipefail
-
-# Load configuration and functions
-source ./standby_create.conf
-source ./functions_standby_rac.sh
-
-log "Starting Standby Creation Process"
-
-# Step 1: Perform pre-checks
-precheck_standby_environment
-
-# Step 2: Create required adump directories dynamically for each host
-create_required_directories_standby "$STANDBY_DB_UNIQUE_NAME"
-
-# Step 3: Check for Password File
-check_password_file
-
-# Step 4: Validate RMAN Connections
-validate_rman_connections "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME"
-
-# Step 5: Prepare and start RMAN DUPLICATE in nohup
-log "Preparing RMAN DUPLICATE command for Standby creation."
-
-cat > duplicate_standby.rman <<EOF
-CONNECT TARGET sys/$SYS_PASS@$PRIMARY_DB_CONN
-CONNECT AUXILIARY sys/$SYS_PASS@$STANDBY_DB_NAME
-
-DUPLICATE TARGET DATABASE
-  FOR STANDBY
-  FROM ACTIVE DATABASE
-  DORECOVER
-  SPFILE
-  SET DB_UNIQUE_NAME='$STANDBY_DB_UNIQUE_NAME'
-  SET CLUSTER_DATABASE='${IS_RAC,,}'
-  SET LOG_FILE_NAME_CONVERT='$PRIMARY_REDO_PATH','$ASM_DISKGROUP_REDO'
-  SET DB_FILE_NAME_CONVERT='$PRIMARY_DATAFILE_PATH','$ASM_DISKGROUP_DATA'
-  NOFILENAMECHECK;
-EXIT;
-EOF
-
-log "Starting RMAN DUPLICATE in background using nohup..."
-nohup rman cmdfile=duplicate_standby.rman log=duplicate_standby.log &
-RMAN_PID=$!
-
-log "Waiting for RMAN process (PID=$RMAN_PID) to finish..."
-wait $RMAN_PID || true
-
-# Step 6: Check completion and send email notification
-STATUS=$(check_rman_duplicate_completion duplicate_standby.log)
-send_email_notification duplicate_standby.log "$STATUS" "$EMAIL_TO"
-
-if [ "$STATUS" != "SUCCESS" ]; then
-  log "RMAN duplicate failed. Exiting."
-  exit 1
-fi
-
-# Step 7: Add standby database and start it to mount stage
-add_and_start_standby_database "$STANDBY_DB_NAME" "$STANDBY_DB_UNIQUE_NAME" "$ORACLE_HOME" "$PRIMARY_REDO_PATH" "$ASM_DISKGROUP_REDO"
-
-# Step 8: Create redo and standby redo logs
-create_all_logs_from_primary_info "$PRIMARY_DB_CONN" "$STANDBY_DB_NAME" "$ASM_DISKGROUP_REDO"
-
-# Step 9: Start MRP process
-start_mrp_via_dgmgrl
-
-# Step 10: Check Data Guard sync status
-check_dg_sync_status
-
-# Step 11: Post Steps Reminder
-log "Post Steps Reminder:"
-echo "- Verify all instances registered correctly with srvctl if RAC."
-echo "- Data Guard sync status already validated."
-
-log "Standby Creation Process Completed Successfully"
-
-##
-check_dg_sync_status() {
-  log "Checking Data Guard Broker Configuration Status..."
-
-  dgmgrl sys/$SYS_PASS@$PRIMARY_DB_CONN <<EOF > /tmp/dg_check.log
-SHOW CONFIGURATION;
-SHOW DATABASE "$STANDBY_DB_UNIQUE_NAME";
-EXIT;
-EOF
-
-  if grep -q "SUCCESS" /tmp/dg_check.log && grep -q "APPLY-ON" /tmp/dg_check.log; then
-    log "Data Guard configuration is healthy and Standby is in APPLY-ON mode."
-  else
-    log "ERROR: Data Guard is not healthy or Standby not applying redo."
-    log "Please review /tmp/dg_check.log for details."
-    cat /tmp/dg_check.log
-    exit 1
+# ------------------------------ Load Config -----------------------------------
+[[ -f "$CONFIG_FILE" ]] || { err "Config file not found: $CONFIG_FILE"; exit 1; }
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+need_vars=( SRC_EZCONNECT TGT_EZCONNECT SYS_PASSWORD DUMPFILE_PREFIX )
+for v in "${need_vars[@]}"; do
+  [[ -n "${!v:-}" ]] || { err "Missing required config variable: $v"; exit 1; }
+done
+
+# ----------------------------- Defaults ---------------------------------------
+PARALLEL="${PARALLEL:-4}"
+COMPRESSION="${COMPRESSION:-METADATA_ONLY}"
+ENCRYPTION_PASSWORD="${ENCRYPTION_PASSWORD:-}"
+TABLE_EXISTS_ACTION="${TABLE_EXISTS_ACTION:-APPEND}"
+REMAP_SCHEMA="${REMAP_SCHEMA:-}"
+REMAP_TABLESPACE="${REMAP_TABLESPACE:-}"
+INCLUDE="${INCLUDE:-}"
+EXCLUDE="${EXCLUDE:-}"
+FLASHBACK_SCN="${FLASHBACK_SCN:-}"
+FLASHBACK_TIME="${FLASHBACK_TIME:-}"
+ESTIMATE_ONLY="${ESTIMATE_ONLY:-N}"
+EXPDP_TRACE="${EXPDP_TRACE:-}"
+IMPDP_TRACE="${IMPDP_TRACE:-}"
+
+SCHEMAS_LIST_EXP="${SCHEMAS_LIST_EXP:-}"
+SCHEMAS_LIST_IMP="${SCHEMAS_LIST_IMP:-}"
+
+SKIP_SCHEMAS="${SKIP_SCHEMAS:-}"
+SKIP_TABLESPACES="${SKIP_TABLESPACES:-SYSTEM,SYSAUX,TEMP,UNDOTBS1,UNDOTBS2}"
+
+DRY_RUN_ONLY="${DRY_RUN_ONLY:-N}"
+
+REPORT_EMAILS="${REPORT_EMAILS:-}"
+MAIL_ENABLED="${MAIL_ENABLED:-Y}"
+MAIL_FROM="${MAIL_FROM:-noreply@localhost}"
+MAIL_SUBJECT_PREFIX="${MAIL_SUBJECT_PREFIX:-[Oracle DP]}"
+MAIL_METHOD="${MAIL_METHOD:-auto}"
+
+COMPARE_ENGINE="${COMPARE_ENGINE:-LOCAL}"  # EXTERNAL | FILE | LOCAL
+EXACT_ROWCOUNT="${EXACT_ROWCOUNT:-N}"
+
+EXPORT_DIR_PATH="${EXPORT_DIR_PATH:-${NAS_PATH:-}}"
+IMPORT_DIR_PATH="${IMPORT_DIR_PATH:-}"
+NAS_PATH="${NAS_PATH:-}"
+
+ok "Using config: $CONFIG_FILE"
+ok "Work: $WORK_DIR | Logs: $LOG_DIR | Parfiles(default): $PAR_DIR | DDLs: $DDL_DIR | Compare: $COMPARE_DIR"
+
+# ---------------------------- Pre-flight checks --------------------------------
+for b in sqlplus expdp impdp; do
+  if ! command -v "$b" >/dev/null 2>&1; then err "Missing required binary: $b"; exit 1; fi
+done
+
+mask_pwd() { sed 's#[^/"]\{1,\}@#***@#g' | sed 's#sys/[^@]*@#sys/****@#g'; }
+
+basename_safe() { local x="${1:-}"; x="${x##*/}"; printf "%s" "$x"; }
+reject_if_pathlike() { local x="${1:-}"; if [[ "$x" == *"/"* ]]; then warn "Path component detected and removed: [$x]"; x="${x##*/}"; fi; printf "%s" "$x"; }
+
+parfile_dir_for_mode() {
+  local mode="${1}" preferred=""
+  case "${mode}" in expdp) preferred="${EXPORT_DIR_PATH:-}";; impdp) preferred="${IMPORT_DIR_PATH:-}";; esac
+  if [[ -n "$preferred" && -d "$preferred" && -w "$preferred" ]]; then echo "$preferred"; else
+    [[ -n "$preferred" && ! -d "$preferred" ]] && warn "Parfile dir [$preferred] missing; using $PAR_DIR"
+    [[ -n "$preferred" && -d "$preferred" && ! -w "$preferred" ]] && warn "Parfile dir [$preferred] not writable; using $PAR_DIR"
+    echo "$PAR_DIR"
   fi
 }
 
-###
-
-#!/bin/bash
-# File: lib/dg_manager.sh
-CONFIG_FILE="dg_config.cfg"
-source "$CONFIG_FILE" 2>/dev/null
-HTML_REPORT="/tmp/dg_report_$(date +%Y%m%d).html"
-
-# Function: Stop Standby in Mount State
-stop_standby_mount() {
-    if [ "$DG_TYPE" == "single" ]; then
-        ssh "$STANDBY_HOST" <<EOF
-            export ORACLE_SID=$STANDBY_SID
-            sqlplus / as sysdba <<SQL
-                SHUTDOWN IMMEDIATE;
-                STARTUP MOUNT;
-                EXIT;
+# ------------------------------- SQL helpers ----------------------------------
+run_sql() {
+  local ez="$1"; shift
+  local tag="${1:-sql}"; shift || true
+  local sql="$*"
+  local conn="sys/${SYS_PASSWORD}@${ez} as sysdba"
+  local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
+  debug "run_sql(tag=${tag}) on ${ez} -> $logf"
+  sqlplus -s "$conn" <<SQL >"$logf" 2>&1
+SET PAGES 0 FEEDBACK OFF LINES 32767 VERIFY OFF HEADING OFF ECHO OFF LONG 1000000 LONGCHUNKSIZE 1000000
+SET DEFINE OFF
+${sql}
+EXIT
 SQL
-EOF
-    elif [ "$DG_TYPE" == "rac" ]; then
-        for node in "${STANDBY_RAC_HOSTS[@]}"; do
-            ssh "$node" <<EOF
-                srvctl stop database -db $RAC_DB_NAME
-                srvctl start database -db $RAC_DB_NAME -startoption mount
-EOF
-        done
-    fi
+  if grep -qi "ORA-" "$logf"; then
+    err "SQL error: ${tag} (see $logf)"
+    tail -n 120 "$logf" | mask_pwd | sed 's/^/  /'
+    exit 1
+  fi
+  ok "SQL ok: ${tag}"
 }
 
-# Function: Setup RAC using srvctl
-setup_rac_srvctl() {
-    if [ "$DG_TYPE" == "rac" ]; then
-        # Add Database to Cluster
-        ssh "${STANDBY_RAC_HOSTS[0]}" <<EOF
-            srvctl add database -db $RAC_DB_NAME \
-                -oraclehome $ORACLE_HOME \
-                -dbtype PHYSICAL_STANDBY \
-                -dbname $RAC_DB_NAME \
-                -spfile "+$DATA_DG/$RAC_DB_NAME/spfile$RAC_DB_NAME.ora"
-            
-            # Add Instances
-            node_num=1
-            for node in "${STANDBY_RAC_HOSTS[@]}"; do
-                srvctl add instance -db $RAC_DB_NAME \
-                    -instance "${RAC_INSTANCE_PREFIX}\${node_num}" \
-                    -node "$node"
-                ((node_num++))
-            done
-            
-            srvctl config database -db $RAC_DB_NAME
-EOF
-    fi
+run_sql_try() {
+  local ez="$1"; shift
+  local tag="${1:-sqltry}"; shift || true
+  local sql="$*"
+  local conn="sys/${SYS_PASSWORD}@${ez} as sysdba"
+  local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
+  debug "run_sql_try(tag=${tag}) on ${ez} -> $logf"
+  sqlplus -s "$conn" <<SQL >"$logf" 2>&1
+SET PAGES 0 FEEDBACK OFF LINES 32767 VERIFY OFF HEADING OFF ECHO OFF LONG 1000000 LONGCHUNKSIZE 1000000
+SET DEFINE OFF
+${sql}
+EXIT
+SQL
+  if grep -qi "ORA-" "$logf"; then
+    warn "SQL (non-fatal) error on ${tag} — see $logf"
+    tail -n 60 "$logf" | mask_pwd | sed 's/^/  /'
+    return 1
+  fi
+  ok "SQL ok (non-fatal): ${tag}"
+  return 0
 }
 
-# Function: Configure Data Guard Broker
-configure_dgmgrl() {
-    dgmgrl_cmds="/tmp/dgmgrl_cmds_$$.txt"
-    cat <<DGMGRL > "$dgmgrl_cmds"
-        CREATE CONFIGURATION DG_${DB_NAME} AS PRIMARY DATABASE IS ${DB_NAME} CONNECT IDENTIFIER IS ${PRIMARY_HOST};
-        ADD DATABASE ${DB_NAME}_STBY AS CONNECT IDENTIFIER IS ${STANDBY_HOST} MAINTAINED AS PHYSICAL;
-        ENABLE CONFIGURATION;
-        SHOW CONFIGURATION;
-DGMGRL
-
-    dgmgrl sys/$SYS_PASSWORD@$PRIMARY_HOST <<EOF
-        @$dgmgrl_cmds
-EOF
-    rm -f "$dgmgrl_cmds"
+run_sql_spool_local() {
+  local ez="$1"; shift
+  local tag="$1"; shift
+  local out="$1"; shift
+  local body="$*"
+  local conn="sys/${SYS_PASSWORD}@${ez} as sysdba"
+  local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
+  debug "run_sql_spool_local(tag=${tag}) -> spool $out ; log=$logf"
+  sqlplus -s "$conn" <<SQL >"$logf" 2>&1
+SET PAGESIZE 0 LINESIZE 4000 LONG 1000000 LONGCHUNKSIZE 1000000 TRIMSPOOL ON TRIMOUT ON FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+SET DEFINE OFF
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+SPOOL $out
+${body}
+SPOOL OFF
+EXIT
+SQL
+  if grep -qi "ORA-" "$logf"; then
+    err "SQL error: ${tag} (see $logf)"
+    tail -n 120 "$logf" | mask_pwd | sed 's/^/  /'
+    exit 1
+  fi
+  ok "Spool ok: $out"
 }
 
-# Function: Generate HTML Report
-generate_html_report() {
-    cat <<HTML > "$HTML_REPORT"
-<html>
-<head>
-<style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-    th { background-color: #4CAF50; color: white; }
-    .success { background-color: #dff0d8; }
-    .error { background-color: #f2dede; }
-</style>
-</head>
-<body>
-    <h2>Data Guard Deployment Report</h2>
-    <p>Generated: $(date)</p>
-    <table>
-        <tr><th>Step</th><th>Status</th><th>Details</th></tr>
-HTML
-
-    # Add report entries from log file
-    while read -r line; do
-        echo "<tr><td>${line%%|*}</td><td>${line#*|}</td><td>${line##*|}</td></tr>" >> "$HTML_REPORT"
-    done < /tmp/dg_deploy.log
-
-    cat <<HTML >> "$HTML_REPORT"
-    </table>
-</body>
-</html>
-HTML
+run_sql_capture() {
+  local ez="$1" body="$2"
+  local conn="sys/${SYS_PASSWORD}@${ez} as sysdba"
+  local out rc
+  out="$(sqlplus -s "$conn" <<SQL 2>&1
+SET PAGES 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMSPOOL ON LINES 32767
+SET LONG 1000000 LONGCHUNKSIZE 1000000
+SET DEFINE OFF
+${body}
+/
+EXIT
+SQL
+)" && rc=$? || rc=$?
+  if [[ $rc -ne 0 || "$out" =~ ORA- ]]; then echo ""; return 1; fi
+  echo "$out" | awk 'NF{last=$0} END{print last}'
+  return 0
 }
 
-# Function: Send Email Report
-send_email_report() {
-    local recipient=$(whoami)@example.com  # Set your email
-    local subject="Data Guard Deployment Report - $DB_NAME"
-    
-    mailx -s "$subject" -a "Content-type: text/html" "$recipient" <<EOF
-$(cat $HTML_REPORT)
-EOF
+# ------------------------------- Mail helpers ---------------------------------
+detect_mail_stack() {
+  local forced="${MAIL_METHOD:-auto}"
+  case "${forced}" in
+    sendmail) command -v sendmail >/dev/null && { echo sendmail; return; } ;;
+    mailutils) (mail --version 2>/dev/null | grep -qi "mailutils") && { echo mailutils; return; } ;;
+    bsdmail)   (mail -V 2>/dev/null | grep -qi "bsd") && { echo bsdmail; return; } ;;
+    mailx)     command -v mailx >/dev/null && { echo mailx; return; } ;;
+  esac
+  if command -v sendmail >/dev/null 2>&1; then echo sendmail; return; fi
+  if mail --version 2>/dev/null | grep -qi "mailutils"; then echo mailutils; return; fi
+  if mail -V 2>/dev/null | grep -qi "bsd"; then echo bsdmail; return; fi
+  if command -v mailx >/dev/null 2>&1; then echo mailx; return; fi
+  echo none
 }
 
-# Main Deployment Workflow
-main_deployment() {
-    >/tmp/dg_deploy.log  # Initialize log file
-    
-    # 1. Stop Standby in Mount State
-    if stop_standby_mount >>/tmp/dg_deploy.log 2>&1; then
-        echo "Mount Stage|Success|Standby successfully mounted" >>/tmp/dg_deploy.log
-    else
-        echo "Mount Stage|Failed|Error mounting standby" >>/tmp/dg_deploy.log
-        return 1
-    fi
-    
-    # 2. Setup RAC (if applicable)
-    if [ "$DG_TYPE" == "rac" ]; then
-        if setup_rac_srvctl >>/tmp/dg_deploy.log 2>&1; then
-            echo "RAC Setup|Success|Cluster configuration completed" >>/tmp/dg_deploy.log
+email_inline_html() {
+  local file="$1" subject="$2"
+  [[ "${MAIL_ENABLED^^}" != "Y" ]] && { warn "MAIL_ENABLED!=Y; skip email."; return 0; }
+  [[ -z "${REPORT_EMAILS}" ]] && { warn "REPORT_EMAILS empty; skip email."; return 0; }
+  [[ ! -f "$file" ]] && { warn "email_inline_html: $file not found"; return 1; }
+  local method; method="$(detect_mail_stack)"
+  debug "Email stack: ${method}; subject=${subject}; to=${REPORT_EMAILS}; file=${file}"
+  case "$method" in
+    sendmail)
+      { echo "From: ${MAIL_FROM}"
+        echo "To: ${REPORT_EMAILS}"
+        echo "Subject: ${subject}"
+        echo "MIME-Version: 1.0"
+        echo "Content-Type: text/html; charset=UTF-8"
+        echo "Content-Transfer-Encoding: 8bit"
+        echo
+        cat "$file"
+      } | sendmail -t || { warn "sendmail failed"; return 1; }
+      ;;
+    mailutils)
+      mail -a "From: ${MAIL_FROM}" \
+           -a "MIME-Version: 1.0" \
+           -a "Content-Type: text/html; charset=UTF-8" \
+           -s "${subject}" ${REPORT_EMAILS} < "$file" || { warn "mail (mailutils) failed"; return 1; }
+      ;;
+    bsdmail)
+      mail -a "From: ${MAIL_FROM}" \
+           -a "MIME-Version: 1.0" \
+           -a "Content-Type: text/html; charset=UTF-8" \
+           -s "${subject}" ${REPORT_EMAILS} < "$file" || { warn "mail (bsd) failed"; return 1; }
+      ;;
+    mailx)
+      if mailx -V 2>&1 | grep -qiE "heirloom|s-nail|nail"; then
+        if mailx -a "Content-Type: text/html" -s test "$MAIL_FROM" </dev/null 2>&1 | grep -qi "unknown option"; then
+          mailx -r "$MAIL_FROM" -s "${subject}" ${REPORT_EMAILS} < "$file" || { warn "mailx failed"; return 1; }
         else
-            echo "RAC Setup|Failed|Error configuring RAC" >>/tmp/dg_deploy.log
-            return 1
+          mailx -r "$MAIL_FROM" -a "Content-Type: text/html; charset=UTF-8" -s "${subject}" ${REPORT_EMAILS} < "$file" || { warn "mailx failed"; return 1; }
         fi
-    fi
-    
-    # 3. Configure Data Guard Broker
-    if configure_dgmgrl >>/tmp/dg_deploy.log 2>&1; then
-        echo "Broker Config|Success|DGMGRL configuration applied" >>/tmp/dg_deploy.log
-    else
-        echo "Broker Config|Failed|Error in broker configuration" >>/tmp/dg_deploy.log
-        return 1
-    fi
-    
-    # Generate and send report
-    generate_html_report
-    send_email_report
+      else
+        mailx -s "${subject}" ${REPORT_EMAILS} < "$file" || { warn "mailx failed"; return 1; }
+      fi
+      ;;
+    none) warn "No supported mailer found; skipping email."; return 1 ;;
+  esac
+  ok "Inline email sent to ${REPORT_EMAILS} via ${method}"
 }
 
-# Execute main deployment
-main_deployment
-DG_TYPE="rac"  # or "single"
-DB_NAME="ORCL"
-PRIMARY_HOST="primary-node"
-STANDBY_HOST="standby-node"
-RAC_INSTANCE_PREFIX="orclstby"
-STANDBY_RAC_HOSTS=("node1" "node2")
-DATA_DG="DATA"
-LOG_DG="LOG"
-SYS_PASSWORD="securepass"
-ORACLE_HOME="/u01/app/oracle/product/19c/dbhome_1"
-##########
-#!/bin/bash
-# File: lib/dg_manager.sh
-CONFIG_FILE="dg_config.cfg"
-source "$CONFIG_FILE" 2>/dev/null
-HTML_REPORT="/tmp/dg_report_$(date +%Y%m%d).html"
-
-# Function: Stop Standby in Mount State using SRVCTL
-stop_standby_mount() {
-    if [ "$DG_TYPE" == "single" ]; then
-        # For Oracle Restart single instance
-        ssh "$STANDBY_HOST" <<EOF
-            if srvctl config database -db $DB_NAME >/dev/null 2>&1; then
-                srvctl stop database -db $DB_NAME
-                srvctl start database -db $DB_NAME -startoption mount
-            else
-                sqlplus / as sysdba <<SQL
-                    SHUTDOWN IMMEDIATE;
-                    STARTUP MOUNT;
-SQL
-            fi
-EOF
-    elif [ "$DG_TYPE" == "rac" ]; then
-        # For RAC databases
-        ssh "${STANDBY_RAC_HOSTS[0]}" <<EOF
-            srvctl stop database -db $RAC_DB_NAME
-            srvctl start database -db $RAC_DB_NAME -startoption mount
-EOF
-    fi
+dp_emit_html_and_email() {
+  local tool="$1" tag="$2" pf="$3" client_log="$4"
+  local html="${LOG_DIR}/${tool}_${tag}_${RUN_ID}.html"
+  {
+    echo "<html><head><meta charset='utf-8'><title>${tool^^} ${tag} ${RUN_ID}</title>"
+    echo "<style>body{font-family:Arial,Helvetica,sans-serif} pre{white-space:pre-wrap; border:1px solid #ddd; padding:10px; background:#fafafa} .box{border:1px solid #ccc; padding:10px; margin:8px 0}</style>"
+    echo "</head><body>"
+    echo "<h2>${tool^^} job completed</h2>"
+    echo "<p><b>Run:</b> ${RUN_ID}<br/><b>Tool:</b> ${tool}<br/><b>Tag:</b> ${tag}</p>"
+    echo "<div class='box'><h3>Parfile</h3><pre>"
+    if [[ -f "$pf" ]]; then sed -E 's/(encryption_password=).*/\1*****/I' "$pf" | sed 's/&/\&amp;/g;s/</\&lt;/g'; else echo "(parfile not found at $pf)"; fi
+    echo "</pre></div>"
+    echo "<div class='box'><h3>Client Log</h3><pre>"
+    if [[ -f "$client_log" ]]; then sed 's/&/\&amp;/g;s/</\&lt;/g' "$client_log"; else echo "(client log not found at $client_log)"; fi
+    echo "</pre></div>"
+    local server_log=""
+    if [[ -f "$pf" ]]; then server_log="$(awk -F= 'tolower($1)=="logfile"{print $2}' "$pf" | head -1)"; fi
+    [[ -n "$server_log" ]] && echo "<p><i>Server log (on DB host Oracle DIRECTORY):</i> ${server_log}</p>"
+    echo "</body></html>"
+  } > "$html"
+  email_inline_html "$html" "${MAIL_SUBJECT_PREFIX} ${tool^^} ${tag} ${RUN_ID}"
+  ok "HTML emailed: ${html}"
 }
 
-# Function: Setup Single Instance with Oracle Restart
-setup_si_srvctl() {
-    if [ "$DG_TYPE" == "single" ]; then
-        ssh "$STANDBY_HOST" <<EOF
-            # Check if database already exists in Oracle Restart
-            if ! srvctl config database -db $DB_NAME >/dev/null 2>&1; then
-                srvctl add database -db $DB_NAME \
-                    -oraclehome $ORACLE_HOME \
-                    -dbtype PHYSICAL_STANDBY \
-                    -dbname $DB_NAME \
-                    -spfile '+$DATA_DG/$DB_NAME/spfile$DB_NAME.ora' \
-                    -role PHYSICAL_STANDBY \
-                    -startoption MOUNT \
-                    -stopoption IMMEDIATE
-                
-                srvctl modify database -db $DB_NAME \
-                    -dbname $DB_NAME \
-                    -pwfile '+$DATA_DG/$DB_NAME/orapw$DB_NAME'
-                
-                srvctl enable database -db $DB_NAME
-            fi
-            
-            srvctl config database -db $DB_NAME
-EOF
-    fi
+# ----------------------- DIRECTORY helpers (NON-FATAL) ------------------------
+create_or_replace_directory() {
+  local ez="$1" dir_name="$2" dir_path="$3" host_tag="$4"
+  [[ -z "$dir_path" ]] && { warn "create_or_replace_directory: dir_path is empty"; return 1; }
+  dir_name="$(echo "$dir_name" | tr '[:lower:]' '[:upper:]')"
+  debug "CREATE OR REPLACE DIRECTORY ${dir_name} AS '${dir_path}' on ${host_tag} (${ez})"
+  run_sql_try "$ez" "create_dir_${host_tag}_${dir_name}" "
+BEGIN
+  EXECUTE IMMEDIATE 'CREATE OR REPLACE DIRECTORY ${dir_name} AS ''${dir_path}''';
+  BEGIN EXECUTE IMMEDIATE 'GRANT READ,WRITE ON DIRECTORY ${dir_name} TO PUBLIC'; EXCEPTION WHEN OTHERS THEN NULL; END;
+END;
+/
+"
+  return $?
 }
 
-# Function: Configure Data Guard Broker with DGMGRL
-configure_dgmgrl() {
-    dgmgrl_cmds="/tmp/dgmgrl_cmds_$$.txt"
-    
-    cat <<DGMGRL > "$dgmgrl_cmds"
-        CREATE CONFIGURATION DG_${DB_NAME} AS PRIMARY DATABASE IS ${DB_NAME} 
-            CONNECT IDENTIFIER IS ${PRIMARY_HOST};
-        ADD DATABASE ${DB_NAME}_STBY AS CONNECT IDENTIFIER IS ${STANDBY_HOST} 
-            MAINTAINED AS PHYSICAL;
-        ENABLE CONFIGURATION;
-        ENABLE DATABASE ${DB_NAME}_STBY;
-        SHOW CONFIGURATION VERBOSE;
-DGMGRL
-
-    dgmgrl sys/$SYS_PASSWORD@$PRIMARY_HOST <<EOF
-        @$dgmgrl_cmds
-EOF
-    local status=$?
-    rm -f "$dgmgrl_cmds"
-    return $status
+validate_directory_on_db_try() {
+  local ez="$1" tag="$2" dir_name="${3:-$COMMON_DIR_NAME}"
+  dir_name="$(echo "$dir_name" | tr '[:lower:]' '[:upper:]')"
+  local logtag="dircheck_${tag}"
+  debug "VALIDATE DIRECTORY ${dir_name} on ${tag} (${ez})"
+  run_sql_try "$ez" "$logtag" "
+SET SERVEROUTPUT ON
+DECLARE
+  v_cnt  PLS_INTEGER := 0;
+  v_path VARCHAR2(4000);
+BEGIN
+  SELECT COUNT(*) INTO v_cnt
+  FROM all_directories
+  WHERE directory_name = UPPER('${dir_name}');
+  IF v_cnt = 0 THEN
+    DBMS_OUTPUT.PUT_LINE('DIRECTORY_MISSING '||UPPER('${dir_name}'));
+  ELSE
+    SELECT directory_path INTO v_path
+    FROM all_directories
+    WHERE directory_name = UPPER('${dir_name}');
+    DBMS_OUTPUT.PUT_LINE('DIRECTORY_OK '||UPPER('${dir_name}')||' '||v_path);
+  END IF;
+EXCEPTION
+  WHEN OTHERS THEN
+    DBMS_OUTPUT.PUT_LINE('DIRECTORY_VALIDATE_ERROR '||SQLCODE||' '||SQLERRM);
+END;
+/
+"
+  return $?
 }
 
-# Enhanced HTML Report Generation
-generate_html_report() {
-    cat <<HTML > "$HTML_REPORT"
-<html>
-<head>
-<style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-    th { background-color: #4CAF50; color: white; }
-    .success { background-color: #dff0d8; }
-    .warning { background-color: #fcf8e3; }
-    .error { background-color: #f2dede; }
-</style>
-</head>
-<body>
-    <h2>Data Guard Deployment Report</h2>
-    <p>Generated: $(date "+%Y-%m-%d %H:%M:%S")</p>
-    <h3>Configuration Details</h3>
-    <ul>
-        <li>Database Name: $DB_NAME</li>
-        <li>Database Type: ${DG_TYPE^^}</li>
-        <li>Primary Host: $PRIMARY_HOST</li>
-        <li>Standby Host: ${STANDBY_HOST:-${STANDBY_RAC_HOSTS[*]}}</li>
-    </ul>
-    <h3>Deployment Steps</h3>
-    <table>
-        <tr><th>Step</th><th>Status</th><th>Details</th><th>Timestamp</th></tr>
-HTML
+# -------------------------- Data Pump Core ------------------------------------
+dp_run() {
+  local tool="$1" ez="$2" pf="$3" tag="$4"
+  local client_log="${LOG_DIR}/${tool}_${tag}_${RUN_ID}.client.log"
+  local conn="sys/${SYS_PASSWORD}@${ez} as sysdba"
+  debug "dp_run(${tool}) tag=${tag} parfile=${pf} ez=${ez}"
 
-    # Add report entries from log file
-    while IFS='|' read -r step status details timestamp; do
-        echo "<tr class=\"${status,,}\"><td>$step</td><td>$status</td><td>$details</td><td>$timestamp</td></tr>" >> "$HTML_REPORT"
-    done < /tmp/dg_deploy.log
+  {
+    echo "---- ${tool} environment ----"
+    echo "date: $(date)"
+    echo "host: $(hostname)"
+    echo "ORACLE_HOME: ${ORACLE_HOME:-<unset>}"
+    echo "PATH: $PATH"
+    echo "tool_binary: $(command -v $tool || echo not found)"
+    echo "tool_version: $($tool -V 2>/dev/null | head -1 || echo '(unknown)')"
+    echo "---- parfile (${pf}) ----"
+    if [[ -f "$pf" ]]; then sed -E 's/(encryption_password=).*/\1*****/I' "$pf"; else echo "<parfile not found>"; fi
+  } > "$client_log" 2>&1
 
-    cat <<HTML >> "$HTML_REPORT"
-    </table>
-</body>
-</html>
-HTML
+  set +e
+  ( set -o pipefail; $tool "$conn" parfile="$pf" 2>&1 | tee -a "$client_log"; exit ${PIPESTATUS[0]} )
+  local rc=$?
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    err "[${tool}] FAILED (rc=$rc) — see ${client_log}"
+    dp_emit_html_and_email "$tool" "$tag-FAILED" "$pf" "$client_log" || true
+    exit $rc
+  fi
+
+  ok "[${tool}] SUCCESS — see ${client_log}"
+  dp_emit_html_and_email "$tool" "$tag" "$pf" "$client_log" || true
 }
 
-# Enhanced Email Function
-send_email_report() {
-    local recipient="dba-team@yourcompany.com"
-    local subject="Data Guard Deployment Report - $DB_NAME ($DG_TYPE)"
-    
-    mailx -s "$subject" -a "Content-type: text/html" "$recipient" <<EOF
-$(cat $HTML_REPORT)
-EOF
-}
+par_common() {
+  local mode="$1" tag="$2" dir_name="$3"
+  local pf_dir; pf_dir="$(parfile_dir_for_mode "$mode")"
+  mkdir -p "$pf_dir" || true
+  local pf="${pf_dir}/${tag}_${RUN_ID}.par"
+  debug "par_common(mode=${mode}, tag=${tag}, dir=${dir_name}) -> ${pf}"
 
-# Main Deployment Workflow
-main_deployment() {
+  local server_log="$(basename_safe "${DUMPFILE_PREFIX}_${tag}_${RUN_ID}.log")"
+
+  {
+    echo "directory=${dir_name}"
+    echo "logfile=${server_log}"
+    echo "logtime=all"
+    echo "parallel=${PARALLEL}"
+  } > "$pf"
+
+  if [[ "$mode" == "expdp" ]]; then
+    local dump_pat="$(basename_safe "${DUMPFILE_PREFIX}_${tag}_${RUN_ID}_%U.dmp")"
     {
-        echo "Step|Status|Details|Timestamp"
-        # 1. Stop and mount standby
-        if stop_standby_mount; then
-            echo "Mount Database|Success|Standby mounted using SRVCTL|$(date "+%T")"
-        else
-            echo "Mount Database|Error|Failed to mount standby|$(date "+%T")"
-            return 1
-        fi
-        
-        # 2. Configure Oracle Restart/RAC
-        if [ "$DG_TYPE" == "single" ]; then
-            if setup_si_srvctl; then
-                echo "Oracle Restart|Success|Database registered with SRVCTL|$(date "+%T")"
-            else
-                echo "Oracle Restart|Error|Failed to configure SRVCTL|$(date "+%T")"
-                return 1
-            fi
-        elif [ "$DG_TYPE" == "rac" ]; then
-            if setup_rac_srvctl; then
-                echo "RAC Config|Success|Cluster configuration completed|$(date "+%T")"
-            else
-                echo "RAC Config|Error|Failed to configure RAC|$(date "+%T")"
-                return 1
-            fi
-        fi
-        
-        # 3. Configure Data Guard Broker
-        if configure_dgmgrl; then
-            echo "Broker Config|Success|DGMGRL configuration applied|$(date "+%T")"
-        else
-            echo "Broker Config|Error|Failed to configure broker|$(date "+%T")"
-            return 1
-        fi
-        
-        # 4. Final verification
-        verification_result=$(ssh $STANDBY_HOST "srvctl status database -db $DB_NAME")
-        echo "Final Check|Success|$verification_result|$(date "+%T")"
-        
-    } | tee /tmp/dg_deploy.log
-    
-    generate_html_report
-    send_email_report
+      echo "dumpfile=${dump_pat}"
+      echo "compression=${COMPRESSION}"
+      [[ -n "$FLASHBACK_SCN"  ]] && echo "flashback_scn=${FLASHBACK_SCN}"
+      [[ -n "$FLASHBACK_TIME" ]] && echo "flashback_time=${FLASHBACK_TIME}"
+      [[ -n "$INCLUDE"        ]] && echo "include=${INCLUDE}"
+      [[ -n "$EXCLUDE"        ]] && echo "exclude=${EXCLUDE}"
+      [[ "${ESTIMATE_ONLY^^}" == "Y" ]] && echo "estimate_only=Y"
+      [[ -n "$ENCRYPTION_PASSWORD" ]] && { echo "encryption=encrypt_password"; echo "encryption_password=${ENCRYPTION_PASSWORD}"; }
+      [[ -n "$EXPDP_TRACE" ]] && echo "trace=${EXPDP_TRACE}"
+    } >> "$pf"
+  else
+    {
+      echo "table_exists_action=${TABLE_EXISTS_ACTION}"
+      [[ -n "$REMAP_SCHEMA"     ]] && echo "remap_schema=${REMAP_SCHEMA}"
+      [[ -n "$REMAP_TABLESPACE" ]] && echo "remap_tablespace=${REMAP_TABLESPACE}"
+      [[ -n "$INCLUDE"          ]] && echo "include=${INCLUDE}"
+      [[ -n "$EXCLUDE"          ]] && echo "exclude=${EXCLUDE}"
+      [[ -n "$ENCRYPTION_PASSWORD" ]] && echo "encryption_password=${ENCRYPTION_PASSWORD}"
+      [[ -n "$IMPDP_TRACE" ]] && echo "trace=${IMPDP_TRACE}"
+    } >> "$pf"
+  fi
+  echo "$pf"
 }
-##
-#!/bin/bash
-CONFIG_FILE="dg_config.cfg"
-source "$CONFIG_FILE" 2>/dev/null
 
-sync_password_file() {
-    if [ "$DG_TYPE" == "single" ]; then
-        echo "Syncing password file using ASM..."
-        
-        # Primary ASM password file location
-        asm_pwdfile="+DATA/${DB_NAME}/orapw${DB_NAME}"
-        standby_pwdfile="${ORACLE_HOME}/dbs/orapw${STANDBY_SID}"
-        
-        # 1. Copy from ASM to primary /tmp
-        echo "Copying password file from ASM to primary temp..."
-        ssh "${PRIMARY_HOST}" <<EOF
-            export ORACLE_SID=+ASM
-            asmcmd cp '${asm_pwdfile}' /tmp/orapw_temp
-            exit \$?
-EOF
-        [ $? -ne 0 ] && return 1
+show_and_confirm_parfile() {
+  local pf="$1" tool="${2:-}"
+  { echo "----- PARFILE: ${pf} -----"
+    sed -E 's/(encryption_password=).*/\1*****/I' "$pf"
+    echo "---------------------------"
+  } | say_to_user
+  local ans
+  read -rp "Proceed with ${tool:-the job} using this parfile? [Y/N/X]: " ans
+  case "${ans^^}" in Y) return 0 ;; N) return 1 ;; X) exit 0 ;; *) return 1 ;; esac
+}
 
-        # 2. Copy from primary to standby
-        echo "Transferring password file to standby..."
-        ssh "${PRIMARY_HOST}" "scp /tmp/orapw_temp ${STANDBY_HOST}:${standby_pwdfile}"
-        [ $? -ne 0 ] && return 1
-
-        # 3. Cleanup and verify
-        ssh "${PRIMARY_HOST}" "rm -f /tmp/orapw_temp"
-        ssh "${STANDBY_HOST}" <<EOF
-            [ -f "${standby_pwdfile}" ] || {
-                echo "Password file missing, creating new one..."
-                orapwd file=${standby_pwdfile} password=${SYS_PASSWORD} force=y
-            }
-            chmod 640 ${standby_pwdfile}
-EOF
-        return $?
-
-    elif [ "$DG_TYPE" == "rac" ]; then
-        echo "Handling RAC password files..."
-        asm_pwdfile="+DATA/${RAC_DB_NAME}/orapw${RAC_DB_NAME}"
-        
-        # Copy to all standby nodes
-        for node in "${STANDBY_RAC_HOSTS[@]}"; do
-            ssh "${PRIMARY_HOST}" <<EOF
-                export ORACLE_SID=+ASM
-                asmcmd cp '${asm_pwdfile}' /tmp/orapw_temp
-                scp /tmp/orapw_temp ${node}:${ORACLE_HOME}/dbs/orapw${RAC_INSTANCE_PREFIX}1
-                rm -f /tmp/orapw_temp
-EOF
-            ssh "${node}" "[ -f "${ORACLE_HOME}/dbs/orapw${RAC_INSTANCE_PREFIX}1" ] || orapwd file=${ORACLE_HOME}/dbs/orapw${RAC_INSTANCE_PREFIX}1 password=${SYS_PASSWORD} force=y"
-        done
+# -------------------- value confirmers & content picker ------------------------
+confirm_edit_value() {
+  local label="$1" val="${2:-}" ans=""
+  while true; do
+    if [[ -z "${val// }" ]]; then
+      echo "${label} is currently empty." | say_to_user
+      read -rp "Please enter ${label}: " val
+      continue
     fi
+    echo "${label}: ${val}" | say_to_user
+    read -rp "Use this value? (Y to accept, N to edit) [Y/N]: " ans
+    case "${ans^^}" in Y) echo "$val"; return 0 ;; N) read -rp "Enter new ${label}: " val ;; *) echo "Please answer Y or N." | say_to_user ;; esac
+  done
 }
 
-# Enhanced validation_and_save with error handling
-validate_and_save() {
-    [ "$DG_TYPE" != "single" ] && return  # Focus on single instance for this example
-    
-    validate_primary_connection || {
-        echo "Primary connection failed!"
-        return 1
-    }
-
-    validate_standby_listener || {
-        echo "Listener configuration failed!"
-        return 1
-    }
-
-    sync_password_file || {
-        echo "Password file sync failed! Error code: $?"
-        read -p "Retry with manual creation? [y/N] " retry
-        if [[ $retry =~ ^[Yy]$ ]]; then
-            ssh "${STANDBY_HOST}" "orapwd file=${ORACLE_HOME}/dbs/orapw${STANDBY_SID} password=${SYS_PASSWORD} force=y"
-        else
-            return 1
-        fi
-    }
-
-    save_config
-}
-#!/bin/bash
-CONFIG_FILE="dg_config.cfg"
-source "$CONFIG_FILE" 2>/dev/null
-
-# New standby connection validation function
-validate_standby_connection() {
-    echo "Validating standby database connectivity..."
-    ssh "${STANDBY_HOST}" <<EOF
-        export ORACLE_SID=${STANDBY_SID}
-        export ORACLE_HOME=${ORACLE_HOME}
-        ${ORACLE_HOME}/bin/sqlplus -s /nolog <<SQL
-            CONNECT / AS SYSDBA
-            WHENEVER SQLERROR EXIT SQL.SQLCODE
-            SELECT 'Standby Instance Status: ' || STATUS FROM V\$INSTANCE;
-            EXIT
-SQL
-        exit \$?
-EOF
-    local status=$?
-    
-    if [ $status -eq 0 ]; then
-        echo "Standby connection successful"
-        return 0
-    else
-        echo "Standby connection failed with error: $status"
-        echo "Trying to start standby instance..."
-        ssh "${STANDBY_HOST}" <<EOF
-            export ORACLE_SID=${STANDBY_SID}
-            export ORACLE_HOME=${ORACLE_HOME}
-            ${ORACLE_HOME}/bin/sqlplus -s /nolog <<SQL
-                CONNECT / AS SYSDBA
-                STARTUP NOMOUNT PFILE='${ORACLE_HOME}/dbs/init${STANDBY_SID}.ora';
-                EXIT
-SQL
-            exit \$?
-EOF
-        return $?
-    fi
-}
-
-# Enhanced validation_and_save function
-validate_and_save() {
-    # Existing primary validation
-    validate_primary_connection || {
-        echo "Primary database connection failed!"
-        return 1
-    }
-
-    # Existing listener validation
-    validate_standby_listener
-    case $? in
-        0) echo "Standby listener validation successful" ;;
-        1) 
-            echo "Reloading standby listener..."
-            ssh "${STANDBY_HOST}" "lsnrctl reload"
-            ;;
-        2)
-            echo "Configuring static listener entry..."
-            ssh "${STANDBY_HOST}" <<EOF
-                echo "SID_LIST_LISTENER =
-                    (SID_LIST =
-                        (SID_DESC =
-                            (GLOBAL_DBNAME = ${DB_NAME}_DGMGRL)
-                            (ORACLE_HOME = ${ORACLE_HOME})
-                            (SID_NAME = ${STANDBY_SID})
-                        )
-                    )" >> ${ORACLE_HOME}/network/admin/listener.ora
-                lsnrctl reload
-EOF
-            ;;
+choose_content_option() {
+  while true; do
+    cat <<'EOS' | say_to_user
+Choose Export Content:
+  a) METADATA_ONLY  (schema/metadata only)
+  b) FULL (ALL)     (metadata + data)
+  x) Exit
+EOS
+    local choice=""; read -rp "Select [a/b/x]: " choice
+    case "${choice,,}" in
+      a) echo "METADATA_ONLY"; echo "[INFO] CONTENT=METADATA_ONLY" | say_to_user; return 0 ;;
+      b) echo "ALL";            echo "[INFO] CONTENT=ALL"            | say_to_user; return 0 ;;
+      x) echo "[INFO] Exit chosen." | say_to_user; exit 0 ;;
+      *) echo "Invalid choice. Please select a, b or x." | say_to_user ;;
     esac
-
-    # Password file synchronization
-    sync_password_file || {
-        echo "Password file synchronization failed!"
-        return 1
-    }
-
-    # New standby connection validation
-    validate_standby_connection || {
-        echo "Standby connection validation failed!"
-        echo "Please verify:"
-        echo "1. Standby instance is in NOMOUNT state"
-        echo "2. Password file exists at ${ORACLE_HOME}/dbs/orapw${STANDBY_SID}"
-        echo "3. Static listener configuration is correct"
-        return 1
-    }
-
-    save_config
+  done
 }
 
-# Rest of the functions remain unchanged
-# ... [configure_single, configure_rac, show_config, etc] ...
+# ---------------- Precheck helpers: verify only on the DB that runs the job ---
+precheck_export_directory() {
+  local def_name="${COMMON_DIR_NAME:-DP_DIR}"
+  while true; do
+    read -rp "Export: DIRECTORY object name to use/create on SOURCE [${def_name}]: " dname
+    local dir_name="$(echo "${dname:-$def_name}" | tr '[:lower:]' '[:upper:]')"
+    local default_path="${EXPORT_DIR_PATH:-${NAS_PATH:-}}"
+    local dir_path=""
+    if [[ -z "$default_path" ]]; then
+      echo "Enter absolute OS path on the SOURCE DB server for export dumpfiles (.dmp):" | say_to_user
+      read -rp "Export path: " dir_path
+    else
+      echo "Default export path from conf: ${default_path}" | say_to_user
+      read -rp "Use this export path? [Y to accept, N to enter a different path]: " ans
+      if [[ "${ans^^}" == "N" ]]; then read -rp "Enter export path: " dir_path; else dir_path="$default_path"; fi
+    fi
+    if [[ -z "$dir_path" ]]; then warn "Export path cannot be empty."
+    else
+      create_or_replace_directory "$SRC_EZCONNECT" "$dir_name" "$dir_path" "src"
+      if validate_directory_on_db_try "$SRC_EZCONNECT" "src" "$dir_name"; then
+        ok "SOURCE export DIRECTORY ${dir_name} -> ${dir_path} is ready"
+        EXPORT_DIR_NAME="$dir_name"; EXPORT_DIR_PATH="$dir_path"; return 0
+      fi
+      warn "[DEBUG] run_sql_try(tag_dircheck_src) failed to create/validate export DIRECTORY on source."
+    fi
+    read -rp "Retry export precheck? [Y=retry / B=back / X=exit]: " r
+    case "${r^^}" in Y) continue ;; B) return 1 ;; X) exit 0 ;; *) return 1 ;; esac
+  done
+}
 
-# Start the menu
-show_menu
-# Execute main deployment
-main_deployment
+precheck_import_directory() {
+  local def_name="${COMMON_DIR_NAME:-DP_DIR}"
+  while true; do
+    read -rp "Import: DIRECTORY object name to use/create on TARGET [${def_name}]: " dname
+    local dir_name="$(echo "${dname:-$def_name}" | tr '[:lower:]' '[:upper:]')"
+    echo "Enter absolute OS path on the TARGET DB server for import dumpfiles (.dmp):" | say_to_user
+    read -rp "Import path: " dir_path
+    [[ -z "$dir_path" ]] && { warn "Import path cannot be empty."; }
+    if [[ -n "$dir_path" ]]; then
+      create_or_replace_directory "$TGT_EZCONNECT" "$dir_name" "$dir_path" "tgt"
+      if validate_directory_on_db_try "$TGT_EZCONNECT" "tgt" "$dir_name"; then
+        ok "TARGET import DIRECTORY ${dir_name} -> ${dir_path} is ready"
+        IMPORT_DIR_NAME="$dir_name"; IMPORT_DIR_PATH="$dir_path"; return 0
+      fi
+      warn "[DEBUG] run_sql_try(tag_dircheck_tgt) failed to create/validate import DIRECTORY on target."
+    fi
+    read -rp "Retry import precheck? [Y=retry / B=back / X=exit]: " r
+    case "${r^^}" in Y) continue ;; B) return 1 ;; X) exit 0 ;; *) return 1 ;; esac
+  done
+}
 
-#!/bin/bash
-# File: lib/dg_manager.sh
-CONFIG_FILE="dg_config.cfg"
-source "$CONFIG_FILE" 2>/dev/null
-HTML_REPORT="/tmp/dg_report_$(date +%Y%m%d).html"
+# ------------------- Export/Import dump location prompts ----------------------
+prompt_export_dump_location() {
+  if [[ -n "${EXPORT_DIR_NAME:-}" && -n "${EXPORT_DIR_PATH:-}" ]]; then
+    echo "Export using SOURCE DIRECTORY ${EXPORT_DIR_NAME} -> ${EXPORT_DIR_PATH}" | say_to_user
+    read -rp "Use these? [Y to accept / N to change / X to exit]: " ans
+    case "${ans^^}" in Y) return 0 ;; N) ;; X) exit 0 ;; esac
+  fi
+  precheck_export_directory
+}
 
-# Function: Stop Standby in Mount State
-stop_standby_mount() {
-    if [ "$DG_TYPE" == "single" ]; then
-        ssh "$STANDBY_HOST" <<EOF
-            export ORACLE_SID=$STANDBY_SID
-            sqlplus / as sysdba <<SQL
-                SHUTDOWN IMMEDIATE;
-                STARTUP MOUNT;
-                EXIT;
+prompt_import_dump_location() {
+  if [[ -n "${IMPORT_DIR_NAME:-}" && -n "${IMPORT_DIR_PATH:-}" ]]; then
+    echo "Import using TARGET DIRECTORY ${IMPORT_DIR_NAME} -> ${IMPORT_DIR_PATH}" | say_to_user
+    read -rp "Use these? [Y to accept / N to change / X to exit]: " ans
+    case "${ans^^}" in Y) : ;; N) precheck_import_directory || { warn "Setup cancelled."; return 1; } ;; X) exit 0 ;; esac
+  else
+    precheck_import_directory || { warn "Setup cancelled."; return 1; }
+  fi
+  echo "Enter dumpfile pattern or list (impdp format; e.g., dumpfile%U.dmp or f1.dmp,f2.dmp)" | say_to_user
+  echo "(Tip: just the filename pattern, not a path — DIRECTORY controls the path)" | say_to_user
+  read -rp "Dumpfile(s): " IMPORT_DUMPFILE_PATTERN
+  [[ -z "$IMPORT_DUMPFILE_PATTERN" ]] && { warn "Dumpfile pattern cannot be empty."; return 1; }
+  return 0
+}
+
+# ------------------------------ EXPORT MENUS ----------------------------------
+get_nonmaintained_schemas() {
+  local pred=""
+  if [[ -n "$SKIP_SCHEMAS" ]]; then
+    IFS=',' read -r -a arr <<< "$SKIP_SCHEMAS"
+    for s in "${arr[@]}"; do s="$(echo "$s" | awk '{$1=$1;print}')"; [[ -z "$s" ]] && continue; pred+=" AND UPPER(username) NOT LIKE '${s^^}'"; done
+  fi
+  run_sql_capture "$SRC_EZCONNECT" "
+WITH base AS ( SELECT username FROM dba_users WHERE oracle_maintained='N'${pred} )
+SELECT LISTAGG(username, ',') WITHIN GROUP (ORDER BY username) FROM base
+"
+}
+
+get_nonmaintained_schemas_tgt() {
+  local pred=""
+  if [[ -n "$SKIP_SCHEMAS" ]]; then
+    IFS=',' read -r -a arr <<< "$SKIP_SCHEMAS"
+    for s in "${arr[@]}"; do s="$(echo "$s" | awk '{$1=$1;print}')"; [[ -z "$s" ]] && continue; pred+=" AND UPPER(username) NOT LIKE '${s^^}'"; done
+  fi
+  run_sql_capture "$TGT_EZCONNECT" "
+WITH base AS ( SELECT username FROM dba_users WHERE oracle_maintained='N'${pred} )
+SELECT LISTAGG(username, ',') WITHIN GROUP (ORDER BY username) FROM base
+"
+}
+
+confirm_and_run_expdp() {
+  local tag="$1" dir_name="$2"
+  local pf; pf=$(par_common expdp "$tag" "$dir_name")
+  if show_and_confirm_parfile "$pf" "expdp"; then dp_run expdp "$SRC_EZCONNECT" "$pf" "$tag"; else warn "Export cancelled."; fi
+}
+
+exp_full_menu() {
+  while true; do
+    cat <<'EOS' | say_to_user
+Export FULL (choose content):
+  1) metadata_only  (CONTENT=METADATA_ONLY)
+  2) full           (CONTENT=ALL)
+  3) Back
+  X) Exit
+EOS
+    read -rp "Choose: " c
+    case "$c" in
+      1) prompt_export_dump_location || { warn "Setup cancelled."; continue; }
+         pf=$(par_common expdp "exp_full_meta" "$EXPORT_DIR_NAME")
+         { echo "full=Y"; echo "content=METADATA_ONLY"; } >> "$pf"
+         show_and_confirm_parfile "$pf" "expdp" && dp_run expdp "$SRC_EZCONNECT" "$pf" "exp_full_meta"
+         ;;
+      2) prompt_export_dump_location || { warn "Setup cancelled."; continue; }
+         pf=$(par_common expdp "exp_full_all" "$EXPORT_DIR_NAME")
+         { echo "full=Y"; echo "content=ALL"; } >> "$pf"
+         show_and_confirm_parfile "$pf" "expdp" && dp_run expdp "$SRC_EZCONNECT" "$pf" "exp_full_all"
+         ;;
+      3) break ;;
+      X|x) exit 0 ;;
+      *) warn "Invalid choice" ;;
+    esac
+  done
+}
+
+exp_schemas_menu() {
+  while true; do
+    cat <<'EOS' | say_to_user
+Export SCHEMAS:
+  1) All accounts (exclude Oracle-maintained; honors SKIP_SCHEMAS)
+  2) User input or value from conf (SCHEMAS_LIST_EXP) with confirmation
+  3) Back
+  X) Exit
+EOS
+    read -rp "Choose: " c
+    case "$c" in
+      1)
+        prompt_export_dump_location || { warn "Setup cancelled."; continue; }
+        schemas="$(get_nonmaintained_schemas)"
+        schemas="$(confirm_edit_value "Schemas (comma-separated)" "$schemas")"
+        content_choice="$(choose_content_option)"
+        echo "[INFO] Final Schemas: ${schemas}" | say_to_user
+        echo "[INFO] Final CONTENT: ${content_choice}" | say_to_user
+        pf=$(par_common expdp "exp_schemas_auto" "$EXPORT_DIR_NAME")
+        { echo "schemas=${schemas}"; echo "content=${content_choice}"; } >> "$pf"
+        show_and_confirm_parfile "$pf" "expdp" && dp_run expdp "$SRC_EZCONNECT" "$pf" "exp_schemas_auto"
+        ;;
+      2)
+        prompt_export_dump_location || { warn "Setup cancelled."; continue; }
+        init="${SCHEMAS_LIST_EXP:-}"
+        [[ -z "$init" ]] && read -rp "Enter schemas (comma-separated): " init
+        schemas="$(confirm_edit_value "Schemas (comma-separated)" "$init")"
+        content_choice="$(choose_content_option)"
+        echo "[INFO] Final Schemas: ${schemas}" | say_to_user
+        echo "[INFO] Final CONTENT: ${content_choice}" | say_to_user
+        pf=$(par_common expdp "exp_schemas_user" "$EXPORT_DIR_NAME")
+        { echo "schemas=${schemas}"; echo "content=${content_choice}"; } >> "$pf"
+        show_and_confirm_parfile "$pf" "expdp" && dp_run expdp "$SRC_EZCONNECT" "$pf" "exp_schemas_user"
+        ;;
+      3) break ;;
+      X|x) exit 0 ;;
+      *) warn "Invalid choice" ;;
+    esac
+  done
+}
+
+exp_tablespaces() {
+  prompt_export_dump_location || { warn "Setup cancelled."; return; }
+  read -rp "Tablespaces (comma-separated): " tbs
+  pf=$(par_common expdp "exp_tbs" "$EXPORT_DIR_NAME")
+  echo "transport_tablespaces=${tbs}" >> "$pf"
+  show_and_confirm_parfile "$pf" "expdp" && dp_run expdp "$SRC_EZCONNECT" "$pf" "exp_tbs"
+}
+
+exp_tables() {
+  prompt_export_dump_location || { warn "Setup cancelled."; return; }
+  read -rp "Tables (SCHEMA.TAB,SCHEMA2.TAB2,...): " tabs
+  pf=$(par_common expdp "exp_tables" "$EXPORT_DIR_NAME")
+  echo "tables=${tabs}" >> "$pf"
+  show_and_confirm_parfile "$pf" "expdp" && dp_run expdp "$SRC_EZCONNECT" "$pf" "exp_tables"
+}
+
+export_menu() {
+  while true; do
+    cat <<'EOS' | say_to_user
+Export Menu:
+  1) FULL database (metadata_only / full)
+  2) SCHEMAS      (all non-maintained / user|conf) with content selector
+  3) TABLESPACES  (transport)
+  4) TABLES
+  5) Back
+  X) Exit
+EOS
+    read -rp "Choose: " c
+    case "$c" in
+      1) exp_full_menu ;;
+      2) exp_schemas_menu ;;
+      3) exp_tablespaces ;;
+      4) exp_tables ;;
+      5) break ;;
+      X|x) exit 0 ;;
+      *) warn "Invalid choice" ;;
+    esac
+  done
+}
+
+# ------------------------------ IMPORT HELPERS --------------------------------
+par_common_imp_with_dump() {
+  local tag="$1"
+  local pf_dir; pf_dir="$(parfile_dir_for_mode impdp)"
+  mkdir -p "$pf_dir" || true
+  local pf="${pf_dir}/${tag}_${RUN_ID}.par"
+  debug "Creating impdp parfile: ${pf}"
+  local server_log="$(basename_safe "${DUMPFILE_PREFIX}_${tag}_${RUN_ID}.log")"
+  local cleaned_pattern; cleaned_pattern="$(reject_if_pathlike "${IMPORT_DUMPFILE_PATTERN}")"
+  {
+    echo "directory=${IMPORT_DIR_NAME}"
+    echo "dumpfile=${cleaned_pattern}"
+    echo "logfile=${server_log}"
+    echo "logtime=all"
+    echo "parallel=${PARALLEL}"
+    echo "table_exists_action=${TABLE_EXISTS_ACTION}"
+    [[ -n "$REMAP_SCHEMA"     ]] && echo "remap_schema=${REMAP_SCHEMA}"
+    [[ -n "$REMAP_TABLESPACE" ]] && echo "remap_tablespace=${REMAP_TABLESPACE}"
+    [[ -n "$INCLUDE"          ]] && echo "include=${INCLUDE}"
+    [[ -n "$EXCLUDE"          ]] && echo "exclude=${EXCLUDE}"
+    [[ -n "$ENCRYPTION_PASSWORD" ]] && echo "encryption_password=${ENCRYPTION_PASSWORD}"
+    [[ -n "$IMPDP_TRACE"      ]] && echo "trace=${IMPDP_TRACE}"
+  } > "$pf"
+  echo "$pf"
+}
+
+imp_full_menu() {
+  while true; do
+    cat <<'EOS' | say_to_user
+Import FULL (choose content):
+  1) metadata_only  (CONTENT=METADATA_ONLY)
+  2) full           (CONTENT=ALL)
+  3) Back
+  X) Exit
+EOS
+    read -rp "Choose: " c
+    case "$c" in
+      1) prompt_import_dump_location || { warn "Setup cancelled."; continue; }
+         pf=$(par_common_imp_with_dump "imp_full_meta"); { echo "full=Y"; echo "content=METADATA_ONLY"; } >> "$pf"
+         show_and_confirm_parfile "$pf" "impdp" && dp_run impdp "$TGT_EZCONNECT" "$pf" "imp_full_meta"
+         ;;
+      2) prompt_import_dump_location || { warn "Setup cancelled."; continue; }
+         pf=$(par_common_imp_with_dump "imp_full_all");  { echo "full=Y"; echo "content=ALL"; } >> "$pf"
+         show_and_confirm_parfile "$pf" "impdp" && dp_run impdp "$TGT_EZCONNECT" "$pf" "imp_full_all"
+         ;;
+      3) break ;;
+      X|x) exit 0 ;;
+      *) warn "Invalid choice" ;;
+    esac
+  done
+}
+
+imp_schemas_menu() {
+  while true; do
+    cat <<'EOS' | say_to_user
+Import SCHEMAS:
+  1) All accounts (exclude Oracle-maintained; honors SKIP_SCHEMAS)
+  2) User input or value from conf (SCHEMAS_LIST_IMP / SCHEMAS_LIST_EXP) with confirmation
+  3) Back
+  X) Exit
+EOS
+    read -rp "Choose: " c
+    case "$c" in
+      1)
+        prompt_import_dump_location || { warn "Setup cancelled."; continue; }
+        schemas="$(get_nonmaintained_schemas_tgt)"
+        schemas="$(confirm_edit_value "Schemas to import (comma-separated)" "$schemas")"
+        echo "[INFO] Final Schemas to import: ${schemas}" | say_to_user
+        pf=$(par_common_imp_with_dump "imp_schemas_auto"); { echo "schemas=${schemas}"; echo "content=ALL"; } >> "$pf"
+        show_and_confirm_parfile "$pf" "impdp" && dp_run impdp "$TGT_EZCONNECT" "$pf" "imp_schemas_auto"
+        ;;
+      2)
+        prompt_import_dump_location || { warn "Setup cancelled."; continue; }
+        init="${SCHEMAS_LIST_IMP:-${SCHEMAS_LIST_EXP:-}}"
+        [[ -z "$init" ]] && read -rp "Enter schemas (comma-separated): " init
+        schemas="$(confirm_edit_value "Schemas to import (comma-separated)" "$init")"
+        echo "[INFO] Final Schemas to import: ${schemas}" | say_to_user
+        pf=$(par_common_imp_with_dump "imp_schemas_user"); { echo "schemas=${schemas}"; echo "content=ALL"; } >> "$pf"
+        show_and_confirm_parfile "$pf" "impdp" && dp_run impdp "$TGT_EZCONNECT" "$pf" "imp_schemas_user"
+        ;;
+      3) break ;;
+      X|x) exit 0 ;;
+      *) warn "Invalid choice" ;;
+    esac
+  done
+}
+
+imp_tablespaces() {
+  prompt_import_dump_location || { warn "Setup cancelled."; return; }
+  read -rp "Transported tablespaces (comma-separated): " tbs
+  pf=$(par_common_imp_with_dump "imp_tbs")
+  echo "transport_tablespaces=${tbs}" >> "$pf"
+  show_and_confirm_parfile "$pf" "impdp" && dp_run impdp "$TGT_EZCONNECT" "$pf" "imp_tbs"
+}
+
+imp_tables() {
+  prompt_import_dump_location || { warn "Setup cancelled."; return; }
+  read -rp "Tables (SCHEMA.TAB,SCHEMA2.TAB2,...): " tabs
+  pf=$(par_common_imp_with_dump "imp_tables")
+  echo "tables=${tabs}" >> "$pf"
+  show_and_confirm_parfile "$pf" "impdp" && dp_run impdp "$TGT_EZCONNECT" "$pf" "imp_tables"
+}
+
+import_cleanup_menu() {
+  while true; do
+    cat <<EOS | say_to_user
+Import Cleanup (TARGET) - DANGEROUS  $( [[ "${DRY_RUN_ONLY^^}" == "Y" ]] && echo "[DRY_RUN_ONLY=Y]" )
+  1) Drop ALL users CASCADE (exclude Oracle-maintained; honors SKIP_SCHEMAS)
+  2) Drop ALL objects of ALL users (exclude Oracle-maintained; honors SKIP_SCHEMAS) [users kept]
+  3) Drop users CASCADE listed in imp schemas (SCHEMAS_LIST_IMP/SCHEMAS_LIST_EXP)
+  4) Drop ALL objects of users listed in imp schemas [users kept]
+  5) Back
+  X) Exit
+EOS
+    read -rp "Choose: " c
+    case "$c" in
+      1) drop_users_cascade_all_nonmaint ;;
+      2) drop_objects_all_nonmaint ;;
+      3) drop_users_cascade_listed ;;
+      4) drop_objects_listed ;;
+      5) break ;;
+      X|x) exit 0 ;;
+      *) warn "Invalid choice" ;;
+    esac
+  done
+}
+
+# ------------------------------ DDL Extraction (subset) -----------------------
+ddl_spool() {
+  local out="$1"; shift
+  local body="$*"
+  local conn="sys/${SYS_PASSWORD}@${SRC_EZCONNECT} as sysdba"
+  debug "DDL spool -> ${out}"
+  sqlplus -s "$conn" <<SQL >"$out" 2>"${out}.log"
+SET LONG 1000000 LONGCHUNKSIZE 1000000 LINES 32767 PAGES 0 TRIMSPOOL ON TRIMOUT ON FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+SET DEFINE OFF
+BEGIN
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE',            FALSE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'CONSTRAINTS',        TRUE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'REF_CONSTRAINTS',    TRUE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'OID',                FALSE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SQLTERMINATOR',      TRUE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'PRETTY',             TRUE);
+END;
+/
+${body}
+EXIT
 SQL
-EOF
-    elif [ "$DG_TYPE" == "rac" ]; then
-        for node in "${STANDBY_RAC_HOSTS[@]}"; do
-            ssh "$node" <<EOF
-                srvctl stop database -db $RAC_DB_NAME
-                srvctl start database -db $RAC_DB_NAME -startoption mount
-EOF
-        done
-    fi
+  if grep -qi "ORA-" "${out}.log"; then
+    err "DDL extract error in $(basename "$out")"
+    tail -n 50 "${out}.log" | mask_pwd | sed 's/^/  /'
+    return 1
+  fi
+  ok "DDL file created: $out"
 }
 
-# Function: Setup RAC using srvctl
-setup_rac_srvctl() {
-    if [ "$DG_TYPE" == "rac" ]; then
-        # Add Database to Cluster
-        ssh "${STANDBY_RAC_HOSTS[0]}" <<EOF
-            srvctl add database -db $RAC_DB_NAME \
-                -oraclehome $ORACLE_HOME \
-                -dbtype PHYSICAL_STANDBY \
-                -dbname $RAC_DB_NAME \
-                -spfile "+$DATA_DG/$RAC_DB_NAME/spfile$RAC_DB_NAME.ora"
-            
-            # Add Instances
-            node_num=1
-            for node in "${STANDBY_RAC_HOSTS[@]}"; do
-                srvctl add instance -db $RAC_DB_NAME \
-                    -instance "${RAC_INSTANCE_PREFIX}\${node_num}" \
-                    -node "$node"
-                ((node_num++))
-            done
-            
-            srvctl config database -db $RAC_DB_NAME
-EOF
-    fi
+ddl_users() { local f="${DDL_DIR}/01_users_${RUN_ID}.sql"; ddl_spool "$f" "
+SELECT DBMS_METADATA.GET_DDL('USER', username)
+FROM dba_users
+WHERE oracle_maintained = 'N'
+ORDER BY username;
+"; }
+
+ddl_profiles() { local f="${DDL_DIR}/02_profiles_${RUN_ID}.sql"; ddl_spool "$f" "
+SELECT DBMS_METADATA.GET_DDL('PROFILE', profile)
+FROM (SELECT DISTINCT profile FROM dba_profiles ORDER BY 1);
+"; }
+
+ddl_roles() { local f="${DDL_DIR}/03_roles_${RUN_ID}.sql"; ddl_spool "$f" "
+SELECT DBMS_METADATA.GET_DDL('ROLE', role)
+FROM dba_roles
+WHERE NVL(oracle_maintained,'N')='N'
+ORDER BY role;
+"; }
+
+ddl_privs_to_roles() { local f="${DDL_DIR}/04_sys_and_role_grants_${RUN_ID}.sql"; ddl_spool "$f" "
+SELECT 'GRANT '||privilege||' TO '||grantee||CASE WHEN admin_option='YES' THEN ' WITH ADMIN OPTION' ELSE '' END||';'
+FROM dba_sys_privs
+WHERE grantee NOT IN (SELECT username FROM dba_users WHERE oracle_maintained='Y')
+  AND grantee NOT IN (SELECT role FROM dba_roles WHERE oracle_maintained='Y')
+UNION ALL
+SELECT 'GRANT '||granted_role||' TO '||grantee||CASE WHEN admin_option='YES' THEN ' WITH ADMIN OPTION' ELSE '' END||';'
+FROM dba_role_privs
+WHERE grantee NOT IN (SELECT username FROM dba_users WHERE oracle_maintained='Y')
+  AND granted_role NOT IN (SELECT role FROM dba_roles WHERE oracle_maintained='Y')
+ORDER BY 1;
+"; }
+
+ddl_sysprivs_to_users() { local f="${DDL_DIR}/05_user_obj_privs_${RUN_ID}.sql"; ddl_spool "$f" "
+WITH src AS (
+  SELECT grantee, owner, table_name, privilege, grantable, grantor
+  FROM dba_tab_privs
+  WHERE grantee <> 'PUBLIC'
+    AND grantee NOT IN (SELECT username FROM dba_users WHERE oracle_maintained='Y')
+    AND grantee NOT IN (SELECT role FROM dba_roles WHERE oracle_maintained='Y')
+    AND grantee NOT LIKE 'C##%'
+)
+SELECT 'GRANT '||privilege||' ON '||owner||'.\"'||table_name||'\" TO '||grantee||
+       DECODE(grantable,'YES',' WITH GRANT OPTION','')||' /* grantor '||grantor||' */;'
+FROM src
+ORDER BY grantee, owner, table_name, privilege;
+"; }
+
+ddl_sequences_all_users() { local f="${DDL_DIR}/06_sequences_${RUN_ID}.sql"; ddl_spool "$f" "
+SELECT DBMS_METADATA.GET_DDL('SEQUENCE', sequence_name, owner)
+FROM dba_sequences
+WHERE owner IN (SELECT username FROM dba_users WHERE oracle_maintained='N')
+ORDER BY owner, sequence_name;
+"; }
+
+ddl_public_synonyms() { local f="${DDL_DIR}/07_public_synonyms_${RUN_ID}.sql"; ddl_spool "$f" "
+SELECT DBMS_METADATA.GET_DDL('SYNONYM', synonym_name, 'PUBLIC')
+FROM dba_synonyms
+WHERE owner='PUBLIC'
+ORDER BY synonym_name;
+"; }
+
+ddl_private_synonyms_all_users() { local f="${DDL_DIR}/08_private_synonyms_${RUN_ID}.sql"; ddl_spool "$f" "
+SELECT DBMS_METADATA.GET_DDL('SYNONYM', synonym_name, owner)
+FROM dba_synonyms
+WHERE owner <> 'PUBLIC'
+  AND owner IN (SELECT username FROM dba_users WHERE oracle_maintained='N')
+ORDER BY owner, synonym_name;
+"; }
+
+to_inlist_upper() {
+  local csv="$1" out="" tok
+  IFS=',' read -r -a arr <<< "$csv"
+  for tok in "${arr[@]}"; do tok="$(echo "$tok" | awk '{$1=$1;print}')"; [[ -z "$tok" ]] && continue; tok="${tok^^}"; out+="${out:+,}'${tok}'"; done
+  printf "%s" "$out"
 }
 
-# Function: Configure Data Guard Broker
-configure_dgmgrl() {
-    dgmgrl_cmds="/tmp/dgmgrl_cmds_$$.txt"
-    cat <<DGMGRL > "$dgmgrl_cmds"
-        CREATE CONFIGURATION DG_${DB_NAME} AS PRIMARY DATABASE IS ${DB_NAME} CONNECT IDENTIFIER IS ${PRIMARY_HOST};
-        ADD DATABASE ${DB_NAME}_STBY AS CONNECT IDENTIFIER IS ${STANDBY_HOST} MAINTAINED AS PHYSICAL;
-        ENABLE CONFIGURATION;
-        SHOW CONFIGURATION;
-DGMGRL
+ddl_all_ddls_all_users() {
+  local f="${DDL_DIR}/09_all_ddls_${RUN_ID}.sql"
+  local types_clause; types_clause="$(to_inlist_upper "TABLE,INDEX,VIEW,SEQUENCE,TRIGGER,FUNCTION,PROCEDURE,PACKAGE,PACKAGE_BODY,MATERIALIZED_VIEW,TYPE,SYNONYM")"
+  ddl_spool "$f" "
+WITH owners AS ( SELECT username AS owner FROM dba_users WHERE oracle_maintained='N' ),
+objs AS (
+  SELECT owner, object_type, object_name
+  FROM dba_objects
+  WHERE owner IN (SELECT owner FROM owners)
+    AND object_type IN (${types_clause})
+    AND object_name NOT LIKE 'BIN$%%'
+    AND temporary='N'
+)
+SELECT DBMS_METADATA.GET_DDL(object_type, object_name, owner)
+FROM objs
+ORDER BY owner, object_type, object_name;
+"; }
 
-    dgmgrl sys/$SYS_PASSWORD@$PRIMARY_HOST <<EOF
-        @$dgmgrl_cmds
-EOF
-    rm -f "$dgmgrl_cmds"
+ddl_tablespaces() {
+  local f="${DDL_DIR}/10_tablespaces_${RUN_ID}.sql"
+  local skip_clause; skip_clause="$(to_inlist_upper "$SKIP_TABLESPACES")"
+  ddl_spool "$f" "
+SELECT DBMS_METADATA.GET_DDL('TABLESPACE', tablespace_name)
+FROM dba_tablespaces
+WHERE UPPER(tablespace_name) NOT IN (${skip_clause})
+ORDER BY tablespace_name;
+"; }
+
+ddl_role_grants_to_users() { local f="${DDL_DIR}/11_role_grants_to_users_${RUN_ID}.sql"; ddl_spool "$f" "
+WITH u AS (SELECT username FROM dba_users WHERE oracle_maintained='N'),
+r AS (
+  SELECT grantee AS username, LISTAGG(role, ',') WITHIN GROUP (ORDER BY role) AS roles
+  FROM (
+    SELECT grantee, granted_role AS role
+    FROM dba_role_privs
+    WHERE default_role='YES'
+  )
+  GROUP BY grantee
+)
+SELECT 'ALTER USER '||username||' DEFAULT ROLE '||NVL(roles, 'ALL')||';'
+FROM u LEFT JOIN r USING (username)
+ORDER BY username;
+"; }
+
+ddl_directories() { local f="${DDL_DIR}/13_directories_${RUN_ID}.sql"; ddl_spool "$f" "
+SELECT DBMS_METADATA.GET_DDL('DIRECTORY', directory_name)
+FROM (SELECT DISTINCT directory_name FROM dba_directories ORDER BY 1);
+"; }
+
+ddl_db_links_by_owner() {
+  read -rp "Enter owner for DB links (schema name): " owner
+  owner="${owner^^}"
+  local f="${DDL_DIR}/14_db_links_${owner}_${RUN_ID}.sql"
+  ddl_spool "$f" "
+SELECT DBMS_METADATA.GET_DDL('DB_LINK', db_link, owner)
+FROM dba_db_links
+WHERE owner = UPPER('${owner}')
+ORDER BY db_link;
+"
+  warn "Note: DB link passwords may be masked/omitted depending on version/security."
 }
 
-# Function: Generate HTML Report
-generate_html_report() {
-    cat <<HTML > "$HTML_REPORT"
-<html>
-<head>
-<style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-    th { background-color: #4CAF50; color: white; }
-    .success { background-color: #dff0d8; }
-    .error { background-color: #f2dede; }
-</style>
-</head>
-<body>
-    <h2>Data Guard Deployment Report</h2>
-    <p>Generated: $(date)</p>
-    <table>
-        <tr><th>Step</th><th>Status</th><th>Details</th></tr>
-HTML
-
-    # Add report entries from log file
-    while read -r line; do
-        echo "<tr><td>${line%%|*}</td><td>${line#*|}</td><td>${line##*|}</td></tr>" >> "$HTML_REPORT"
-    done < /tmp/dg_deploy.log
-
-    cat <<HTML >> "$HTML_REPORT"
-    </table>
-</body>
-</html>
-HTML
+ddl_menu_wrapper() {
+  while true; do
+    cat <<'EOS' | say_to_user
+DDL Extraction (Source DB):
+  1) USERS (exclude Oracle-maintained)
+  2) PROFILES
+  3) ROLES (exclude Oracle-maintained)
+  4) PRIVILEGES -> ROLES   [system + role grants]
+  5) OBJECT PRIVS -> USERS [from DBA_TAB_PRIVS]
+  6) SEQUENCES for USERS (exclude Oracle-maintained)
+  7) PUBLIC SYNONYMS
+  8) PRIVATE SYNONYMS for USERS (exclude Oracle-maintained)
+  9) ALL OBJECT DDLs for USERS (exclude Oracle-maintained) [heavy]
+ 10) TABLESPACE DDLs (skip system/temp/undo)
+ 11) DEFAULT ROLES per USER (ALTER USER DEFAULT ROLE ...)
+ 12) DIRECTORY OBJECTS
+ 13) DB LINKS by OWNER (prompt)
+  B) Back
+  X) Exit
+EOS
+    read -rp "Choose: " c
+    case "${c^^}" in
+      1) ddl_users ;; 2) ddl_profiles ;; 3) ddl_roles ;; 4) ddl_privs_to_roles ;;
+      5) ddl_sysprivs_to_users ;; 6) ddl_sequences_all_users ;; 7) ddl_public_synonyms ;;
+      8) ddl_private_synonyms_all_users ;; 9) ddl_all_ddls_all_users ;; 10) ddl_tablespaces ;;
+      11) ddl_role_grants_to_users ;; 12) ddl_directories ;; 13) ddl_db_links_by_owner ;;
+      B) break ;; X) exit 0 ;; * ) warn "Invalid choice" ;;
+    esac
+  done
 }
 
-# Function: Send Email Report
-send_email_report() {
-    local recipient=$(whoami)@example.com  # Set your email
-    local subject="Data Guard Deployment Report - $DB_NAME"
-    
-    mailx -s "$subject" -a "Content-type: text/html" "$recipient" <<EOF
-$(cat $HTML_REPORT)
-EOF
+# ----------------------- COMPARE (LOCAL/Jumper) -------------------------------
+ensure_local_dir() { mkdir -p "$1" || { echo "Cannot create $1"; exit 1; }; }
+normalize_sorted() { local in="$1" out="$2"; if [[ -f "$in" ]]; then tr -d '\r' < "$in" | awk 'NF' | sort -u > "$out"; else : > "$out"; fi; }
+
+emit_set_delta_html() {
+  local title="$1" left_csv="$2" right_csv="$3" html="$4"
+  local L R; L="$(mktemp)"; R="$(mktemp)"
+  normalize_sorted "$left_csv"  "$L"; normalize_sorted "$right_csv" "$R"
+  echo "<h3>${title}</h3>" >> "$html"
+  echo "<table><tr><th>Only in Source</th><th>Only in Target</th></tr><tr><td valign='top'><pre>" >> "$html"
+  comm -23 "$L" "$R" | sed 's/&/\&amp;/g;s/</\&lt;/g' >> "$html"
+  echo "</pre></td><td valign='top'><pre>" >> "$html"
+  comm -13 "$L" "$R" | sed 's/&/\&amp;/g;s/</\&lt;/g' >> "$html"
+  echo "</pre></td></tr></table>" >> "$html"
+  rm -f "$L" "$R"
 }
 
-# Main Deployment Workflow
-main_deployment() {
-    >/tmp/dg_deploy.log  # Initialize log file
-    
-    # 1. Stop Standby in Mount State
-    if stop_standby_mount >>/tmp/dg_deploy.log 2>&1; then
-        echo "Mount Stage|Success|Standby successfully mounted" >>/tmp/dg_deploy.log
-    else
-        echo "Mount Stage|Failed|Error mounting standby" >>/tmp/dg_deploy.log
-        return 1
-    fi
-    
-    # 2. Setup RAC (if applicable)
-    if [ "$DG_TYPE" == "rac" ]; then
-        if setup_rac_srvctl >>/tmp/dg_deploy.log 2>&1; then
-            echo "RAC Setup|Success|Cluster configuration completed" >>/tmp/dg_deploy.log
-        else
-            echo "RAC Setup|Failed|Error configuring RAC" >>/tmp/dg_deploy.log
-            return 1
-        fi
-    fi
-    
-    # 3. Configure Data Guard Broker
-    if configure_dgmgrl >>/tmp/dg_deploy.log 2>&1; then
-        echo "Broker Config|Success|DGMGRL configuration applied" >>/tmp/dg_deploy.log
-    else
-        echo "Broker Config|Failed|Error in broker configuration" >>/tmp/dg_deploy.log
-        return 1
-    fi
-    
-    # Generate and send report
-    generate_html_report
-    send_email_report
+emit_rowcount_delta_html() {
+  local title="$1" left_csv="$2" right_csv="$3" html="$4"
+  local L R; L="$(mktemp)"; R="$(mktemp)"
+  normalize_sorted "$left_csv"  "$L"; normalize_sorted "$right_csv" "$R"
+  echo "<h3>${title}</h3><table><tr><th>Table</th><th>Source</th><th>Target</th><th>Delta</th></tr>" >> "$html"
+  awk -F'|' '
+    NR==FNR { l[$1]=$2; next }
+    { r[$1]=$2 }
+    END{
+      for (k in l) keys[k]=1
+      for (k in r) keys[k]=1
+      PROCINFO["sorted_in"]="@ind_str_asc"
+      for (k in keys){
+        ls=(k in l)?l[k]:""; rs=(k in r)?r[k]:""
+        delta="SAME"
+        if (ls=="" && rs!="") delta="ONLY_IN_TARGET"
+        else if (ls!="" && rs=="") delta="ONLY_IN_SOURCE"
+        else if (ls!=rs) delta="DIFF"
+        if (delta!="SAME"){
+          gsub(/&/,"\\&amp;",k); gsub(/</,"\\&lt;",k)
+          gsub(/&/,"\\&amp;",ls); gsub(/</,"\\&lt;",ls)
+          gsub(/&/,"\\&amp;",rs); gsub(/</,"\\&lt;",rs)
+          printf("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n", k, ls, rs, delta)
+        }
+      }
+    }' "$L" "$R" >> "$html"
+  echo "</table>" >> "$html"
+  rm -f "$L" "$R"
 }
 
-# Execute main deployment
-main_deployment
+snapshot_objects_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_objects_local(${who}, ${schema}) -> ${out}"
+  run_sql_spool_local "$ez" "snap_${who}_objects_${schema}" "$out" "
+SET COLSEP '|'
+SELECT object_type||'|'||object_name||'|'||status
+FROM dba_objects
+WHERE owner=UPPER('${schema}')
+  AND temporary='N'
+  AND object_name NOT LIKE 'BIN$%'
+ORDER BY object_type, object_name;
+"
+}
+
+snapshot_rowcounts_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_rowcounts_local(${who}, ${schema}) -> ${out} (exact=${EXACT_ROWCOUNT})"
+  if [[ "${EXACT_ROWCOUNT^^}" == "Y" ]]; then
+    run_sql_spool_local "$ez" "snap_${who}_rowcnt_exact_${schema}" "$out" "
+SET SERVEROUTPUT ON SIZE UNLIMITED
+DECLARE v_cnt NUMBER;
+BEGIN
+  FOR t IN (SELECT table_name FROM dba_tables WHERE owner=UPPER('${schema}') ORDER BY table_name) LOOP
+    BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(1) FROM '||UPPER('${schema}')||'.\"'||t.table_name||'\"' INTO v_cnt;
+         DBMS_OUTPUT.PUT_LINE(t.table_name||'|'||v_cnt);
+    EXCEPTION WHEN OTHERS THEN DBMS_OUTPUT.PUT_LINE(t.table_name||'|#ERR#'); END;
+  END LOOP;
+END;
+/
+"
+  else
+    run_sql_spool_local "$ez" "snap_${who}_rowcnt_stats_${schema}" "$out" "
+SET COLSEP '|'
+SELECT t.table_name||'|'||NVL(s.num_rows,-1)
+FROM dba_tables t
+LEFT JOIN dba_tab_statistics s
+  ON s.owner=t.owner AND s.table_name=t.table_name AND s.object_type='TABLE'
+WHERE t.owner=UPPER('${schema}')
+ORDER BY t.table_name;
+"
+  fi
+}
+
+snapshot_sys_privs_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_sys_privs_local(${who}, ${schema}) -> ${out}"
+  run_sql_spool_local "$ez" "snap_${who}_sysprivs_${schema}" "$out" "
+SET COLSEP '|'
+SELECT privilege||'|'||admin_option
+FROM dba_sys_privs
+WHERE grantee=UPPER('${schema}')
+ORDER BY privilege;
+"
+}
+
+snapshot_role_privs_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_role_privs_local(${who}, ${schema}) -> ${out}"
+  run_sql_spool_local "$ez" "snap_${who}_roleprivs_${schema}" "$out" "
+SET COLSEP '|'
+SELECT granted_role||'|'||admin_option||'|'||default_role
+FROM dba_role_privs
+WHERE grantee=UPPER('${schema}')
+ORDER BY granted_role;
+"
+}
+
+snapshot_tabprivs_on_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_tabprivs_on_local(${who}, ${schema}) -> ${out}"
+  run_sql_spool_local "$ez" "snap_${who}_tabprivs_on_${schema}" "$out" "
+SET COLSEP '|'
+SELECT owner||'|'||table_name||'|'||grantee||'|'||privilege||'|'||grantable||'|'||grantor
+FROM dba_tab_privs
+WHERE owner=UPPER('${schema}') AND grantee <> 'PUBLIC'
+ORDER BY owner, table_name, grantee, privilege;
+"
+}
+
+snapshot_tabprivs_to_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_tabprivs_to_local(${who}, ${schema}) -> ${out}"
+  run_sql_spool_local "$ez" "snap_${who}_tabprivs_to_${schema}" "$out" "
+SET COLSEP '|'
+SELECT owner||'|'||table_name||'|'||grantee||'|'||privilege||'|'||grantable||'|'||grantor
+FROM dba_tab_privs
+WHERE grantee=UPPER('${schema}')
+ORDER BY owner, table_name, privilege;
+"
+}
+
+snapshot_invalid_objects_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_invalid_objects_local(${who}, ${schema}) -> ${out}"
+  run_sql_spool_local "$ez" "snap_${who}_invalid_${schema}" "$out" "
+SET COLSEP '|'
+SELECT object_type||'|'||object_name
+FROM dba_objects
+WHERE owner=UPPER('${schema}') AND status<>'VALID' AND object_name NOT LIKE 'BIN$%'
+ORDER BY object_type, object_name;
+"
+}
+
+snapshot_unusable_indexes_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_unusable_indexes_local(${who}, ${schema}) -> ${out}"
+  run_sql_spool_local "$ez" "snap_${who}_unusable_idx_${schema}" "$out" "
+SET COLSEP '|'
+SELECT index_name||'|'||table_name
+FROM dba_indexes
+WHERE owner=UPPER('${schema}') AND status='UNUSABLE'
+ORDER BY index_name;
+"
+}
+
+snapshot_disabled_constraints_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_disabled_constraints_local(${who}, ${schema}) -> ${out}"
+  run_sql_spool_local "$ez" "snap_${who}_disabled_cons_${schema}" "$out" "
+SET COLSEP '|'
+SELECT constraint_type||'|'||constraint_name||'|'||table_name
+FROM dba_constraints
+WHERE owner=UPPER('${schema}') AND status='DISABLED'
+ORDER BY constraint_type, constraint_name;
+"
+}
+
+cap_db_version()       { local ez="$1"; run_sql_capture "$ez" "SELECT banner FROM v\\$version WHERE banner LIKE 'Oracle Database%'"; }
+cap_db_patchlevel()    { local ez="$1"; run_sql_capture "$ez" "SELECT NVL(MAX(version||' '||REGEXP_REPLACE(description,' Patch','')), 'N/A') FROM dba_registry_sqlpatch WHERE action='APPLY' AND status='SUCCESS'"; }
+cap_db_charsets()      { local ez="$1"; run_sql_capture "$ez" "SELECT LISTAGG(parameter||'='||value, ', ') WITHIN GROUP (ORDER BY parameter) FROM nls_database_parameters WHERE parameter IN ('NLS_CHARACTERSET','NLS_NCHAR_CHARACTERSET')"; }
+cap_total_objects()    { local ez="$1" schema="${2^^}"; run_sql_capture "$ez" "SELECT COUNT(*) FROM dba_objects WHERE owner=UPPER('${schema}') AND temporary='N' AND object_name NOT LIKE 'BIN$%'"; }
+cap_invalid_objects()  { local ez="$1" schema="${2^^}"; run_sql_capture "$ez" "SELECT COUNT(*) FROM dba_objects WHERE owner=UPPER('${schema}') AND status<>'VALID'"; }
+
+compare_one_schema_local() { local schema="${1^^}"
+  debug "compare_one_schema_local: START schema=${schema}"
+  ensure_local_dir "$LOCAL_COMPARE_DIR"
+  local S="${LOCAL_COMPARE_DIR}"
+
+  debug "Header capture: versions/patch/charsets/totals/invalids"
+  local src_ver tgt_ver src_patch tgt_patch src_cs tgt_cs
+  src_ver="$(cap_db_version "$SRC_EZCONNECT" || true)"; tgt_ver="$(cap_db_version "$TGT_EZCONNECT" || true)"
+  src_patch="$(cap_db_patchlevel "$SRC_EZCONNECT" || true)"; tgt_patch="$(cap_db_patchlevel "$TGT_EZCONNECT" || true)"
+  src_cs="$(cap_db_charsets "$SRC_EZCONNECT" || true)"; tgt_cs="$(cap_db_charsets "$TGT_EZCONNECT" || true)"
+  local src_tot tgt_tot src_inv tgt_inv
+  src_tot="$(cap_total_objects "$SRC_EZCONNECT" "$schema" || true)"; tgt_tot="$(cap_total_objects "$TGT_EZCONNECT" "$schema" || true)"
+  src_inv="$(cap_invalid_objects "$SRC_EZCONNECT" "$schema" || true)"; tgt_inv="$(cap_invalid_objects "$TGT_EZCONNECT" "$schema" || true)"
+  [[ -z "$src_tot" ]] && src_tot="0"; [[ -z "$tgt_tot" ]] && tgt_tot="0"
+  [[ -z "$src_inv" ]] && src_inv="0"; [[ -z "$tgt_inv" ]] && tgt_inv="0"
+  local tot_match inv_match
+  tot_match=$([[ "$src_tot" == "$tgt_tot" ]] && echo "Match" || echo "NO MATCH")
+  inv_match=$([[ "$src_inv" == "$tgt_inv" ]] && echo "Match" || echo "NO MATCH")
+  debug "Header data: src_ver='${src_ver}', tgt_ver='${tgt_ver}', src_patch='${src_patch}', tgt_patch='${tgt_patch}', src_cs='${src_cs}', tgt_cs='${tgt_cs}', totals=${src_tot}/${tgt_tot}, invalids=${src_inv}/${tgt_inv}"
+
+  debug "Snapshot: objects/rowcounts/privs (src & tgt)"
+  snapshot_objects_local      "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_objects_${RUN_ID}.csv"
+  snapshot_rowcounts_local    "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_rowcounts_${RUN_ID}.csv"
+  snapshot_sys_privs_local    "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_sys_privs_${RUN_ID}.csv"
+  snapshot_role_privs_local   "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_role_privs_${RUN_ID}.csv"
+  snapshot_tabprivs_on_local  "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_obj_privs_on_${RUN_ID}.csv"
+  snapshot_tabprivs_to_local  "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_obj_privs_to_${RUN_ID}.csv"
+  snapshot_objects_local      "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_objects_${RUN_ID}.csv"
+  snapshot_rowcounts_local    "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_rowcounts_${RUN_ID}.csv"
+  snapshot_sys_privs_local    "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_sys_privs_${RUN_ID}.csv"
+  snapshot_role_privs_local   "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_role_privs_${RUN_ID}.csv"
+  snapshot_tabprivs_on_local  "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_obj_privs_on_${RUN_ID}.csv"
+  snapshot_tabprivs_to_local  "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_obj_privs_to_${RUN_ID}.csv"
+
+  debug "Snapshot: expert checks (invalid objects / unusable idx / disabled constraints)"
+  snapshot_invalid_objects_local      "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_invalid_${RUN_ID}.csv"
+  snapshot_invalid_objects_local      "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_invalid_${RUN_ID}.csv"
+  snapshot_unusable_indexes_local     "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_unusable_idx_${RUN_ID}.csv"
+  snapshot_unusable_indexes_local     "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_unusable_idx_${RUN_ID}.csv"
+  snapshot_disabled_constraints_local "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_disabled_cons_${RUN_ID}.csv"
+  snapshot_disabled_constraints_local "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_disabled_cons_${RUN_ID}.csv"
+
+  local html="${COMPARE_DIR}/compare_local_${schema}_${RUN_ID}.html"
+  ensure_local_dir "$COMPARE_DIR"
+  debug "Writing HTML summary to ${html}"
+  {
+    echo "<html><head><meta charset='utf-8'><title>Schema Compare (LOCAL) ${schema}</title>"
+    echo "<style>body{font-family:Arial,Helvetica,sans-serif} table{border-collapse:collapse} th,td{border:1px solid #ccc;padding:6px 10px} pre{white-space:pre-wrap}</style>"
+    echo "</head><body>"
+    echo "<h2>Schema Compare (LOCAL/Jumper): ${schema}</h2>"
+    echo "<p>Run: ${RUN_ID}<br/>Source: ${SRC_EZCONNECT}<br/>Target: ${TGT_EZCONNECT}<br/>Local: ${LOCAL_COMPARE_DIR}</p>"
+
+    echo "<h3>Summary</h3>"
+    echo "<table>"
+    echo "<tr><th></th><th>Source</th><th>Target</th><th>Match</th></tr>"
+    echo "<tr><td><b>DB Version</b></td><td>$(echo "$src_ver" | sed 's/&/\&amp;/g;s/</\&lt;/g')</td><td>$(echo "$tgt_ver" | sed 's/&/\&amp;/g;s/</\&lt;/g')</td><td>$( [[ "$src_ver" == "$tgt_ver" ]] && echo 'Match' || echo 'NO MATCH' )</td></tr>"
+    echo "<tr><td><b>Patch Level</b></td><td>$(echo "$src_patch" | sed 's/&/\&amp;/g;s/</\&lt;/g')</td><td>$(echo "$tgt_patch" | sed 's/&/\&amp;/g;s/</\&lt;/g')</td><td>$( [[ "$src_patch" == "$tgt_patch" ]] && echo 'Match' || echo 'NO MATCH' )</td></tr>"
+    echo "<tr><td><b>Character Sets</b></td><td>$(echo "$src_cs" | sed 's/&/\&amp;/g;s/</\&lt;/g')</td><td>$(echo "$tgt_cs" | sed 's/&/\&amp;/g;s/</\&lt;/g')</td><td>$( [[ "$src_cs" == "$tgt_cs" ]] && echo 'Match' || echo 'NO MATCH' )</td></tr>"
+    echo "<tr><td><b>Total Objects (${schema})</b></td><td>${src_tot}</td><td>${tgt_tot}</td><td>${tot_match}</td></tr>"
+    echo "<tr><td><b>Invalid Objects (${schema})</b></td><td>${src_inv}</td><td>${tgt_inv}</td><td>${inv_match}</td></tr>"
+    echo "</table>"
+  } > "$html"
+
+  emit_set_delta_html "Objects (type|name|status)" \
+    "${S}/${schema}_src_objects_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_objects_${RUN_ID}.csv" \
+    "$html"
+
+  emit_rowcount_delta_html "Rowcount differences (table|count)" \
+    "${S}/${schema}_src_rowcounts_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_rowcounts_${RUN_ID}.csv" \
+    "$html"
+
+  emit_set_delta_html "System Privileges (priv|admin)" \
+    "${S}/${schema}_src_sys_privs_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_sys_privs_${RUN_ID}.csv" \
+    "$html"
+
+  emit_set_delta_html "Role Grants (role|admin|default)" \
+    "${S}/${schema}_src_role_privs_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_role_privs_${RUN_ID}.csv" \
+    "$html"
+
+  emit_set_delta_html "Object Privileges ON ${schema} objects (owner|table|grantee|priv|grantable|grantor)" \
+    "${S}/${schema}_src_obj_privs_on_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_obj_privs_on_${RUN_ID}.csv" \
+    "$html"
+
+  emit_set_delta_html "Object Privileges TO ${schema} user (owner|table|grantee|priv|grantable|grantor)" \
+    "${S}/${schema}_src_obj_privs_to_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_obj_privs_to_${RUN_ID}.csv" \
+    "$html"
+
+  emit_set_delta_html "Invalid Objects (type|name)" \
+    "${S}/${schema}_src_invalid_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_invalid_${RUN_ID}.csv" \
+    "$html"
+
+  emit_set_delta_html "Disabled Constraints (type|name|table)" \
+    "${S}/${schema}_src_disabled_cons_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_disabled_cons_${RUN_ID}.csv" \
+    "$html"
+
+  emit_set_delta_html "Unusable Indexes (index|table)" \
+    "${S}/${schema}_src_unusable_idx_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_unusable_idx_${RUN_ID}.csv" \
+    "$html"
+
+  echo "</body></html>" >> "$html"
+  ok "HTML (LOCAL/Jumper): ${html}"
+  email_inline_html "$html" "${MAIL_SUBJECT_PREFIX} Schema Compare LOCAL - ${schema} - ${RUN_ID}"
+  debug "compare_one_schema_local: END schema=${schema}"
+}
+
+compare_many_local() {
+  local list_input="${1:-}"
+  debug "compare_many_local START (input='${list_input}')"
+  local schemas_list=""
+  if [[ -n "$list_input" ]]; then schemas_list="$list_input"
+  else
+    schemas_list="$(get_nonmaintained_schemas)"
+    [[ -z "$schemas_list" ]] && { warn "No non-maintained schemas found on source."; return 0; }
+    ok "Auto-compare LOCAL mode (source list): ${schemas_list}"
+  fi
+  ensure_local_dir "$COMPARE_DIR"
+  local index="${COMPARE_DIR}/compare_local_index_${RUN_ID}.html"
+  {
+    echo "<html><head><meta charset='utf-8'><title>Schema Compare LOCAL Index ${RUN_ID}</title>"
+    echo "<style>body{font-family:Arial,Helvetica,sans-serif} table{border-collapse:collapse} th,td{border:1px solid #ccc;padding:6px 10px}</style>"
+    echo "</head><body>"
+    echo "<h2>Schema Compare Index (LOCAL/Jumper)</h2>"
+    echo "<p>Run: ${RUN_ID}<br/>Source: ${SRC_EZCONNECT}<br/>Target: ${TGT_EZCONNECT}</p>"
+    echo "<table><tr><th>#</th><th>Schema</th><th>Report</th></tr>"
+  } > "$index"
+  local i=0
+  IFS=',' read -r -a arr <<< "$schemas_list"
+  for s in "${arr[@]}"; do
+    s="$(echo "$s" | awk '{$1=$1;print}')"; [[ -z "$s" ]] && continue
+    i=$((i+1)); debug "compare_many_local item ${i}: ${s}"
+    compare_one_schema_local "$s"
+    local f="compare_local_${s^^}_${RUN_ID}.html"
+    echo "<tr><td>${i}</td><td>${s^^}</td><td><a href='${f}'>${f}</a></td></tr>" >> "$index"
+  done
+  echo "</table></body></html>" >> "$index"
+  ok "Index HTML (LOCAL): ${index}"
+  email_inline_html "$index" "${MAIL_SUBJECT_PREFIX} Compare LOCAL Index - ${RUN_ID}"
+  debug "compare_many_local END"
+}
+
+# ------------------------------ Menus -----------------------------------------
+export_import_menu() {
+  while true; do
+    cat <<'EOS' | say_to_user
+Data Pump:
+  1) Export -> sub menu
+  2) Import -> sub menu
+  3) Back
+  X) Exit
+EOS
+    read -rp "Choose: " c
+    case "$c" in
+      1) export_menu ;;
+      2) import_menu ;;
+      3) break ;;
+      X|x) exit 0 ;;
+      *) warn "Invalid choice" ;;
+    esac
+  done
+}
+
+import_menu() {
+  while true; do
+    cat <<'EOS' | say_to_user
+Import Menu:
+  1) FULL (metadata_only / full)
+  2) SCHEMAS (auto/user list)
+  3) TABLESPACES (transport)
+  4) TABLES
+  5) Cleanup helpers (drop users/objects)  [DANGEROUS]
+  6) Back
+  X) Exit
+EOS
+    read -rp "Choose: " c
+    case "$c" in
+      1) imp_full_menu ;;
+      2) imp_schemas_menu ;;
+      3) imp_tablespaces ;;
+      4) imp_tables ;;
+      5) import_cleanup_menu ;;
+      6) break ;;
+      X|x) exit 0 ;;
+      *) warn "Invalid choice" ;;
+    esac
+  done
+}
+
+compare_schema_menu() {
+  while true; do
+    cat <<'EOS' | say_to_user
+Compare Objects (Source vs Target)
+  Engine:
+    A) EXTERNAL tables on TARGET (needs DIRECTORY/NAS)
+    B) FILE mode (CSV + shell diff; needs DIRECTORY/NAS)
+    C) LOCAL/JUMPER (CSV spooled locally; NO NAS, NO ext tables)
+  Actions:
+    1) One schema (HTML + email)
+    2) Multiple schemas (ENTER = all non-maintained on source) [HTML + email]
+    3) Back
+    X) Exit
+EOS
+    read -rp "Choose engine [A/B/C] or action [1/2/3/X]: " eng
+    eng="${eng^^}"
+    case "$eng" in
+      A)
+        read -rp "Pick action [1=one schema, 2=multiple, 3=back, X=exit]: " c
+        case "${c^^}" in
+          1) read -rp "Schema name: " s; compare_one_schema_sql_external "$s" ;;
+          2) read -rp "Schema names (comma-separated) or ENTER for all: " list; compare_many_sql_external "${list:-}";;
+          3) break ;;
+          X) exit 0 ;;
+          *) warn "Invalid choice" ;;
+        esac
+        ;;
+      B)
+        read -rp "Pick action [1=one schema, 2=multiple, 3=back, X=exit]: " c
+        case "${c^^}" in
+          1) read -rp "Schema name: " s; compare_one_schema_file_mode "$s" ;;
+          2) read -rp "Schema names (comma-separated) or ENTER for all: " list; compare_many_file_mode "${list:-}";;
+          3) break ;;
+          X) exit 0 ;;
+          *) warn "Invalid choice" ;;
+        esac
+        ;;
+      C)
+        read -rp "Pick action [1=one schema, 2=multiple, 3=back, X=exit]: " c
+        case "${c^^}" in
+          1) read -rp "Schema name: " s; compare_one_schema_local "$s" ;;
+          2) read -rp "Schema names (comma-separated) or ENTER for all: " list; compare_many_local "${list:-}";;
+          3) break ;;
+          X) exit 0 ;;
+          *) warn "Invalid choice" ;;
+        esac
+        ;;
+      1|2|3) warn "Pick engine first (A/B/C), then action." ;;
+      X) exit 0 ;;
+      *) warn "Unknown engine. Choose A, B, C or X." ;;
+    esac
+  done
+}
+
+show_jobs() {
+  ce "Logs under $LOG_DIR"
+  read -rp "Show DBA_DATAPUMP_JOBS on which DB? (src/tgt/b=back/x=exit): " side
+  case "${side,,}" in
+    src) run_sql "$SRC_EZCONNECT" "jobs_src_${RUN_ID}" "SET LINES 220 PAGES 200
+COL owner_name FOR A20
+COL job_name FOR A30
+COL state FOR A12
+SELECT owner_name, job_name, state, operation, job_mode, degree, attached_sessions
+FROM dba_datapump_jobs ORDER BY 1,2; /" ;;
+    tgt) run_sql "$TGT_EZCONNECT" "jobs_tgt_${RUN_ID}" "SET LINES 220 PAGES 200
+COL owner_name FOR A20
+COL job_name FOR A30
+COL state FOR A12
+SELECT owner_name, job_name, state, operation, job_mode, degree, attached_sessions
+FROM dba_datapump_jobs ORDER BY 1,2; /" ;;
+    b) return ;;
+    x) exit 0 ;;
+    *) warn "Unknown choice";;
+  esac
+  for f in "$LOG_DIR"/*.log; do [[ -f "$f" ]] || continue; echo "---- $(basename "$f") (tail -n 20) ----"; tail -n 20 "$f"; done
+}
+
+cleanup_dirs() {
+  read -rp "Drop DIRECTORY ${COMMON_DIR_NAME} on (src/tgt/both/b=back/x=exit)? " side
+  case "${side,,}" in
+    src) run_sql_try "$SRC_EZCONNECT" "drop_dir_src_${RUN_ID}" "BEGIN EXECUTE IMMEDIATE 'DROP DIRECTORY ${COMMON_DIR_NAME}'; EXCEPTION WHEN OTHERS THEN NULL; END; /" || true ;;
+    tgt) run_sql_try "$TGT_EZCONNECT" "drop_dir_tgt_${RUN_ID}" "BEGIN EXECUTE IMMEDIATE 'DROP DIRECTORY ${COMMON_DIR_NAME}'; EXCEPTION WHEN OTHERS THEN NULL; END; /" || true ;;
+    both) run_sql_try "$SRC_EZCONNECT" "drop_dir_src_${RUN_ID}" "BEGIN EXECUTE IMMEDIATE 'DROP DIRECTORY ${COMMON_DIR_NAME}'; EXCEPTION WHEN OTHERS THEN NULL; END; /" || true
+          run_sql_try "$TGT_EZCONNECT" "drop_dir_tgt_${RUN_ID}" "BEGIN EXECUTE IMMEDIATE 'DROP DIRECTORY ${COMMON_DIR_NAME}'; EXCEPTION WHEN OTHERS THEN NULL; END; /" || true ;;
+    b) return ;;
+    x) exit 0 ;;
+    *) warn "No action";;
+  esac
+}
+
+main_menu() {
+  while true; do
+    cat <<EOS | say_to_user
+
+======== Oracle 19c Migration & DDL (${SCRIPT_NAME} v4as) ========
+Source: ${SRC_EZCONNECT}
+Target: ${TGT_EZCONNECT}
+NAS:    ${NAS_PATH:-<not set>}
+PARALLEL=${PARALLEL}  COMPRESSION=${COMPRESSION}  TABLE_EXISTS_ACTION=${TABLE_EXISTS_ACTION}
+DDL out: ${DDL_DIR}
+Compare out: ${COMPARE_DIR}
+=============================================================
+
+1) Toggle DEBUG on/off (current: ${DEBUG})
+2) Precheck Export DIRECTORY (on SOURCE only)
+3) Precheck Import DIRECTORY (on TARGET only)
+4) Data Pump (EXP/IMP)         -> sub menu
+5) Monitor/Status              -> DBA_DATAPUMP_JOBS + tail logs
+6) Drop DIRECTORY objects      -> cleanup (non-fatal)
+7) DDL Extraction (Source DB)  -> sub menu
+8) Compare Objects             -> sub menu (EXTERNAL / FILE / LOCAL)
+9) Back
+X) Exit
+EOS
+    read -rp "Choose: " choice
+    case "${choice^^}" in
+      1) toggle_debug ;;
+      2) precheck_export_directory  || true ;;
+      3) precheck_import_directory  || true ;;
+      4) export_import_menu ;;
+      5) show_jobs ;;
+      6) cleanup_dirs ;;
+      7) ddl_menu_wrapper ;;
+      8) compare_schema_menu ;;
+      9) return ;;
+      X) exit 0 ;;
+      *) warn "Invalid choice.";;
+    esac
+  done
+}
+
+# Root loop
+main_menu
