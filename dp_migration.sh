@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dp_migrate.sh (v4aq) - Oracle 19c Data Pump migration & compare toolkit
+# dp_migrate.sh (v4as) - Oracle 19c Data Pump migration & compare toolkit
 # =============================================================================
-# What's new vs prior versions:
-# - FIX: get_nonmaintained_schemas()/..._tgt() capture SQLPlus output directly
-#        (no temporary logfiles; resolves awk/sed "cannot open file" errors)
-# - HTML email automatically sent after each expdp/impdp job (success/failure)
-#   with parfile (masked) + full client log inline.
-# - DEBUG prints to STDERR so command substitutions don't capture debug lines.
-# - Parfiles are created in the export/import directory if locally writable.
-# - Export SCHEMAS now always writes "schemas=..." + shows parfile for confirm.
+# Fixes in v4as:
+# - Resolved "version: unbound variable" by removing any risky 'version:' usage
+#   under 'set -u' and printing tool version safely.
+# - Added DEBUG tracing for compare schema functions (start/end and each step).
+# - Retains inline-HTML email after expdp/impdp runs, DDL extraction suite,
+#   robust parfile placement, and local (jumper) compare with rich HTML header.
 # =============================================================================
 
 set -euo pipefail
@@ -37,19 +35,10 @@ err()  { ce "\e[31m✘ $*\e[0m"; }
 DEBUG="${DEBUG:-Y}"
 debug() { if [[ "${DEBUG^^}" == "Y" ]]; then ce "\e[36m[DEBUG]\e[0m $*" >&2; fi; }
 
-# write to the screen even inside command substitution
-say_to_user() {
-  if [[ -w /dev/tty ]]; then cat >/dev/tty
-  else cat 1>&2
-  fi
-}
+say_to_user() { if [[ -w /dev/tty ]]; then cat >/dev/tty; else cat 1>&2; fi; }
 
 toggle_debug() {
-  if [[ "${DEBUG^^}" == "Y" ]]; then
-    DEBUG="N"; ok "DEBUG turned OFF"
-  else
-    DEBUG="Y"; ok "DEBUG turned ON"
-  fi
+  if [[ "${DEBUG^^}" == "Y" ]]; then DEBUG="N"; ok "DEBUG turned OFF"; else DEBUG="Y"; ok "DEBUG turned ON"; fi
   ce "Current DEBUG=${DEBUG}"
 }
 
@@ -95,7 +84,6 @@ MAIL_METHOD="${MAIL_METHOD:-auto}"
 COMPARE_ENGINE="${COMPARE_ENGINE:-LOCAL}"  # EXTERNAL | FILE | LOCAL
 EXACT_ROWCOUNT="${EXACT_ROWCOUNT:-N}"
 
-# Export/Import OS paths bound to Oracle DIRECTORY objects.
 EXPORT_DIR_PATH="${EXPORT_DIR_PATH:-${NAS_PATH:-}}"
 IMPORT_DIR_PATH="${IMPORT_DIR_PATH:-}"
 NAS_PATH="${NAS_PATH:-}"
@@ -108,29 +96,17 @@ for b in sqlplus expdp impdp; do
   if ! command -v "$b" >/dev/null 2>&1; then err "Missing required binary: $b"; exit 1; fi
 done
 
-# mask passwords in log tails
 mask_pwd() { sed 's#[^/"]\{1,\}@#***@#g' | sed 's#sys/[^@]*@#sys/****@#g'; }
 
-# --- filename/path helpers (prevent paths in Data Pump LOGFILE) ---
 basename_safe() { local x="${1:-}"; x="${x##*/}"; printf "%s" "$x"; }
 reject_if_pathlike() { local x="${1:-}"; if [[ "$x" == *"/"* ]]; then warn "Path component detected and removed: [$x]"; x="${x##*/}"; fi; printf "%s" "$x"; }
 
-# choose a directory for parfile based on mode and writability
 parfile_dir_for_mode() {
   local mode="${1}" preferred=""
-  case "${mode}" in
-    expdp) preferred="${EXPORT_DIR_PATH:-}";;
-    impdp) preferred="${IMPORT_DIR_PATH:-}";;
-    *) preferred="";;
-  esac
-  if [[ -n "$preferred" && -d "$preferred" && -w "$preferred" ]]; then
-    echo "$preferred"
-  else
-    if [[ -n "$preferred" && ! -d "$preferred" ]]; then
-      warn "Preferred parfile dir [$preferred] does not exist locally; using $PAR_DIR"
-    elif [[ -n "$preferred" && -d "$preferred" && ! -w "$preferred" ]]; then
-      warn "Preferred parfile dir [$preferred] not writable; using $PAR_DIR"
-    fi
+  case "${mode}" in expdp) preferred="${EXPORT_DIR_PATH:-}";; impdp) preferred="${IMPORT_DIR_PATH:-}";; esac
+  if [[ -n "$preferred" && -d "$preferred" && -w "$preferred" ]]; then echo "$preferred"; else
+    [[ -n "$preferred" && ! -d "$preferred" ]] && warn "Parfile dir [$preferred] missing; using $PAR_DIR"
+    [[ -n "$preferred" && -d "$preferred" && ! -w "$preferred" ]] && warn "Parfile dir [$preferred] not writable; using $PAR_DIR"
     echo "$PAR_DIR"
   fi
 }
@@ -157,7 +133,6 @@ SQL
   ok "SQL ok: ${tag}"
 }
 
-# NON-FATAL SQL (returns 0=ok, 1=error)
 run_sql_try() {
   local ez="$1"; shift
   local tag="${1:-sqltry}"; shift || true
@@ -205,6 +180,24 @@ SQL
   ok "Spool ok: $out"
 }
 
+run_sql_capture() {
+  local ez="$1" body="$2"
+  local conn="sys/${SYS_PASSWORD}@${ez} as sysdba"
+  local out rc
+  out="$(sqlplus -s "$conn" <<SQL 2>&1
+SET PAGES 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMSPOOL ON LINES 32767
+SET LONG 1000000 LONGCHUNKSIZE 1000000
+SET DEFINE OFF
+${body}
+/
+EXIT
+SQL
+)" && rc=$? || rc=$?
+  if [[ $rc -ne 0 || "$out" =~ ORA- ]]; then echo ""; return 1; fi
+  echo "$out" | awk 'NF{last=$0} END{print last}'
+  return 0
+}
+
 # ------------------------------- Mail helpers ---------------------------------
 detect_mail_stack() {
   local forced="${MAIL_METHOD:-auto}"
@@ -213,7 +206,6 @@ detect_mail_stack() {
     mailutils) (mail --version 2>/dev/null | grep -qi "mailutils") && { echo mailutils; return; } ;;
     bsdmail)   (mail -V 2>/dev/null | grep -qi "bsd") && { echo bsdmail; return; } ;;
     mailx)     command -v mailx >/dev/null && { echo mailx; return; } ;;
-    auto|*)    : ;;
   esac
   if command -v sendmail >/dev/null 2>&1; then echo sendmail; return; fi
   if mail --version 2>/dev/null | grep -qi "mailutils"; then echo mailutils; return; fi
@@ -227,10 +219,8 @@ email_inline_html() {
   [[ "${MAIL_ENABLED^^}" != "Y" ]] && { warn "MAIL_ENABLED!=Y; skip email."; return 0; }
   [[ -z "${REPORT_EMAILS}" ]] && { warn "REPORT_EMAILS empty; skip email."; return 0; }
   [[ ! -f "$file" ]] && { warn "email_inline_html: $file not found"; return 1; }
-
   local method; method="$(detect_mail_stack)"
   debug "Email stack: ${method}; subject=${subject}; to=${REPORT_EMAILS}; file=${file}"
-
   case "$method" in
     sendmail)
       { echo "From: ${MAIL_FROM}"
@@ -247,15 +237,13 @@ email_inline_html() {
       mail -a "From: ${MAIL_FROM}" \
            -a "MIME-Version: 1.0" \
            -a "Content-Type: text/html; charset=UTF-8" \
-           -s "${subject}" ${REPORT_EMAILS} < "$file" \
-        || { warn "mail (mailutils) failed"; return 1; }
+           -s "${subject}" ${REPORT_EMAILS} < "$file" || { warn "mail (mailutils) failed"; return 1; }
       ;;
     bsdmail)
       mail -a "From: ${MAIL_FROM}" \
            -a "MIME-Version: 1.0" \
            -a "Content-Type: text/html; charset=UTF-8" \
-           -s "${subject}" ${REPORT_EMAILS} < "$file" \
-        || { warn "mail (bsd) failed"; return 1; }
+           -s "${subject}" ${REPORT_EMAILS} < "$file" || { warn "mail (bsd) failed"; return 1; }
       ;;
     mailx)
       if mailx -V 2>&1 | grep -qiE "heirloom|s-nail|nail"; then
@@ -268,52 +256,31 @@ email_inline_html() {
         mailx -s "${subject}" ${REPORT_EMAILS} < "$file" || { warn "mailx failed"; return 1; }
       fi
       ;;
-    none)
-      warn "No supported mailer found; skipping email."
-      return 1
-      ;;
+    none) warn "No supported mailer found; skipping email."; return 1 ;;
   esac
-
   ok "Inline email sent to ${REPORT_EMAILS} via ${method}"
 }
 
-# --- Build a small HTML report from parfile + client log and email it ---
 dp_emit_html_and_email() {
   local tool="$1" tag="$2" pf="$3" client_log="$4"
   local html="${LOG_DIR}/${tool}_${tag}_${RUN_ID}.html"
-
   {
     echo "<html><head><meta charset='utf-8'><title>${tool^^} ${tag} ${RUN_ID}</title>"
     echo "<style>body{font-family:Arial,Helvetica,sans-serif} pre{white-space:pre-wrap; border:1px solid #ddd; padding:10px; background:#fafafa} .box{border:1px solid #ccc; padding:10px; margin:8px 0}</style>"
     echo "</head><body>"
     echo "<h2>${tool^^} job completed</h2>"
     echo "<p><b>Run:</b> ${RUN_ID}<br/><b>Tool:</b> ${tool}<br/><b>Tag:</b> ${tag}</p>"
-
     echo "<div class='box'><h3>Parfile</h3><pre>"
-    if [[ -f "$pf" ]]; then
-      sed -E 's/(encryption_password=).*/\1*****/I' "$pf" | sed 's/&/\&amp;/g;s/</\&lt;/g'
-    else
-      echo "(parfile not found at $pf)"
-    fi
+    if [[ -f "$pf" ]]; then sed -E 's/(encryption_password=).*/\1*****/I' "$pf" | sed 's/&/\&amp;/g;s/</\&lt;/g'; else echo "(parfile not found at $pf)"; fi
     echo "</pre></div>"
-
     echo "<div class='box'><h3>Client Log</h3><pre>"
-    if [[ -f "$client_log" ]]; then
-      sed 's/&/\&amp;/g;s/</\&lt;/g' "$client_log"
-    else
-      echo "(client log not found at $client_log)"
-    fi
+    if [[ -f "$client_log" ]]; then sed 's/&/\&amp;/g;s/</\&lt;/g' "$client_log"; else echo "(client log not found at $client_log)"; fi
     echo "</pre></div>"
-
     local server_log=""
-    if [[ -f "$pf" ]]; then
-      server_log="$(awk -F= 'tolower($1)=="logfile"{print $2}' "$pf" | head -1)"
-    fi
+    if [[ -f "$pf" ]]; then server_log="$(awk -F= 'tolower($1)=="logfile"{print $2}' "$pf" | head -1)"; fi
     [[ -n "$server_log" ]] && echo "<p><i>Server log (on DB host Oracle DIRECTORY):</i> ${server_log}</p>"
-
     echo "</body></html>"
   } > "$html"
-
   email_inline_html "$html" "${MAIL_SUBJECT_PREFIX} ${tool^^} ${tag} ${RUN_ID}"
   ok "HTML emailed: ${html}"
 }
@@ -378,10 +345,10 @@ dp_run() {
     echo "host: $(hostname)"
     echo "ORACLE_HOME: ${ORACLE_HOME:-<unset>}"
     echo "PATH: $PATH"
-    echo "which ${tool}: $(command -v $tool || echo not found)"
-    echo "version:"; $tool -V || true
+    echo "tool_binary: $(command -v $tool || echo not found)"
+    echo "tool_version: $($tool -V 2>/dev/null | head -1 || echo '(unknown)')"
     echo "---- parfile (${pf}) ----"
-    [[ -f "$pf" ]] && sed -E 's/(encryption_password=).*/\1*****/I' "$pf" || echo "<parfile not found>"
+    if [[ -f "$pf" ]]; then sed -E 's/(encryption_password=).*/\1*****/I' "$pf"; else echo "<parfile not found>"; fi
   } > "$client_log" 2>&1
 
   set +e
@@ -399,7 +366,6 @@ dp_run() {
   dp_emit_html_and_email "$tool" "$tag" "$pf" "$client_log" || true
 }
 
-# BUILD parfile into export/import directory if possible
 par_common() {
   local mode="$1" tag="$2" dir_name="$3"
   local pf_dir; pf_dir="$(parfile_dir_for_mode "$mode")"
@@ -443,7 +409,6 @@ par_common() {
   echo "$pf"
 }
 
-# Show parfile + confirm before dp
 show_and_confirm_parfile() {
   local pf="$1" tool="${2:-}"
   { echo "----- PARFILE: ${pf} -----"
@@ -452,12 +417,7 @@ show_and_confirm_parfile() {
   } | say_to_user
   local ans
   read -rp "Proceed with ${tool:-the job} using this parfile? [Y/N/X]: " ans
-  case "${ans^^}" in
-    Y) return 0 ;;
-    N) return 1 ;;
-    X) exit 0 ;;
-    *) return 1 ;;
-  esac
+  case "${ans^^}" in Y) return 0 ;; N) return 1 ;; X) exit 0 ;; *) return 1 ;; esac
 }
 
 # -------------------- value confirmers & content picker ------------------------
@@ -471,11 +431,7 @@ confirm_edit_value() {
     fi
     echo "${label}: ${val}" | say_to_user
     read -rp "Use this value? (Y to accept, N to edit) [Y/N]: " ans
-    case "${ans^^}" in
-      Y) echo "$val"; return 0 ;;
-      N) read -rp "Enter new ${label}: " val ;;
-      *) echo "Please answer Y or N." | say_to_user ;;
-    esac
+    case "${ans^^}" in Y) echo "$val"; return 0 ;; N) read -rp "Enter new ${label}: " val ;; *) echo "Please answer Y or N." | say_to_user ;; esac
   done
 }
 
@@ -487,8 +443,7 @@ Choose Export Content:
   b) FULL (ALL)     (metadata + data)
   x) Exit
 EOS
-    local choice=""
-    read -rp "Select [a/b/x]: " choice
+    local choice=""; read -rp "Select [a/b/x]: " choice
     case "${choice,,}" in
       a) echo "METADATA_ONLY"; echo "[INFO] CONTENT=METADATA_ONLY" | say_to_user; return 0 ;;
       b) echo "ALL";            echo "[INFO] CONTENT=ALL"            | say_to_user; return 0 ;;
@@ -504,7 +459,6 @@ precheck_export_directory() {
   while true; do
     read -rp "Export: DIRECTORY object name to use/create on SOURCE [${def_name}]: " dname
     local dir_name="$(echo "${dname:-$def_name}" | tr '[:lower:]' '[:upper:]')"
-
     local default_path="${EXPORT_DIR_PATH:-${NAS_PATH:-}}"
     local dir_path=""
     if [[ -z "$default_path" ]]; then
@@ -513,33 +467,19 @@ precheck_export_directory() {
     else
       echo "Default export path from conf: ${default_path}" | say_to_user
       read -rp "Use this export path? [Y to accept, N to enter a different path]: " ans
-      if [[ "${ans^^}" == "N" ]]; then
-        read -rp "Enter export path: " dir_path
-      else
-        dir_path="$default_path"
-      fi
+      if [[ "${ans^^}" == "N" ]]; then read -rp "Enter export path: " dir_path; else dir_path="$default_path"; fi
     fi
-
-    if [[ -z "$dir_path" ]]; then
-      warn "Export path cannot be empty."
+    if [[ -z "$dir_path" ]]; then warn "Export path cannot be empty."
     else
       create_or_replace_directory "$SRC_EZCONNECT" "$dir_name" "$dir_path" "src"
       if validate_directory_on_db_try "$SRC_EZCONNECT" "src" "$dir_name"; then
         ok "SOURCE export DIRECTORY ${dir_name} -> ${dir_path} is ready"
-        EXPORT_DIR_NAME="$dir_name"
-        EXPORT_DIR_PATH="$dir_path"
-        return 0
+        EXPORT_DIR_NAME="$dir_name"; EXPORT_DIR_PATH="$dir_path"; return 0
       fi
       warn "[DEBUG] run_sql_try(tag_dircheck_src) failed to create/validate export DIRECTORY on source."
     fi
-
     read -rp "Retry export precheck? [Y=retry / B=back / X=exit]: " r
-    case "${r^^}" in
-      Y) continue ;;
-      B) return 1 ;;
-      X) exit 0 ;;
-      *) return 1 ;;
-    esac
+    case "${r^^}" in Y) continue ;; B) return 1 ;; X) exit 0 ;; *) return 1 ;; esac
   done
 }
 
@@ -551,25 +491,16 @@ precheck_import_directory() {
     echo "Enter absolute OS path on the TARGET DB server for import dumpfiles (.dmp):" | say_to_user
     read -rp "Import path: " dir_path
     [[ -z "$dir_path" ]] && { warn "Import path cannot be empty."; }
-
     if [[ -n "$dir_path" ]]; then
       create_or_replace_directory "$TGT_EZCONNECT" "$dir_name" "$dir_path" "tgt"
       if validate_directory_on_db_try "$TGT_EZCONNECT" "tgt" "$dir_name"; then
         ok "TARGET import DIRECTORY ${dir_name} -> ${dir_path} is ready"
-        IMPORT_DIR_NAME="$dir_name"
-        IMPORT_DIR_PATH="$dir_path"
-        return 0
+        IMPORT_DIR_NAME="$dir_name"; IMPORT_DIR_PATH="$dir_path"; return 0
       fi
       warn "[DEBUG] run_sql_try(tag_dircheck_tgt) failed to create/validate import DIRECTORY on target."
     fi
-
     read -rp "Retry import precheck? [Y=retry / B=back / X=exit]: " r
-    case "${r^^}" in
-      Y) continue ;;
-      B) return 1 ;;
-      X) exit 0 ;;
-      *) return 1 ;;
-    esac
+    case "${r^^}" in Y) continue ;; B) return 1 ;; X) exit 0 ;; *) return 1 ;; esac
   done
 }
 
@@ -578,12 +509,7 @@ prompt_export_dump_location() {
   if [[ -n "${EXPORT_DIR_NAME:-}" && -n "${EXPORT_DIR_PATH:-}" ]]; then
     echo "Export using SOURCE DIRECTORY ${EXPORT_DIR_NAME} -> ${EXPORT_DIR_PATH}" | say_to_user
     read -rp "Use these? [Y to accept / N to change / X to exit]: " ans
-    case "${ans^^}" in
-      Y) return 0 ;;
-      N) ;;
-      X) exit 0 ;;
-      *) ;;
-    esac
+    case "${ans^^}" in Y) return 0 ;; N) ;; X) exit 0 ;; esac
   fi
   precheck_export_directory
 }
@@ -592,12 +518,7 @@ prompt_import_dump_location() {
   if [[ -n "${IMPORT_DIR_NAME:-}" && -n "${IMPORT_DIR_PATH:-}" ]]; then
     echo "Import using TARGET DIRECTORY ${IMPORT_DIR_NAME} -> ${IMPORT_DIR_PATH}" | say_to_user
     read -rp "Use these? [Y to accept / N to change / X to exit]: " ans
-    case "${ans^^}" in
-      Y) : ;;
-      N) precheck_import_directory || { warn "Setup cancelled."; return 1; } ;;
-      X) exit 0 ;;
-      *) : ;;
-    esac
+    case "${ans^^}" in Y) : ;; N) precheck_import_directory || { warn "Setup cancelled."; return 1; } ;; X) exit 0 ;; esac
   else
     precheck_import_directory || { warn "Setup cancelled."; return 1; }
   fi
@@ -609,74 +530,34 @@ prompt_import_dump_location() {
 }
 
 # ------------------------------ EXPORT MENUS ----------------------------------
-# Return CSV of non–Oracle-maintained schemas on SOURCE (capture output directly)
 get_nonmaintained_schemas() {
   local pred=""
   if [[ -n "$SKIP_SCHEMAS" ]]; then
     IFS=',' read -r -a arr <<< "$SKIP_SCHEMAS"
-    for s in "${arr[@]}"; do
-      s="$(echo "$s" | awk '{$1=$1;print}')"
-      [[ -z "$s" ]] && continue
-      pred+=" AND UPPER(username) NOT LIKE '${s^^}'"
-    done
+    for s in "${arr[@]}"; do s="$(echo "$s" | awk '{$1=$1;print}')"; [[ -z "$s" ]] && continue; pred+=" AND UPPER(username) NOT LIKE '${s^^}'"; done
   fi
-
-  local conn="sys/${SYS_PASSWORD}@${SRC_EZCONNECT} as sysdba"
-  local sql="
-SET PAGES 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMSPOOL ON LINES 32767
+  run_sql_capture "$SRC_EZCONNECT" "
 WITH base AS ( SELECT username FROM dba_users WHERE oracle_maintained='N'${pred} )
-SELECT LISTAGG(username, ',') WITHIN GROUP (ORDER BY username) FROM base;
-/
+SELECT LISTAGG(username, ',') WITHIN GROUP (ORDER BY username) FROM base
 "
-  debug "get_nonmaintained_schemas(): running SQL on SOURCE"
-  local out rc
-  out="$(echo "$sql" | sqlplus -s "$conn" 2>&1)" && rc=$? || rc=$?
-  if [[ $rc -ne 0 || "$out" =~ ORA- ]]; then
-    warn "get_nonmaintained_schemas(): SQL error on SOURCE"; echo "$out" | tail -n 30 1>&2
-    echo ""; return 1
-  fi
-  echo "$out" | awk 'NF{last=$0} END{print last}'
 }
 
-# Return CSV of non–Oracle-maintained schemas on TARGET (capture output directly)
 get_nonmaintained_schemas_tgt() {
   local pred=""
   if [[ -n "$SKIP_SCHEMAS" ]]; then
     IFS=',' read -r -a arr <<< "$SKIP_SCHEMAS"
-    for s in "${arr[@]}"; do
-      s="$(echo "$s" | awk '{$1=$1;print}')"
-      [[ -z "$s" ]] && continue
-      pred+=" AND UPPER(username) NOT LIKE '${s^^}'"
-    done
+    for s in "${arr[@]}"; do s="$(echo "$s" | awk '{$1=$1;print}')"; [[ -z "$s" ]] && continue; pred+=" AND UPPER(username) NOT LIKE '${s^^}'"; done
   fi
-
-  local conn="sys/${SYS_PASSWORD}@${TGT_EZCONNECT} as sysdba"
-  local sql="
-SET PAGES 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMSPOOL ON LINES 32767
+  run_sql_capture "$TGT_EZCONNECT" "
 WITH base AS ( SELECT username FROM dba_users WHERE oracle_maintained='N'${pred} )
-SELECT LISTAGG(username, ',') WITHIN GROUP (ORDER BY username) FROM base;
-/
+SELECT LISTAGG(username, ',') WITHIN GROUP (ORDER BY username) FROM base
 "
-  debug "get_nonmaintained_schemas_tgt(): running SQL on TARGET"
-  local out rc
-  out="$(echo "$sql" | sqlplus -s "$conn" 2>&1)" && rc=$? || rc=$?
-  if [[ $rc -ne 0 || "$out" =~ ORA- ]]; then
-    warn "get_nonmaintained_schemas_tgt(): SQL error on TARGET"; echo "$out" | tail -n 30 1>&2
-    echo ""; return 1
-  fi
-  echo "$out" | awk 'NF{last=$0} END{print last}'
 }
 
-# Common confirmation path for expdp: build, show, confirm, run
 confirm_and_run_expdp() {
   local tag="$1" dir_name="$2"
-  local pf
-  pf=$(par_common expdp "$tag" "$dir_name")
-  if show_and_confirm_parfile "$pf" "expdp"; then
-    dp_run expdp "$SRC_EZCONNECT" "$pf" "$tag"
-  else
-    warn "Export cancelled."
-  fi
+  local pf; pf=$(par_common expdp "$tag" "$dir_name")
+  if show_and_confirm_parfile "$pf" "expdp"; then dp_run expdp "$SRC_EZCONNECT" "$pf" "$tag"; else warn "Export cancelled."; fi
 }
 
 exp_full_menu() {
@@ -690,18 +571,16 @@ Export FULL (choose content):
 EOS
     read -rp "Choose: " c
     case "$c" in
-      1)
-        prompt_export_dump_location || { warn "Setup cancelled."; continue; }
-        pf=$(par_common expdp "exp_full_meta" "$EXPORT_DIR_NAME")
-        { echo "full=Y"; echo "content=METADATA_ONLY"; } >> "$pf"
-        show_and_confirm_parfile "$pf" "expdp" && dp_run expdp "$SRC_EZCONNECT" "$pf" "exp_full_meta"
-        ;;
-      2)
-        prompt_export_dump_location || { warn "Setup cancelled."; continue; }
-        pf=$(par_common expdp "exp_full_all" "$EXPORT_DIR_NAME")
-        { echo "full=Y"; echo "content=ALL"; } >> "$pf"
-        show_and_confirm_parfile "$pf" "expdp" && dp_run expdp "$SRC_EZCONNECT" "$pf" "exp_full_all"
-        ;;
+      1) prompt_export_dump_location || { warn "Setup cancelled."; continue; }
+         pf=$(par_common expdp "exp_full_meta" "$EXPORT_DIR_NAME")
+         { echo "full=Y"; echo "content=METADATA_ONLY"; } >> "$pf"
+         show_and_confirm_parfile "$pf" "expdp" && dp_run expdp "$SRC_EZCONNECT" "$pf" "exp_full_meta"
+         ;;
+      2) prompt_export_dump_location || { warn "Setup cancelled."; continue; }
+         pf=$(par_common expdp "exp_full_all" "$EXPORT_DIR_NAME")
+         { echo "full=Y"; echo "content=ALL"; } >> "$pf"
+         show_and_confirm_parfile "$pf" "expdp" && dp_run expdp "$SRC_EZCONNECT" "$pf" "exp_full_all"
+         ;;
       3) break ;;
       X|x) exit 0 ;;
       *) warn "Invalid choice" ;;
@@ -797,10 +676,8 @@ par_common_imp_with_dump() {
   mkdir -p "$pf_dir" || true
   local pf="${pf_dir}/${tag}_${RUN_ID}.par"
   debug "Creating impdp parfile: ${pf}"
-
   local server_log="$(basename_safe "${DUMPFILE_PREFIX}_${tag}_${RUN_ID}.log")"
   local cleaned_pattern; cleaned_pattern="$(reject_if_pathlike "${IMPORT_DUMPFILE_PATTERN}")"
-
   {
     echo "directory=${IMPORT_DIR_NAME}"
     echo "dumpfile=${cleaned_pattern}"
@@ -829,16 +706,14 @@ Import FULL (choose content):
 EOS
     read -rp "Choose: " c
     case "$c" in
-      1)
-        prompt_import_dump_location || { warn "Setup cancelled."; continue; }
-        pf=$(par_common_imp_with_dump "imp_full_meta"); { echo "full=Y"; echo "content=METADATA_ONLY"; } >> "$pf"
-        show_and_confirm_parfile "$pf" "impdp" && dp_run impdp "$TGT_EZCONNECT" "$pf" "imp_full_meta"
-        ;;
-      2)
-        prompt_import_dump_location || { warn "Setup cancelled."; continue; }
-        pf=$(par_common_imp_with_dump "imp_full_all");  { echo "full=Y"; echo "content=ALL"; } >> "$pf"
-        show_and_confirm_parfile "$pf" "impdp" && dp_run impdp "$TGT_EZCONNECT" "$pf" "imp_full_all"
-        ;;
+      1) prompt_import_dump_location || { warn "Setup cancelled."; continue; }
+         pf=$(par_common_imp_with_dump "imp_full_meta"); { echo "full=Y"; echo "content=METADATA_ONLY"; } >> "$pf"
+         show_and_confirm_parfile "$pf" "impdp" && dp_run impdp "$TGT_EZCONNECT" "$pf" "imp_full_meta"
+         ;;
+      2) prompt_import_dump_location || { warn "Setup cancelled."; continue; }
+         pf=$(par_common_imp_with_dump "imp_full_all");  { echo "full=Y"; echo "content=ALL"; } >> "$pf"
+         show_and_confirm_parfile "$pf" "impdp" && dp_run impdp "$TGT_EZCONNECT" "$pf" "imp_full_all"
+         ;;
       3) break ;;
       X|x) exit 0 ;;
       *) warn "Invalid choice" ;;
@@ -1023,12 +898,7 @@ ORDER BY owner, synonym_name;
 to_inlist_upper() {
   local csv="$1" out="" tok
   IFS=',' read -r -a arr <<< "$csv"
-  for tok in "${arr[@]}"; do
-    tok="$(echo "$tok" | awk '{$1=$1;print}')"
-    [[ -z "$tok" ]] && continue
-    tok="${tok^^}"
-    out+="${out:+,}'${tok}'"
-  done
+  for tok in "${arr[@]}"; do tok="$(echo "$tok" | awk '{$1=$1;print}')"; [[ -z "$tok" ]] && continue; tok="${tok^^}"; out+="${out:+,}'${tok}'"; done
   printf "%s" "$out"
 }
 
@@ -1127,16 +997,12 @@ EOS
 
 # ----------------------- COMPARE (LOCAL/Jumper) -------------------------------
 ensure_local_dir() { mkdir -p "$1" || { echo "Cannot create $1"; exit 1; }; }
-normalize_sorted() {
-  local in="$1" out="$2"
-  if [[ -f "$in" ]]; then tr -d '\r' < "$in" | awk 'NF' | sort -u > "$out"; else : > "$out"; fi
-}
+normalize_sorted() { local in="$1" out="$2"; if [[ -f "$in" ]]; then tr -d '\r' < "$in" | awk 'NF' | sort -u > "$out"; else : > "$out"; fi; }
 
 emit_set_delta_html() {
   local title="$1" left_csv="$2" right_csv="$3" html="$4"
-  local L="$(mktemp)" R="$(mktemp)"
-  normalize_sorted "$left_csv"  "$L"
-  normalize_sorted "$right_csv" "$R"
+  local L R; L="$(mktemp)"; R="$(mktemp)"
+  normalize_sorted "$left_csv"  "$L"; normalize_sorted "$right_csv" "$R"
   echo "<h3>${title}</h3>" >> "$html"
   echo "<table><tr><th>Only in Source</th><th>Only in Target</th></tr><tr><td valign='top'><pre>" >> "$html"
   comm -23 "$L" "$R" | sed 's/&/\&amp;/g;s/</\&lt;/g' >> "$html"
@@ -1148,9 +1014,8 @@ emit_set_delta_html() {
 
 emit_rowcount_delta_html() {
   local title="$1" left_csv="$2" right_csv="$3" html="$4"
-  local L="$(mktemp)" R="$(mktemp)"
-  normalize_sorted "$left_csv"  "$L"
-  normalize_sorted "$right_csv" "$R"
+  local L R; L="$(mktemp)"; R="$(mktemp)"
+  normalize_sorted "$left_csv"  "$L"; normalize_sorted "$right_csv" "$R"
   echo "<h3>${title}</h3><table><tr><th>Table</th><th>Source</th><th>Target</th><th>Delta</th></tr>" >> "$html"
   awk -F'|' '
     NR==FNR { l[$1]=$2; next }
@@ -1178,6 +1043,7 @@ emit_rowcount_delta_html() {
 }
 
 snapshot_objects_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_objects_local(${who}, ${schema}) -> ${out}"
   run_sql_spool_local "$ez" "snap_${who}_objects_${schema}" "$out" "
 SET COLSEP '|'
 SELECT object_type||'|'||object_name||'|'||status
@@ -1186,8 +1052,11 @@ WHERE owner=UPPER('${schema}')
   AND temporary='N'
   AND object_name NOT LIKE 'BIN$%'
 ORDER BY object_type, object_name;
-"; }
+"
+}
+
 snapshot_rowcounts_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_rowcounts_local(${who}, ${schema}) -> ${out} (exact=${EXACT_ROWCOUNT})"
   if [[ "${EXACT_ROWCOUNT^^}" == "Y" ]]; then
     run_sql_spool_local "$ez" "snap_${who}_rowcnt_exact_${schema}" "$out" "
 SET SERVEROUTPUT ON SIZE UNLIMITED
@@ -1213,42 +1082,111 @@ ORDER BY t.table_name;
 "
   fi
 }
+
 snapshot_sys_privs_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_sys_privs_local(${who}, ${schema}) -> ${out}"
   run_sql_spool_local "$ez" "snap_${who}_sysprivs_${schema}" "$out" "
 SET COLSEP '|'
 SELECT privilege||'|'||admin_option
 FROM dba_sys_privs
 WHERE grantee=UPPER('${schema}')
 ORDER BY privilege;
-"; }
+"
+}
+
 snapshot_role_privs_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_role_privs_local(${who}, ${schema}) -> ${out}"
   run_sql_spool_local "$ez" "snap_${who}_roleprivs_${schema}" "$out" "
 SET COLSEP '|'
 SELECT granted_role||'|'||admin_option||'|'||default_role
 FROM dba_role_privs
 WHERE grantee=UPPER('${schema}')
 ORDER BY granted_role;
-"; }
+"
+}
+
 snapshot_tabprivs_on_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_tabprivs_on_local(${who}, ${schema}) -> ${out}"
   run_sql_spool_local "$ez" "snap_${who}_tabprivs_on_${schema}" "$out" "
 SET COLSEP '|'
 SELECT owner||'|'||table_name||'|'||grantee||'|'||privilege||'|'||grantable||'|'||grantor
 FROM dba_tab_privs
 WHERE owner=UPPER('${schema}') AND grantee <> 'PUBLIC'
 ORDER BY owner, table_name, grantee, privilege;
-"; }
+"
+}
+
 snapshot_tabprivs_to_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_tabprivs_to_local(${who}, ${schema}) -> ${out}"
   run_sql_spool_local "$ez" "snap_${who}_tabprivs_to_${schema}" "$out" "
 SET COLSEP '|'
 SELECT owner||'|'||table_name||'|'||grantee||'|'||privilege||'|'||grantable||'|'||grantor
 FROM dba_tab_privs
 WHERE grantee=UPPER('${schema}')
 ORDER BY owner, table_name, privilege;
-"; }
+"
+}
+
+snapshot_invalid_objects_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_invalid_objects_local(${who}, ${schema}) -> ${out}"
+  run_sql_spool_local "$ez" "snap_${who}_invalid_${schema}" "$out" "
+SET COLSEP '|'
+SELECT object_type||'|'||object_name
+FROM dba_objects
+WHERE owner=UPPER('${schema}') AND status<>'VALID' AND object_name NOT LIKE 'BIN$%'
+ORDER BY object_type, object_name;
+"
+}
+
+snapshot_unusable_indexes_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_unusable_indexes_local(${who}, ${schema}) -> ${out}"
+  run_sql_spool_local "$ez" "snap_${who}_unusable_idx_${schema}" "$out" "
+SET COLSEP '|'
+SELECT index_name||'|'||table_name
+FROM dba_indexes
+WHERE owner=UPPER('${schema}') AND status='UNUSABLE'
+ORDER BY index_name;
+"
+}
+
+snapshot_disabled_constraints_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_disabled_constraints_local(${who}, ${schema}) -> ${out}"
+  run_sql_spool_local "$ez" "snap_${who}_disabled_cons_${schema}" "$out" "
+SET COLSEP '|'
+SELECT constraint_type||'|'||constraint_name||'|'||table_name
+FROM dba_constraints
+WHERE owner=UPPER('${schema}') AND status='DISABLED'
+ORDER BY constraint_type, constraint_name;
+"
+}
+
+cap_db_version()       { local ez="$1"; run_sql_capture "$ez" "SELECT banner FROM v\\$version WHERE banner LIKE 'Oracle Database%'"; }
+cap_db_patchlevel()    { local ez="$1"; run_sql_capture "$ez" "SELECT NVL(MAX(version||' '||REGEXP_REPLACE(description,' Patch','')), 'N/A') FROM dba_registry_sqlpatch WHERE action='APPLY' AND status='SUCCESS'"; }
+cap_db_charsets()      { local ez="$1"; run_sql_capture "$ez" "SELECT LISTAGG(parameter||'='||value, ', ') WITHIN GROUP (ORDER BY parameter) FROM nls_database_parameters WHERE parameter IN ('NLS_CHARACTERSET','NLS_NCHAR_CHARACTERSET')"; }
+cap_total_objects()    { local ez="$1" schema="${2^^}"; run_sql_capture "$ez" "SELECT COUNT(*) FROM dba_objects WHERE owner=UPPER('${schema}') AND temporary='N' AND object_name NOT LIKE 'BIN$%'"; }
+cap_invalid_objects()  { local ez="$1" schema="${2^^}"; run_sql_capture "$ez" "SELECT COUNT(*) FROM dba_objects WHERE owner=UPPER('${schema}') AND status<>'VALID'"; }
 
 compare_one_schema_local() { local schema="${1^^}"
+  debug "compare_one_schema_local: START schema=${schema}"
   ensure_local_dir "$LOCAL_COMPARE_DIR"
   local S="${LOCAL_COMPARE_DIR}"
+
+  debug "Header capture: versions/patch/charsets/totals/invalids"
+  local src_ver tgt_ver src_patch tgt_patch src_cs tgt_cs
+  src_ver="$(cap_db_version "$SRC_EZCONNECT" || true)"; tgt_ver="$(cap_db_version "$TGT_EZCONNECT" || true)"
+  src_patch="$(cap_db_patchlevel "$SRC_EZCONNECT" || true)"; tgt_patch="$(cap_db_patchlevel "$TGT_EZCONNECT" || true)"
+  src_cs="$(cap_db_charsets "$SRC_EZCONNECT" || true)"; tgt_cs="$(cap_db_charsets "$TGT_EZCONNECT" || true)"
+  local src_tot tgt_tot src_inv tgt_inv
+  src_tot="$(cap_total_objects "$SRC_EZCONNECT" "$schema" || true)"; tgt_tot="$(cap_total_objects "$TGT_EZCONNECT" "$schema" || true)"
+  src_inv="$(cap_invalid_objects "$SRC_EZCONNECT" "$schema" || true)"; tgt_inv="$(cap_invalid_objects "$TGT_EZCONNECT" "$schema" || true)"
+  [[ -z "$src_tot" ]] && src_tot="0"; [[ -z "$tgt_tot" ]] && tgt_tot="0"
+  [[ -z "$src_inv" ]] && src_inv="0"; [[ -z "$tgt_inv" ]] && tgt_inv="0"
+  local tot_match inv_match
+  tot_match=$([[ "$src_tot" == "$tgt_tot" ]] && echo "Match" || echo "NO MATCH")
+  inv_match=$([[ "$src_inv" == "$tgt_inv" ]] && echo "Match" || echo "NO MATCH")
+  debug "Header data: src_ver='${src_ver}', tgt_ver='${tgt_ver}', src_patch='${src_patch}', tgt_patch='${tgt_patch}', src_cs='${src_cs}', tgt_cs='${tgt_cs}', totals=${src_tot}/${tgt_tot}, invalids=${src_inv}/${tgt_inv}"
+
+  debug "Snapshot: objects/rowcounts/privs (src & tgt)"
   snapshot_objects_local      "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_objects_${RUN_ID}.csv"
   snapshot_rowcounts_local    "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_rowcounts_${RUN_ID}.csv"
   snapshot_sys_privs_local    "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_sys_privs_${RUN_ID}.csv"
@@ -1262,14 +1200,33 @@ compare_one_schema_local() { local schema="${1^^}"
   snapshot_tabprivs_on_local  "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_obj_privs_on_${RUN_ID}.csv"
   snapshot_tabprivs_to_local  "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_obj_privs_to_${RUN_ID}.csv"
 
+  debug "Snapshot: expert checks (invalid objects / unusable idx / disabled constraints)"
+  snapshot_invalid_objects_local      "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_invalid_${RUN_ID}.csv"
+  snapshot_invalid_objects_local      "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_invalid_${RUN_ID}.csv"
+  snapshot_unusable_indexes_local     "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_unusable_idx_${RUN_ID}.csv"
+  snapshot_unusable_indexes_local     "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_unusable_idx_${RUN_ID}.csv"
+  snapshot_disabled_constraints_local "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_disabled_cons_${RUN_ID}.csv"
+  snapshot_disabled_constraints_local "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_disabled_cons_${RUN_ID}.csv"
+
   local html="${COMPARE_DIR}/compare_local_${schema}_${RUN_ID}.html"
   ensure_local_dir "$COMPARE_DIR"
+  debug "Writing HTML summary to ${html}"
   {
     echo "<html><head><meta charset='utf-8'><title>Schema Compare (LOCAL) ${schema}</title>"
     echo "<style>body{font-family:Arial,Helvetica,sans-serif} table{border-collapse:collapse} th,td{border:1px solid #ccc;padding:6px 10px} pre{white-space:pre-wrap}</style>"
     echo "</head><body>"
     echo "<h2>Schema Compare (LOCAL/Jumper): ${schema}</h2>"
     echo "<p>Run: ${RUN_ID}<br/>Source: ${SRC_EZCONNECT}<br/>Target: ${TGT_EZCONNECT}<br/>Local: ${LOCAL_COMPARE_DIR}</p>"
+
+    echo "<h3>Summary</h3>"
+    echo "<table>"
+    echo "<tr><th></th><th>Source</th><th>Target</th><th>Match</th></tr>"
+    echo "<tr><td><b>DB Version</b></td><td>$(echo "$src_ver" | sed 's/&/\&amp;/g;s/</\&lt;/g')</td><td>$(echo "$tgt_ver" | sed 's/&/\&amp;/g;s/</\&lt;/g')</td><td>$( [[ "$src_ver" == "$tgt_ver" ]] && echo 'Match' || echo 'NO MATCH' )</td></tr>"
+    echo "<tr><td><b>Patch Level</b></td><td>$(echo "$src_patch" | sed 's/&/\&amp;/g;s/</\&lt;/g')</td><td>$(echo "$tgt_patch" | sed 's/&/\&amp;/g;s/</\&lt;/g')</td><td>$( [[ "$src_patch" == "$tgt_patch" ]] && echo 'Match' || echo 'NO MATCH' )</td></tr>"
+    echo "<tr><td><b>Character Sets</b></td><td>$(echo "$src_cs" | sed 's/&/\&amp;/g;s/</\&lt;/g')</td><td>$(echo "$tgt_cs" | sed 's/&/\&amp;/g;s/</\&lt;/g')</td><td>$( [[ "$src_cs" == "$tgt_cs" ]] && echo 'Match' || echo 'NO MATCH' )</td></tr>"
+    echo "<tr><td><b>Total Objects (${schema})</b></td><td>${src_tot}</td><td>${tgt_tot}</td><td>${tot_match}</td></tr>"
+    echo "<tr><td><b>Invalid Objects (${schema})</b></td><td>${src_inv}</td><td>${tgt_inv}</td><td>${inv_match}</td></tr>"
+    echo "</table>"
   } > "$html"
 
   emit_set_delta_html "Objects (type|name|status)" \
@@ -1302,22 +1259,37 @@ compare_one_schema_local() { local schema="${1^^}"
     "${S}/${schema}_tgt_obj_privs_to_${RUN_ID}.csv" \
     "$html"
 
+  emit_set_delta_html "Invalid Objects (type|name)" \
+    "${S}/${schema}_src_invalid_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_invalid_${RUN_ID}.csv" \
+    "$html"
+
+  emit_set_delta_html "Disabled Constraints (type|name|table)" \
+    "${S}/${schema}_src_disabled_cons_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_disabled_cons_${RUN_ID}.csv" \
+    "$html"
+
+  emit_set_delta_html "Unusable Indexes (index|table)" \
+    "${S}/${schema}_src_unusable_idx_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_unusable_idx_${RUN_ID}.csv" \
+    "$html"
+
   echo "</body></html>" >> "$html"
   ok "HTML (LOCAL/Jumper): ${html}"
   email_inline_html "$html" "${MAIL_SUBJECT_PREFIX} Schema Compare LOCAL - ${schema} - ${RUN_ID}"
+  debug "compare_one_schema_local: END schema=${schema}"
 }
 
 compare_many_local() {
   local list_input="${1:-}"
+  debug "compare_many_local START (input='${list_input}')"
   local schemas_list=""
-  if [[ -n "$list_input" ]]; then
-    schemas_list="$list_input"
+  if [[ -n "$list_input" ]]; then schemas_list="$list_input"
   else
     schemas_list="$(get_nonmaintained_schemas)"
     [[ -z "$schemas_list" ]] && { warn "No non-maintained schemas found on source."; return 0; }
     ok "Auto-compare LOCAL mode (source list): ${schemas_list}"
   fi
-
   ensure_local_dir "$COMPARE_DIR"
   local index="${COMPARE_DIR}/compare_local_index_${RUN_ID}.html"
   {
@@ -1328,13 +1300,11 @@ compare_many_local() {
     echo "<p>Run: ${RUN_ID}<br/>Source: ${SRC_EZCONNECT}<br/>Target: ${TGT_EZCONNECT}</p>"
     echo "<table><tr><th>#</th><th>Schema</th><th>Report</th></tr>"
   } > "$index"
-
   local i=0
   IFS=',' read -r -a arr <<< "$schemas_list"
   for s in "${arr[@]}"; do
-    s="$(echo "$s" | awk '{$1=$1;print}')"
-    [[ -z "$s" ]] && continue
-    i=$((i+1))
+    s="$(echo "$s" | awk '{$1=$1;print}')"; [[ -z "$s" ]] && continue
+    i=$((i+1)); debug "compare_many_local item ${i}: ${s}"
     compare_one_schema_local "$s"
     local f="compare_local_${s^^}_${RUN_ID}.html"
     echo "<tr><td>${i}</td><td>${s^^}</td><td><a href='${f}'>${f}</a></td></tr>" >> "$index"
@@ -1342,6 +1312,7 @@ compare_many_local() {
   echo "</table></body></html>" >> "$index"
   ok "Index HTML (LOCAL): ${index}"
   email_inline_html "$index" "${MAIL_SUBJECT_PREFIX} Compare LOCAL Index - ${RUN_ID}"
+  debug "compare_many_local END"
 }
 
 # ------------------------------ Menus -----------------------------------------
@@ -1485,7 +1456,7 @@ main_menu() {
   while true; do
     cat <<EOS | say_to_user
 
-======== Oracle 19c Migration & DDL (${SCRIPT_NAME} v4aq) ========
+======== Oracle 19c Migration & DDL (${SCRIPT_NAME} v4as) ========
 Source: ${SRC_EZCONNECT}
 Target: ${TGT_EZCONNECT}
 NAS:    ${NAS_PATH:-<not set>}
