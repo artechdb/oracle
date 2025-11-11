@@ -83,7 +83,7 @@ parfile_dir_for_mode(){
 
 run_sql(){
   local ez="$1"; shift; local tag="${1:-sql}"; shift || true; local sql="$*"
-  local conn="${SYS_USER}/${SYS_PASSWORD}@${ez} as sysdba"; local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
+  local conn="${SYS_USER; local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
   debug "run_sql ${tag} on ${ez}"; sqlplus -s "$conn" <<SQL >"$logf" 2>&1
 SET PAGES 0 FEEDBACK OFF LINES 32767 VERIFY OFF HEADING OFF ECHO OFF LONG 1000000 LONGCHUNKSIZE 1000000
 SET DEFINE OFF
@@ -96,7 +96,7 @@ SQL
 
 run_sql_try(){
   local ez="$1"; shift; local tag="${1:-sqltry}"; shift || true; local sql="$*"
-  local conn="${SYS_USER}/${SYS_PASSWORD}@${ez} as sysdba"; local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
+  local conn="${SYS_USER; local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
   debug "run_sql_try ${tag} on ${ez}"; sqlplus -s "$conn" <<SQL >"$logf" 2>&1
 SET PAGES 0 FEEDBACK OFF LINES 32767 VERIFY OFF HEADING OFF ECHO OFF LONG 1000000 LONGCHUNKSIZE 1000000
 SET DEFINE OFF
@@ -109,7 +109,7 @@ SQL
 
 run_sql_spool_local(){
   local ez="$1"; shift; local tag="$1"; shift; local out="$1"; shift; local body="$*"
-  local conn="${SYS_USER}/${SYS_PASSWORD}@${ez} as sysdba"; local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
+  local conn="${SYS_USER; local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
   debug "spool_local ${tag} -> ${out}"
   sqlplus -s "$conn" <<SQL >"$logf" 2>&1
 SET PAGESIZE 0 LINESIZE 4000 LONG 1000000 LONGCHUNKSIZE 1000000 TRIMSPOOL ON TRIMOUT ON FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
@@ -125,11 +125,14 @@ SQL
 }
 
 run_sql_capture(){
-  local ez="$1" body="$2"; local conn="${SYS_USER}/${SYS_PASSWORD}@${ez} as sysdba"
-  # Always return 0 to avoid 'set -e' aborts on command substitution failures.
-  # Emit empty output on error.
-  local out rc
-  out="$(sqlplus -s "$conn" <<SQL 2>&1
+  local ez="$1"
+  local body="$2"
+  local conn="${SYS_USER
+  local tmp="${LOG_DIR}/.capture_${RUN_ID}_$$.out"
+
+  # Do not let set -e abort the script if sqlplus fails here.
+  set +e
+  sqlplus -s "$conn" >"$tmp" 2>&1 <<SQL
 SET PAGES 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMSPOOL ON LINES 32767
 SET LONG 1000000 LONGCHUNKSIZE 1000000
 SET DEFINE OFF
@@ -137,14 +140,25 @@ ${body}
 /
 EXIT
 SQL
-)"; rc=$?
-  if [[ $rc -ne 0 ]] || grep -qi "ORA-" <<<"$out"; then
+  local rc=$?
+  set -e
+
+  # If any ORA- appears, treat as empty result but do not abort caller.
+  if grep -qi "ORA-" "$tmp"; then
+    rc=1
+  fi
+
+  if [[ $rc -ne 0 ]]; then
     echo ""
+    rm -f "$tmp"
     return 0
   fi
-  echo "$out" | awk 'NF{last=$0} END{print last}'
+
+  awk 'NF{last=$0} END{print last}' "$tmp"
+  rm -f "$tmp"
   return 0
-}/${SYS_PASSWORD}@${ez} as sysdba"
+}
+/${SYS_PASSWORD}@${ez} as sysdba"
   local out rc
   out="$(sqlplus -s "$conn" <<SQL 2>&1
 SET PAGES 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMSPOOL ON LINES 32767
@@ -207,17 +221,54 @@ emit_simple_html_and_email(){
 dp_emit_html_and_email(){
   local tool="$1" tag="$2" pf="$3" client_log="$4"
   local html="${LOG_DIR}/${tool}_${tag}_${RUN_ID}.html"
-  { echo "<html><head><meta charset='utf-8'><title>${tool^^} ${tag} ${RUN_ID}</title>"
-    echo "<style>body{font-family:Arial} pre{white-space:pre-wrap;border:1px solid #ddd;padding:10px;background:#fafafa} .box{border:1px solid #ccc;padding:10px;margin:8px 0}</style>"
-    echo "</head><body><h2>${tool^^} job completed</h2><p><b>Run:</b> ${RUN_ID} <b>Tool:</b> ${tool} <b>Tag:</b> ${tag}</p>"
-    echo "<div class='box'><h3>Parfile</h3><pre>"
-    if [[ -f "$pf" ]]; then sed -E 's/(encryption_password=).*/\1*****/I' "$pf" | sed 's/&/\&amp;/g;s/</\&lt;/g'; else echo "(parfile not found)"; fi
-    echo "</pre></div><div class='box'><h3>Client Log</h3><pre>"
-    if [[ -f "$client_log" ]]; then sed 's/&/\&amp;/g;s/</\&lt;/g' "$client_log"; else echo "(client log not found)"; fi
-    echo "</pre></div></body></html>"
-  } > "$html"
+  cat > "$html" <<'HTML'
+<html><head><meta charset="utf-8"><title>__TITLE__</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif}
+pre{white-space:pre-wrap;border:1px solid #ddd;padding:10px;background:#fafafa}
+.box{border:1px solid #ccc;padding:10px;margin:8px 0}
+</style>
+</head><body>
+<h2>__HEADER__</h2>
+<p><b>Run:</b> __RUNID__ <b>Tool:</b> __TOOL__ <b>Tag:</b> __TAG__</p>
+<div class="box"><h3>Parfile</h3><pre>
+__PARFILE__
+</pre></div>
+<div class="box"><h3>Client Log</h3><pre>
+__CLIENTLOG__
+</pre></div>
+</body></html>
+HTML
+  # Populate placeholders
+  sed -i "s/__TITLE__/${tool^^} ${tag} ${RUN_ID}/g" "$html"
+  sed -i "s/__HEADER__/${tool^^} job completed/g" "$html"
+  sed -i "s/__RUNID__/${RUN_ID}/g" "$html"
+  sed -i "s/__TOOL__/${tool}/g" "$html"
+  sed -i "s/__TAG__/${tag}/g" "$html"
+
+  # Insert parfile content (mask encryption password and HTML-escape)
+  local par_tmp="${LOG_DIR}/.tmp_par_${RUN_ID}.txt"
+  if [[ -f "$pf" ]]; then
+    sed -E 's/(encryption_password=).*/\1*****/I' "$pf" | sed 's/&/\&amp;/g;s/</\&lt;/g' > "$par_tmp"
+  else
+    echo "(parfile not found: $pf)" > "$par_tmp"
+  fi
+  perl -0777 -pe "s/__PARFILE__/`sed -e 's/[\\\\&]/\\\\&/g' \"$par_tmp\"`/g" -i "$html" 2>/dev/null || \
+  sed -i "s|__PARFILE__|$(sed -e 's/[\/&]/\\&/g' \"$par_tmp\")|g" "$html"
+
+  # Insert client log content (HTML-escape)
+  local log_tmp="${LOG_DIR}/.tmp_log_${RUN_ID}.txt"
+  if [[ -f "$client_log" ]]; then
+    sed 's/&/\&amp;/g;s/</\&lt;/g' "$client_log" > "$log_tmp"
+  else
+    echo "(client log not found: $client_log)" > "$log_tmp"
+  fi
+  perl -0777 -pe "s/__CLIENTLOG__/`sed -e 's/[\\\\&]/\\\\&/g' \"$log_tmp\"`/g" -i "$html" 2>/dev/null || \
+  sed -i "s|__CLIENTLOG__|$(sed -e 's/[\/&]/\\&/g' \"$log_tmp\")|g" "$html"
+
   email_inline_html "$html" "${MAIL_SUBJECT_PREFIX} ${tool^^} ${tag} ${RUN_ID}" || true
 }
+
 
 create_or_replace_directory(){
   local ez="$1" dir_name="$2" dir_path="$3" host_tag="$4"
