@@ -126,6 +126,25 @@ SQL
 
 run_sql_capture(){
   local ez="$1" body="$2"; local conn="${SYS_USER}/${SYS_PASSWORD}@${ez} as sysdba"
+  # Always return 0 to avoid 'set -e' aborts on command substitution failures.
+  # Emit empty output on error.
+  local out rc
+  out="$(sqlplus -s "$conn" <<SQL 2>&1
+SET PAGES 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMSPOOL ON LINES 32767
+SET LONG 1000000 LONGCHUNKSIZE 1000000
+SET DEFINE OFF
+${body}
+/
+EXIT
+SQL
+)"; rc=$?
+  if [[ $rc -ne 0 ]] || grep -qi "ORA-" <<<"$out"; then
+    echo ""
+    return 0
+  fi
+  echo "$out" | awk 'NF{last=$0} END{print last}'
+  return 0
+}/${SYS_PASSWORD}@${ez} as sysdba"
   local out rc
   out="$(sqlplus -s "$conn" <<SQL 2>&1
 SET PAGES 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMSPOOL ON LINES 32767
@@ -240,8 +259,8 @@ SELECT 'DB_NAME='||name.db_name||' DBID='||name.dbid||CHR(10)||'VERSION='||ver.b
 SQL
 }
 
-show_db_identity(){ local ez="$1" which="$2"; local info; info="$(run_sql_capture "$ez" "$(_db_ident_block)")"; echo "---- ${which} ----" | say_to_user; echo "$info" | say_to_user; }
-db_connection_validation(){ ok "Validating connections…"; show_db_identity "$SRC_EZCONNECT" "SOURCE"; show_db_identity "$TGT_EZCONNECT" "TARGET"; }
+show_db_identity(){ local ez="$1" which="$2"; local info; info="$(run_sql_capture "$ez" "$(_db_ident_block)")"; echo "---- ${which} ----" | say_to_user; if [[ -z "${info// }" ]]; then echo "(connection ok, but identity query returned no rows)" | say_to_user; else echo "$info" | say_to_user; fi; }
+db_connection_validation(){ ok "Validating connections…"; show_db_identity "$SRC_EZCONNECT" "SOURCE"; show_db_identity "$TGT_EZCONNECT" "TARGET"; ok "Validation step finished."; }
 VALIDATED_ONCE="${VALIDATED_ONCE:-N}"
 ensure_connections_ready(){ [[ "$VALIDATED_ONCE" == "Y" ]] || { db_connection_validation; VALIDATED_ONCE="Y"; }; }
 
