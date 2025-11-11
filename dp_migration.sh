@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dp_migrate.sh (v4as) - Oracle 19c Data Pump migration & compare toolkit
+# dp_migrate.sh (v4at) - Oracle 19c Data Pump migration & compare toolkit
 # =============================================================================
-# Fixes in v4as:
-# - Resolved "version: unbound variable" by removing any risky 'version:' usage
-#   under 'set -u' and printing tool version safely.
-# - Added DEBUG tracing for compare schema functions (start/end and each step).
-# - Retains inline-HTML email after expdp/impdp runs, DDL extraction suite,
-#   robust parfile placement, and local (jumper) compare with rich HTML header.
+# New in v4at:
+# - Compare HTML now starts with two side-by-side sections:
+#   (1) Object counts by type (src vs tgt)
+#   (2) Table row counts by table name (src vs tgt)
+# - Added snapshots + DEBUG for the new sections.
+# - Keeps all v4as fixes (no 'version: unbound', rich DEBUG in compare flow,
+#   inline HTML mail after expdp/impdp, robust DDL extraction, etc.)
 # =============================================================================
 
 set -euo pipefail
@@ -1042,6 +1043,33 @@ emit_rowcount_delta_html() {
   rm -f "$L" "$R"
 }
 
+# NEW: side-by-side key|value table (full join by key)
+emit_kv_side_by_side_html() {
+  local title="$1" left_csv="$2" right_csv="$3" html="$4" left_hdr="$5" right_hdr="$6" key_hdr="$7"
+  local L R; L="$(mktemp)"; R="$(mktemp)"
+  normalize_sorted "$left_csv"  "$L"
+  normalize_sorted "$right_csv" "$R"
+  echo "<h3>${title}</h3><table><tr><th>${key_hdr}</th><th>${left_hdr}</th><th>${right_hdr}</th></tr>" >> "$html"
+  awk -F'|' '
+    NR==FNR { l[$1]=$2; next }
+    { r[$1]=$2 }
+    END{
+      for (k in l) keys[k]=1
+      for (k in r) keys[k]=1
+      PROCINFO["sorted_in"]="@ind_str_asc"
+      for (k in keys){
+        lv=(k in l)?l[k]:""; rv=(k in r)?r[k]:"";
+        gsub(/&/,"\\&amp;",k); gsub(/</,"\\&lt;",k)
+        gsub(/&/,"\\&amp;",lv); gsub(/</,"\\&lt;",lv)
+        gsub(/&/,"\\&amp;",rv); gsub(/</,"\\&lt;",rv)
+        printf("<tr><td>%s</td><td>%s</td><td>%s</td></tr>\n", k, lv, rv)
+      }
+    }' "$L" "$R" >> "$html"
+  echo "</table>" >> "$html"
+  rm -f "$L" "$R"
+}
+
+# snapshots
 snapshot_objects_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
   debug "snapshot_objects_local(${who}, ${schema}) -> ${out}"
   run_sql_spool_local "$ez" "snap_${who}_objects_${schema}" "$out" "
@@ -1052,6 +1080,21 @@ WHERE owner=UPPER('${schema}')
   AND temporary='N'
   AND object_name NOT LIKE 'BIN$%'
 ORDER BY object_type, object_name;
+"
+}
+
+# NEW: object counts by type
+snapshot_object_counts_local() { local ez="$1" who="$2" schema="${3^^}" out="${4}"
+  debug "snapshot_object_counts_local(${who}, ${schema}) -> ${out}"
+  run_sql_spool_local "$ez" "snap_${who}_objcounts_${schema}" "$out" "
+SET COLSEP '|'
+SELECT object_type||'|'||COUNT(*)
+FROM dba_objects
+WHERE owner=UPPER('${schema}')
+  AND temporary='N'
+  AND object_name NOT LIKE 'BIN$%'
+GROUP BY object_type
+ORDER BY object_type;
 "
 }
 
@@ -1187,18 +1230,18 @@ compare_one_schema_local() { local schema="${1^^}"
   debug "Header data: src_ver='${src_ver}', tgt_ver='${tgt_ver}', src_patch='${src_patch}', tgt_patch='${tgt_patch}', src_cs='${src_cs}', tgt_cs='${tgt_cs}', totals=${src_tot}/${tgt_tot}, invalids=${src_inv}/${tgt_inv}"
 
   debug "Snapshot: objects/rowcounts/privs (src & tgt)"
-  snapshot_objects_local      "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_objects_${RUN_ID}.csv"
-  snapshot_rowcounts_local    "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_rowcounts_${RUN_ID}.csv"
-  snapshot_sys_privs_local    "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_sys_privs_${RUN_ID}.csv"
-  snapshot_role_privs_local   "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_role_privs_${RUN_ID}.csv"
-  snapshot_tabprivs_on_local  "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_obj_privs_on_${RUN_ID}.csv"
-  snapshot_tabprivs_to_local  "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_obj_privs_to_${RUN_ID}.csv"
-  snapshot_objects_local      "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_objects_${RUN_ID}.csv"
-  snapshot_rowcounts_local    "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_rowcounts_${RUN_ID}.csv"
-  snapshot_sys_privs_local    "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_sys_privs_${RUN_ID}.csv"
-  snapshot_role_privs_local   "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_role_privs_${RUN_ID}.csv"
-  snapshot_tabprivs_on_local  "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_obj_privs_on_${RUN_ID}.csv"
-  snapshot_tabprivs_to_local  "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_obj_privs_to_${RUN_ID}.csv"
+  snapshot_objects_local        "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_objects_${RUN_ID}.csv"
+  snapshot_rowcounts_local      "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_rowcounts_${RUN_ID}.csv"
+  snapshot_sys_privs_local      "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_sys_privs_${RUN_ID}.csv"
+  snapshot_role_privs_local     "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_role_privs_${RUN_ID}.csv"
+  snapshot_tabprivs_on_local    "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_obj_privs_on_${RUN_ID}.csv"
+  snapshot_tabprivs_to_local    "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_obj_privs_to_${RUN_ID}.csv"
+  snapshot_objects_local        "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_objects_${RUN_ID}.csv"
+  snapshot_rowcounts_local      "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_rowcounts_${RUN_ID}.csv"
+  snapshot_sys_privs_local      "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_sys_privs_${RUN_ID}.csv"
+  snapshot_role_privs_local     "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_role_privs_${RUN_ID}.csv"
+  snapshot_tabprivs_on_local    "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_obj_privs_on_${RUN_ID}.csv"
+  snapshot_tabprivs_to_local    "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_obj_privs_to_${RUN_ID}.csv"
 
   debug "Snapshot: expert checks (invalid objects / unusable idx / disabled constraints)"
   snapshot_invalid_objects_local      "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_invalid_${RUN_ID}.csv"
@@ -1207,6 +1250,10 @@ compare_one_schema_local() { local schema="${1^^}"
   snapshot_unusable_indexes_local     "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_unusable_idx_${RUN_ID}.csv"
   snapshot_disabled_constraints_local "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_disabled_cons_${RUN_ID}.csv"
   snapshot_disabled_constraints_local "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_disabled_cons_${RUN_ID}.csv"
+
+  # NEW: object counts by type (for top-of-report table)
+  snapshot_object_counts_local "$SRC_EZCONNECT" "src" "$schema" "${S}/${schema}_src_objcounts_${RUN_ID}.csv"
+  snapshot_object_counts_local "$TGT_EZCONNECT" "tgt" "$schema" "${S}/${schema}_tgt_objcounts_${RUN_ID}.csv"
 
   local html="${COMPARE_DIR}/compare_local_${schema}_${RUN_ID}.html"
   ensure_local_dir "$COMPARE_DIR"
@@ -1217,7 +1264,21 @@ compare_one_schema_local() { local schema="${1^^}"
     echo "</head><body>"
     echo "<h2>Schema Compare (LOCAL/Jumper): ${schema}</h2>"
     echo "<p>Run: ${RUN_ID}<br/>Source: ${SRC_EZCONNECT}<br/>Target: ${TGT_EZCONNECT}<br/>Local: ${LOCAL_COMPARE_DIR}</p>"
+  } > "$html"
 
+  # --------- NEW TOP BLOCKS (side-by-side) ----------
+  emit_kv_side_by_side_html "Object counts by type (Source vs Target)" \
+    "${S}/${schema}_src_objcounts_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_objcounts_${RUN_ID}.csv" \
+    "$html" "Source count" "Target count" "Object Type"
+
+  emit_kv_side_by_side_html "Table row counts by table (Source vs Target)" \
+    "${S}/${schema}_src_rowcounts_${RUN_ID}.csv" \
+    "${S}/${schema}_tgt_rowcounts_${RUN_ID}.csv" \
+    "$html" "Source rows" "Target rows" "Table"
+
+  # ------------- Existing summary & detailed deltas -------------
+  {
     echo "<h3>Summary</h3>"
     echo "<table>"
     echo "<tr><th></th><th>Source</th><th>Target</th><th>Match</th></tr>"
@@ -1227,7 +1288,7 @@ compare_one_schema_local() { local schema="${1^^}"
     echo "<tr><td><b>Total Objects (${schema})</b></td><td>${src_tot}</td><td>${tgt_tot}</td><td>${tot_match}</td></tr>"
     echo "<tr><td><b>Invalid Objects (${schema})</b></td><td>${src_inv}</td><td>${tgt_inv}</td><td>${inv_match}</td></tr>"
     echo "</table>"
-  } > "$html"
+  } >> "$html"
 
   emit_set_delta_html "Objects (type|name|status)" \
     "${S}/${schema}_src_objects_${RUN_ID}.csv" \
@@ -1456,7 +1517,7 @@ main_menu() {
   while true; do
     cat <<EOS | say_to_user
 
-======== Oracle 19c Migration & DDL (${SCRIPT_NAME} v4as) ========
+======== Oracle 19c Migration & DDL (${SCRIPT_NAME} v4at) ========
 Source: ${SRC_EZCONNECT}
 Target: ${TGT_EZCONNECT}
 NAS:    ${NAS_PATH:-<not set>}
