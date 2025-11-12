@@ -82,36 +82,65 @@ parfile_dir_for_mode(){
 }
 
 run_sql(){
-  local ez="$1"; shift; local tag="${1:-sql}"; shift || true; local sql="$*"
-  local conn="${SYS_USER; local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
-  debug "run_sql ${tag} on ${ez}"; sqlplus -s "$conn" <<SQL >"$logf" 2>&1
+  local ez="$1"; shift
+  local tag="${1:-sql}"; shift || true
+  local sql="$*"
+  local conn="${SYS_USER
+  local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
+  debug "run_sql ${tag} on ${ez} -> $logf"
+  sqlplus -s "$conn" >"$logf" 2>&1 <<SQL
 SET PAGES 0 FEEDBACK OFF LINES 32767 VERIFY OFF HEADING OFF ECHO OFF LONG 1000000 LONGCHUNKSIZE 1000000
 SET DEFINE OFF
 ${sql}
+/
 EXIT
 SQL
-  if grep -qi "ORA-" "$logf"; then err "SQL error: ${tag}"; tail -n 80 "$logf" | mask_pwd; exit 1; fi
+  if grep -qi "ORA-" "$logf"; then
+    err "SQL error: ${tag} (see $logf)"
+    tail -n 80 "$logf" | mask_pwd
+    exit 1
+  fi
   ok "SQL ok: ${tag}"
 }
 
+
 run_sql_try(){
-  local ez="$1"; shift; local tag="${1:-sqltry}"; shift || true; local sql="$*"
-  local conn="${SYS_USER; local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
-  debug "run_sql_try ${tag} on ${ez}"; sqlplus -s "$conn" <<SQL >"$logf" 2>&1
+  local ez="$1"; shift
+  local tag="${1:-sqltry}"; shift || true
+  local sql="$*"
+  local conn="${SYS_USER
+  local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
+  debug "run_sql_try ${tag} on ${ez} -> $logf"
+  set +e
+  sqlplus -s "$conn" >"$logf" 2>&1 <<SQL
 SET PAGES 0 FEEDBACK OFF LINES 32767 VERIFY OFF HEADING OFF ECHO OFF LONG 1000000 LONGCHUNKSIZE 1000000
 SET DEFINE OFF
 ${sql}
+/
 EXIT
 SQL
-  if grep -qi "ORA-" "$logf"; then warn "SQL (non-fatal) error on ${tag}"; tail -n 60 "$logf" | mask_pwd; return 1; fi
-  ok "SQL ok (non-fatal): ${tag}"; return 0
+  local rc=$?
+  set -e
+  if grep -qi "ORA-" "$logf"; then rc=1; fi
+  if [[ $rc -ne 0 ]]; then
+    warn "SQL (non-fatal) error on ${tag} — see $logf"
+    tail -n 60 "$logf" | mask_pwd
+    return 1
+  fi
+  ok "SQL ok (non-fatal): ${tag}"
+  return 0
 }
 
+
 run_sql_spool_local(){
-  local ez="$1"; shift; local tag="$1"; shift; local out="$1"; shift; local body="$*"
-  local conn="${SYS_USER; local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
-  debug "spool_local ${tag} -> ${out}"
-  sqlplus -s "$conn" <<SQL >"$logf" 2>&1
+  local ez="$1"; shift
+  local tag="$1"; shift
+  local out="$1"; shift
+  local body="$*"
+  local conn="${SYS_USER
+  local logf="${LOG_DIR}/${tag}_${RUN_ID}.log"
+  debug "run_sql_spool_local ${tag} -> spool $out ; log=$logf"
+  sqlplus -s "$conn" >"$logf" 2>&1 <<SQL
 SET PAGESIZE 0 LINESIZE 4000 LONG 1000000 LONGCHUNKSIZE 1000000 TRIMSPOOL ON TRIMOUT ON FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
 SET DEFINE OFF
 WHENEVER SQLERROR EXIT SQL.SQLCODE
@@ -120,9 +149,14 @@ ${body}
 SPOOL OFF
 EXIT
 SQL
-  if grep -qi "ORA-" "$logf"; then err "SQL error: ${tag}"; tail -n 80 "$logf" | mask_pwd; exit 1; fi
+  if grep -qi "ORA-" "$logf"; then
+    err "SQL error: ${tag} (see $logf)"
+    tail -n 80 "$logf" | mask_pwd
+    exit 1
+  fi
   ok "Spool ok: $out"
 }
+
 
 run_sql_capture(){
   local ez="$1"
@@ -376,20 +410,21 @@ show_and_confirm_parfile(){
 
 # -------------------- DDL extraction with dynamic SPOOL header ----------------
 ddl_spool(){
-  local out="$1"; shift; local label="${1:-}"; shift || true; local body="$*"
+  local out="$1"; shift
+  local label="${1:-}"; shift || true
+  local body="$*"
   [[ -z "$label" ]] && label="$(basename "${out%.sql}" | sed 's/^[0-9]\+_//')"
-  local conn="${SYS_USER}/${SYS_PASSWORD}@${SRC_EZCONNECT} as sysdba"; debug "DDL -> ${out} label=${label}"
-  sqlplus -s "$conn" <<SQL >"$out" 2>"${out}.log"
-SET TERMOUT ON ECHO ON FEEDBACK ON LINES 32767 PAGES 0 SERVEROUTPUT ON SIZE UNLIMITED
-SET DEFINE ON
-COLUMN V_DBNAME NEW_VALUE V_DBNAME
-COLUMN V_TS     NEW_VALUE V_TS
-SELECT name V_DBNAME FROM v\$database;
-SELECT TO_CHAR(SYSDATE,'YYYYMMDD_HH24MISS') V_TS FROM dual;
-DEFINE V_SCRIPT='${label}'
-SPOOL &&V_DBNAME._&&V_SCRIPT._&&V_TS..log
+
+  local conn="${SYS_USER}/${SYS_PASSWORD}@${SRC_EZCONNECT} as sysdba"
+  local seslog="${out}.log"
+  local tmp="${out}.tmp.body"
+
+  debug "DDL spool -> ${out} (label=${label})"
+
+  # 1) Extract just the DDL content into a temp file (no SPOOL here).
+  sqlplus -s "$conn" >"$tmp" 2>"$seslog" <<SQL
+SET PAGES 0 FEEDBACK OFF HEADING OFF LINES 32767 LONG 1000000 LONGCHUNKSIZE 1000000 TRIMSPOOL ON TRIMOUT ON VERIFY OFF
 SET DEFINE OFF
-SET LONG 1000000 LONGCHUNKSIZE 1000000
 BEGIN
   DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE',            FALSE);
   DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE);
@@ -401,12 +436,42 @@ BEGIN
 END;
 /
 ${body}
-SPOOL OFF
+/
 EXIT
 SQL
-  if grep -qi "ORA-" "${out}.log"; then err "DDL extract error: $(basename "$out")"; tail -n 60 "${out}.log" | mask_pwd; return 1; fi
-  ok "DDL file: $out"
+
+  # 2) Build the final .sql file that, when run later, dynamically SPOOLs to <DBNAME>_<LABEL>_<TS>.log
+  {
+    cat <<'SQL'
+-- Generated by ${SCRIPT_NAME} @ ${RUN_ID}
+SET TERMOUT ON ECHO ON FEEDBACK ON LINES 32767 PAGES 0 SERVEROUTPUT ON SIZE UNLIMITED
+SET DEFINE ON
+COLUMN V_DBNAME NEW_VALUE V_DBNAME
+COLUMN V_TS     NEW_VALUE V_TS
+SELECT name V_DBNAME FROM v$database;
+SELECT TO_CHAR(SYSDATE,'YYYYMMDD_HH24MISS') V_TS FROM dual;
+SQL
+    echo "DEFINE V_SCRIPT='${label}'"
+    cat <<'SQL'
+SPOOL &&V_DBNAME._&&V_SCRIPT._&&V_TS..log
+SET DEFINE OFF
+SQL
+  } > "$out"
+
+  # Append the extracted DDL and close SPOOL
+  cat "$tmp" >> "$out"
+  echo "SPOOL OFF" >> "$out"
+  rm -f "$tmp"
+
+  if grep -qi "ORA-" "$seslog"; then
+    err "DDL extract error in $(basename "$out") — see $seslog"
+    tail -n 80 "$seslog" | mask_pwd
+    return 1
+  fi
+  ok "DDL file created (with dynamic SPOOL prolog): $out"
 }
+
+
 
 to_inlist_upper(){ local csv="$1" out="" tok; IFS=',' read -r -a arr <<< "$csv"; for tok in "${arr[@]}"; do tok="$(echo "$tok"|awk '{$1=$1;print}')"; [[ -z "$tok" ]] && continue; tok="${tok^^}"; out+="${out:+,}'${tok}'"; done; printf "%s" "$out"; }
 
