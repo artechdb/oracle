@@ -1,0 +1,1492 @@
+-- ================================================================
+-- Purpose: Generate a self-describing Oracle health snapshot for on-call incident response.
+-- Input: The script PROMPTS for a ServiceNow ticket number and incident category.
+-- Design: Output embeds instructions so Copilot performs a fresh, independent analysis every run.
+-- Control: Diagnostics are evidence; Copilot output is advisory and reviewed before attachment.
+-- Warning: No database changes are performed by this script.
+--
+-- updated 5/1/2026, noon
+-- ================================================================
+
+SET LINESIZE 200
+SET PAGESIZE 900
+SET VERIFY OFF
+SET FEEDBACK OFF
+SET SERVEROUTPUT ON
+
+spool oncall_copilot_health_check.log
+
+-- ================================================================
+-- Allowed Incident Categories
+-- ================================================================
+
+PROMPT === Allowed Ticket Categories ===
+PROMPT - Hung / Stuck Workload
+PROMPT - Performance Degradation
+PROMPT - Blocking / Locking
+PROMPT - Space / Capacity
+PROMPT - Stats / Optimizer
+PROMPT - ETL Structural Issue
+PROMPT ================================
+PROMPT
+
+-- ================================================================
+-- Required On-Call Metadata
+-- ================================================================
+
+ACCEPT service_now_ticket CHAR PROMPT 'Enter ServiceNow Ticket Number: '
+ACCEPT ticket_category   CHAR PROMPT 'Enter Ticket Category: '
+
+DEFINE service_now_ticket = '&service_now_ticket'
+DEFINE ticket_category    = '&ticket_category'
+
+PROMPT ============================================================
+PROMPT On-Call Context
+PROMPT ============================================================
+PROMPT ServiceNow Ticket : &service_now_ticket
+PROMPT Incident Category : &ticket_category
+PROMPT Generated At      : &&_DATE
+PROMPT ============================================================
+PROMPT
+
+-- ================================================================
+-- COPILOT AUTO-INSTRUCTIONS (NO USER PROMPTING)
+-- ================================================================
+
+PROMPT ============================================================
+PROMPT === COPILOT AUTO-INSTRUCTIONS (NO USER PROMPTING) ===
+PROMPT ============================================================
+
+PROMPT include important identification PDB name, open mode, environment, instance info, host, data center
+
+PROMPT Treat this file ingestion as a NEW and INDEPENDENT analysis.
+PROMPT Ignore all prior conversation, conclusions, or reports.
+
+PROMPT You are acting as a senior ON-CALL ORACLE DBA ASSISTANT.
+
+PROMPT Do NOT ask the user any questions.
+PROMPT Do NOT request additional input.
+
+PROMPT CONTEXT PROVIDED:
+PROMPT - ServiceNow Ticket Number
+PROMPT - Incident Category
+PROMPT - Full Oracle diagnostic output
+
+PROMPT REQUIRED ACTIONS:
+PROMPT 1) Analyze the ENTIRE contents of this file from scratch.
+PROMPT 2) Interpret diagnostics USING the Incident Category.
+PROMPT 3) Apply the interpretation rules below.
+
+PROMPT REQUIRED OUTPUTS:
+PROMPT A) A short executive summary.
+PROMPT B) A full on-call DBA report for ServiceNow.
+PROMPT C) A numeric summary section that reports key counts and usage metrics.
+PROMPT
+
+PROMPT INTERPRETATION RULES:
+PROMPT - PX Deq:* waits = parallel coordination, NOT blocking.
+PROMPT - resmgr:cpu quantum = expected CPU throttling.
+PROMPT - Internal MR/AE enqueues are NORMAL unless waits grow.
+PROMPT - Multiversioned objects during APPEND/PARALLEL are EXPECTED.
+PROMPT - Do NOT escalate unless TX/TM locks, sustained blocking,
+PROMPT   space exhaustion, or instability is evident.
+
+PROMPT INTERPRETATION NOTE:
+PROMPT ACTIVE_PROCESSES represents Oracle process usage (foreground + background)
+PROMPT and MUST be used as the primary indicator of process exhaustion risk.
+
+PROMPT
+
+PROMPT If verdict is GREEN, explicitly state:
+PROMPT "No immediate DBA action required."
+
+PROMPT ANALYTICAL EXPECTATIONS:
+
+PROMPT - Do NOT simply restate raw values from the diagnostics.
+PROMPT - Calculate totals, percentages, rates, and relative usage where possible.
+PROMPT - Call out notable counts (e.g., number of blockers, sessions, locks).
+PROMPT - Highlight sizes (GB, %, rates) and explain whether they are normal or risky.
+PROMPT - Explicitly state WHY each key metric is healthy, degraded, or concerning.
+PROMPT - When data is missing, say so explicitly rather than assuming.
+PROMPT - Quantitative findings (including zero counts) are REQUIRED, not optional.
+
+PROMPT COUNT SUMMARY REQUIREMENTS:
+PROMPT - Provide a concise numeric summary section with key counts.
+PROMPT - Include zero counts explicitly (e.g., 0 blocking sessions).
+PROMPT - Use DISTINCT session counts where applicable.
+PROMPT - Use ACTIVE_PROCESSES for process capacity, not session counts.
+PROMPT - Do not infer counts from queries that do not support them.
+
+PROMPT ============================================================
+PROMPT ESCALATION and VERDICT GUIDANCE (ADVISORY)
+PROMPT ============================================================
+
+PROMPT
+
+PROMPT Use the following guidance to determine GREEN, YELLOW, or RED verdicts.
+PROMPT These thresholds are ADVISORY and do NOT replace human DBA judgment.
+PROMPT Copilot MUST explain WHY a condition meets the chosen verdict.
+
+PROMPT
+
+PROMPT VERDICT DEFINITIONS:
+PROMPT - GREEN: Metrics within expected operating range; no immediate DBA action.
+PROMPT - YELLOW: Metrics elevated, abnormal, or trending; monitor and prepare.
+PROMPT - RED: Metrics indicate imminent or active risk requiring intervention.
+
+PROMPT
+
+PROMPT PROCESS CAPACITY (ACTIVE_PROCESSES vs MAX_PROCESSES):
+PROMPT - GREEN: < 65% utilization with stable or declining trend.
+PROMPT - YELLOW: 65%-85% utilization or sustained upward trend.
+PROMPT - RED: > 85% utilization, rapid growth, or ORA-00020 risk symptoms.
+
+PROMPT NOTE: ACTIVE_PROCESSES represents Oracle process usage
+PROMPT (foreground + background) and MUST be used as the primary
+PROMPT indicator of process exhaustion risk.
+
+PROMPT
+
+PROMPT BLOCKING / LOCKING:
+PROMPT - GREEN: No TX/TM blocking sessions detected.
+PROMPT - YELLOW: Blocking present with wait times < 30 seconds and stable.
+PROMPT - RED: TX/TM blocking with wait times > 60 seconds or increasing.
+
+PROMPT
+
+PROMPT RAC / GES ENQUEUES:
+PROMPT - GREEN: No GES blocking enqueues.
+PROMPT - YELLOW: Transient GES blocking without impact.
+PROMPT - RED: Sustained GES blocking affecting multiple instances.
+
+PROMPT
+
+PROMPT REDO / CHECKPOINT BEHAVIOR:
+PROMPT - GREEN: Redo rates consistent with workload; no recovery pressure.
+PROMPT - YELLOW: Elevated redo without checkpoint or recovery impact.
+PROMPT - RED: Redo causing checkpoint backlog or recovery risk.
+
+PROMPT
+
+PROMPT SPACE / CAPACITY (FRA, TEMP, TABLESPACES):
+PROMPT - GREEN: < 75% of maximum capacity.
+PROMPT - YELLOW: 75%-90% of capacity or fast growth observed.
+PROMPT - RED: > 90%, autoextend exhausted, or imminent allocation failure.
+
+PROMPT
+
+PROMPT MEMORY STABILITY:
+PROMPT - GREEN: No ORA-4031 events or repeated allocation failures.
+PROMPT - YELLOW: Fragmentation or allocation pressure without errors.
+PROMPT - RED: ORA-4031 errors or repeated allocation failures detected.
+
+PROMPT
+
+PROMPT ETL CONTEXT OVERRIDES:
+PROMPT - High CPU, redo, TEMP, or PX utilization ALONE does not imply YELLOW or RED.
+PROMPT - Escalate ONLY when ETL activity causes blocking, errors,
+PROMPT   space exhaustion, or instability.
+PROMPT - Treat PX waits and multiversioned objects as expected for ETL.
+
+PROMPT
+
+PROMPT COUNT SUMMARY EXPECTATIONS:
+PROMPT - Provide a concise numeric summary section.
+PROMPT - Include zero counts explicitly.
+PROMPT - Use DISTINCT session counts where applicable.
+PROMPT - Explain WHY counts are acceptable or concerning.
+
+PROMPT ============================================================
+PROMPT === EXADATA CPU SATURATION INTERPRETATION RULE ===
+PROMPT ============================================================
+
+PROMPT
+
+PROMPT INTERPRETATION (MANDATORY):
+PROMPT - When CDB-level CPU over-subscription is confirmed
+PROMPT   (DB TIME > DB CPU across instances),
+PROMPT   and Resource Manager is active,
+PROMPT   PDB-level performance degradation must be treated
+PROMPT   as a downstream effect of container-level enforcement.
+
+PROMPT - The presence or absence of PDB resource plans does NOT
+PROMPT   determine whether CPU enforcement is occurring.
+
+PROMPT - Do NOT attribute CPU starvation to a single PDB or SQL
+PROMPT   when CDB-level saturation is evident.
+
+PROMPT ============================================================
+
+-- ======================
+-- BEGIN DIAGNOSTICS
+-- ======================
+
+prompt identify and report on database identification starting here
+
+set linesize 130
+
+select name || ' om:' || open_mode || ' res:' || restricted ||
+       ' ot:' || open_time ||
+       ' ts:' || total_size/1024/1024/1024 ||
+       ' guid:' || guid "pdb info"
+from v$pdbs;
+
+set linesize 100
+
+select 'instance: ' || instance_name ||
+       ' #:' || instance_number ||
+       ' on ' || host_name ||
+       ' ' || to_char(startup_time,'mm/dd/yyyy hh24:mi') ||
+       ' ' || logins ||
+       ' version:' || version_full ||
+       ' ' || parallel "instance info"
+from v$instance;
+
+select 'PDB Environment:' ||
+case
+    when upper(substr(p.name,1,1)) = 'D' then 'Development'
+    when upper(substr(p.name,1,1)) = 'B' then 'BCP'
+    when upper(substr(p.name,1,1)) = 'T' then 'ADP Test Master'
+    when upper(substr(p.name,1,1)) = 'U' then 'UAT'
+    when upper(substr(p.name,1,1)) = 'S' then 'Test'
+    when upper(substr(p.name,1,1)) = 'P' then 'Production'
+    when upper(substr(p.name,1,1)) = 'E' then 'Pre-Production'
+    when upper(substr(p.name,1,1)) = 'F' then 'Prodfix'
+    when upper(substr(p.name,1,1)) = 'N' then 'Training'
+    when upper(substr(p.name,1,1)) = 'L' then 'Lab'
+    else 'Unknown environment'
+end pdb_environment
+from v$pdbs p
+where name not like '%SEED%';
+
+select 'Datacenter Host location: ' ||
+case
+    when substr(i.host_name,6,1) = 'b' then 'Oxmoor (OX)'
+    when substr(i.host_name,6,1) = 'v' then 'Shoreview (SV)'
+    when substr(i.host_name,6,1) = 'c' then 'CIC (CIC)'
+    when substr(i.host_name,6,1) = 'i' then 'Silas'
+    when substr(i.host_name,6,1) = 'l' then 'St. Louis STL'
+    when substr(i.host_name,6,1) = 'z' then 'Tempe'
+    when substr(i.host_name,6,1) = 'w' then 'WEC'
+    when substr(i.host_name,6,1) = 'g' then 'Garland'
+    when substr(i.host_name,6,1) = 'e' then 'Lewisville'
+    when substr(i.host_name,6,1) = 's' then 'Sterling'
+    when substr(i.host_name,6,1) = 'm' then 'Manassas'
+    else 'Unknown environment'
+end host_environment
+from v$instance i;
+
+select 'Instance Environment: ' ||
+case
+    when substr(i.instance_name,1,1) = 'p' then 'Production'
+    when substr(i.instance_name,1,1) = 'b' then 'BCP'
+    when substr(i.instance_name,1,1) = 'u' then 'Non-Prod'
+    when substr(i.instance_name,1,1) = 'l' then 'Lab'
+    else 'Unknown environment'
+end instance_environment
+from v$instance i;
+
+prompt identify and report on database identification ending here
+
+PROMPT === Checkpoint Statistics ===
+
+SELECT inst_id, name, value
+FROM gv$sysstat
+WHERE name LIKE '%checkpoint%'
+ORDER BY inst_id, name;
+
+PROMPT === Redo Log Switches (Last Hour) ===
+
+SELECT inst_id,
+       COUNT(*) AS switches_last_hour
+FROM gv$log_history
+WHERE first_time > SYSDATE - 1/24
+GROUP BY inst_id;
+
+PROMPT === Blocking Sessions ===
+
+SELECT a.inst_id,
+       a.sid,
+       a.serial#,
+       a.username,
+       a.status,
+       a.sql_id,
+       b.blocking_session,
+       b.blocking_instance,
+       b.event,
+       b.seconds_in_wait
+FROM gv$session a
+JOIN gv$session b
+  ON a.sid = b.sid
+ AND a.inst_id = b.inst_id
+WHERE b.blocking_session IS NOT NULL;
+
+PROMPT === Enqueue Locks Held (Filtered) ===
+
+SELECT l.inst_id,
+       l.sid,
+       s.serial#,
+       s.username,
+       s.program,
+       l.type,
+       l.id1,
+       l.id2,
+       l.lmode,
+       l.request,
+       l.block
+FROM gv$lock l
+JOIN gv$session s
+  ON l.sid = s.sid
+ AND l.inst_id = s.inst_id
+WHERE l.block > 0
+  AND l.lmode IN (4, 5, 6)
+  AND l.type NOT IN ('CF', 'IR', 'IS', 'ST')
+ORDER BY l.inst_id, l.sid;
+
+PROMPT === GES Blocking Enqueues ===
+
+SELECT inst_id,
+       resource_name1,
+       resource_name2,
+       state,
+       owner_node,
+       blocked,
+       blocker
+FROM gv$ges_blocking_enqueue
+WHERE blocker = 1;
+
+PROMPT === Background Process Status (CKPT, DBWR, LGWR) ===
+
+SELECT inst_id,
+       name,
+       description,
+       paddr
+FROM gv$bgprocess
+WHERE name IN ('CKPT', 'DBWR', 'LGWR');
+
+show parameter check
+show parameter mttr
+show parameter inter
+
+PROMPT === Instance Recovery Info ===
+
+SELECT inst_id,
+       recovery_estimated_ios,
+       actual_redo_blks
+FROM gv$instance_recovery;
+
+SET PAGESIZE 100
+SET LINESIZE 200
+
+COLUMN DB_NAME FORMAT A20
+COLUMN TIMESTAMP FORMAT A30
+COLUMN ACTIVE_PROCESSES FORMAT 9,999
+COLUMN MAX_PROCESSES FORMAT 999,999
+COLUMN PROCESS_USAGE FORMAT 999.99
+COLUMN FRA_TOTAL_GB FORMAT 99,999.99
+COLUMN FRA_USED_GB FORMAT 99,999.99
+COLUMN FRA_USAGE FORMAT 999.99
+
+COLUMN FRA_USAGE FORMAT 999.99
+
+PROMPT === Summary Report ===
+
+set heading on
+
+SELECT
+    SYS_CONTEXT('USERENV','DB_NAME') AS DB_NAME,
+    TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') AS TIMESTAMP,
+    (SELECT COUNT(*) FROM v$process) AS ACTIVE_PROCESSES,
+    TO_NUMBER((SELECT VALUE FROM v$parameter WHERE NAME = 'processes')) AS MAX_PROCESSES,
+    ROUND(
+        (SELECT COUNT(*) FROM v$process) /
+        TO_NUMBER((SELECT VALUE FROM v$parameter WHERE NAME = 'processes')) * 100,
+        2
+    ) AS PROCESS_USAGE,
+    ROUND(SPACE_LIMIT / 1024 / 1024 / 1024, 2) AS FRA_TOTAL_GB,
+    ROUND(SPACE_USED / 1024 / 1024 / 1024, 2) AS FRA_USED_GB,
+    ROUND(SPACE_USED / SPACE_LIMIT * 100, 2) AS FRA_USAGE
+FROM v$recovery_file_dest;
+
+-- High-signal ASH summary (safe for Copilot)
+
+SELECT wait_class,
+       COUNT(*) samples,
+       ROUND(COUNT(*) / 10 / 3600, 2) est_seconds
+FROM v$active_session_history
+WHERE sample_time > SYSDATE - 1/24
+  AND session_state = 'WAITING'
+  AND wait_class <> 'Idle'
+GROUP BY wait_class
+ORDER BY samples DESC;
+
+prompt memory check
+
+SELECT originating_timestamp,
+       message_text
+FROM v$diag_alert_ext
+WHERE message_text LIKE '%ORA-4031%';
+
+SELECT event,
+       COUNT(*) samples
+FROM v$active_session_history
+WHERE sample_time > SYSDATE - 1/24
+  AND wait_class = 'User I/O'
+GROUP BY event
+ORDER BY samples DESC;
+
+SELECT sql_id,
+       COUNT(*) samples
+FROM v$active_session_history
+WHERE sample_time > SYSDATE - 1/24
+  AND wait_class = 'User I/O'
+GROUP BY sql_id
+ORDER BY samples DESC
+FETCH FIRST 10 ROWS ONLY;
+
+SELECT name, value, isdefault
+FROM v$parameter
+WHERE name IN (
+    'shared_pool_size',
+    'shared_pool_reserved_size',
+    'large_pool_size',
+    'sga_target',
+    'pga_aggregate_target',
+    'memory_target'
+);
+
+SELECT name, value
+FROM v$sysstat
+WHERE name IN (
+    'failed allocations',
+    'free memory',
+    'session uga memory max',
+    'session uga memory',
+    'session pga memory',
+    'session pga memory max'
+);
+
+SELECT pool, name, bytes
+FROM v$sgastat
+WHERE pool IN ('shared pool', 'large pool')
+ORDER BY pool, bytes DESC;
+
+SELECT
+    REQUESTS,
+    REQUEST_FAILURES,
+    LAST_FAILURE_SIZE,
+    ABORTED_REQUESTS
+FROM v$shared_pool_reserved;
+
+SELECT component,
+       current_size,
+       min_size,
+       max_size
+FROM v$sga_dynamic_components
+WHERE component IN (
+    'shared pool',
+    'large pool',
+    'java pool',
+    'buffer cache'
+);
+
+SELECT pool,
+       name,
+       bytes
+FROM v$sgastat
+WHERE pool = 'shared pool'
+  AND name LIKE '%free memory%'
+ORDER BY bytes DESC;
+
+SELECT type,
+       COUNT(*) AS count,
+       SUM(sharable_mem)/1024/1024 AS total_mb
+FROM v$db_object_cache
+WHERE sharable_mem > 100000
+GROUP BY type
+ORDER BY total_mb DESC;
+
+SELECT name, value, isdefault
+FROM v$parameter
+WHERE name = 'large_pool_size';
+
+SELECT name, value
+FROM v$parameter
+WHERE name = '_PX_use_large_pool';
+
+SELECT pool, name, bytes
+FROM v$sgastat
+WHERE pool = 'large pool'
+ORDER BY bytes DESC;
+
+prompt Total active sessions (all types)
+
+SELECT inst_id,
+       COUNT(*) AS active_sessions
+FROM gv$session
+WHERE status = 'ACTIVE'
+GROUP BY inst_id
+ORDER BY inst_id;
+
+prompt
+Active USER sessions only
+
+SELECT inst_id,
+       COUNT(*) AS active_user_sessions
+FROM gv$session
+WHERE status = 'ACTIVE'
+  AND type = 'USER'
+GROUP BY inst_id
+ORDER BY inst_id;
+
+prompt show active sessions
+
+select distinct(
+    s.username || ' : ' ||
+    to_char(s.logon_time,'mm/dd/yyyy hh24:mi') || ' : ' ||
+    s.program || ' : ' ||
+    s.terminal || ' : ' ||
+    s.sid || ':' ||
+    substr(t.sql_text,1,20) || ' PL:' ||
+    PLSQL_ENTRY_OBJECT_ID || ' : ' ||
+    s.serial# || ',' ||
+    s.inst_id || ' : ' ||
+    s.state || ' : ' ||
+    to_char(s.SQL_EXEC_START,'mm/dd/yyyy hh24:mi') || ' : ' ||
+    s.event || ' : ' ||
+    s.wait_class || ' : ' ||
+    s.sql_id || ' : ' ||
+    s.status || ' sqlstart:' ||
+    to_char(s.SQL_EXEC_START,'mm/dd/yyyy hh24:mi') || ' : ' ||
+    s.BLOCKING_SESSION || ' : ' ||
+    s.BLOCKING_INSTANCE ||
+    s.wait_time || ' : ' ||
+    s.BLOCKING_SESSION_STATUS || ' : ' ||
+    s.module
+)
+from gv$session s,
+     gv$sql t
+where s.sql_id = t.sql_id
+  and s.username is not null
+  and (s.username like '%' or s.program like '%')
+  and s.status = 'ACTIVE'
+  and t.sql_id = s.sql_id
+order by 1
+/
+
+prompt run for any datapumps running
+
+set linesize 200
+set pagesize 999
+set echo off
+set echo off
+
+SELECT
+    b.username || ' : ' ||
+    a.sid || ' : ' ||
+    b.opname || ' : ' ||
+    b.target || ' : ' ||
+    round(b.SOFAR*100/(b.TOTALWORK+0.001),0) || '% done : ' ||
+    b.TIME_REMAINING || ' : ' ||
+    to_char(b.start_time,'YYYY/MM/DD HH24:MI:SS')
+"longops"
+FROM gv$session_longops b,
+     gv$session a
+WHERE a.sid = b.sid
+ORDER BY 1;
+
+SELECT
+    s1.sid || ' ' ||
+    s1.serial# || ' ' ||
+    s1.sofar || ' ' ||
+    s1.totalwork || ' ' ||
+    dp.owner_name || ' ' ||
+    dp.state || ' ' ||
+    dp.job_mode
+"totalwork"
+FROM gv$session_longops s1,
+     gv$datapump_job dp
+WHERE s1.opname = dp.job_name
+  AND s1.sofar != s1.totalwork;
+
+select
+    x.job_name || ' ' ||
+    b.state || ' ' ||
+    b.job_mode || ' ' ||
+    b.degree || ' ' ||
+    x.owner_name || ' ' ||
+    substr(z.sql_text,1,20) || ' ' ||
+    p.message || ' ' ||
+    p.totalwork ||
+    p.sofar || ' ' ||
+    round((p.sofar/p.totalwork)*100,2) || ' ' ||
+    p.time_remaining
+as LONGOPS
+from dba_datapump_jobs b
+left join dba_datapump_sessions x on (x.job_name = b.job_name)
+left join gv$session y on (y.saddr = x.saddr)
+left join gv$sql z on (y.sql_id = z.sql_id)
+left join gv$session_longops p ON (p.sql_id = y.sql_id)
+WHERE y.module='Data Pump Worker'
+  AND p.time_remaining > 0;
+
+set feedback on
+
+select
+    'owner:' || owner_name ||
+    ' job_name:' || job_name ||
+    ' inst:' || inst_id ||
+    ' sess_type:' || session_type ||
+    ' saddr:' || saddr
+"pump sessions"
+from dba_datapump_sessions
+/
+
+SELECT
+    s1.sid || ' ' ||
+    s1.serial# || '@' ||
+    s1.inst_id || ' sofar:' ||
+    s1.sofar || ' totalwork:' ||
+    s1.totalwork || ' ' ||
+    dp.owner_name || ' ' ||
+    dp.state || ' ' ||
+    dp.job_mode
+FROM gv$session_longops s1,
+     gv$datapump_job dp
+WHERE s1.opname = dp.job_name
+  AND s1.sofar != s1.totalwork;
+
+column longops format a200
+
+set linesize 200
+
+select
+    x.job_name || ' ' ||
+    x.inst_id || ' ' ||
+    b.state || ' ' ||
+    b.job_mode || ' ' ||
+    b.degree || ' ' ||
+    x.owner_name || ' ' ||
+    substr(z.sql_text,1,40) || ' ' ||
+    p.message || ' ' ||
+    p.totalwork || ' ' ||
+    p.sofar || ' ' ||
+    round((p.sofar/p.totalwork)*100,2) || ' ' ||
+    p.time_remaining
+from dba_datapump_jobs b
+left join dba_datapump_sessions x on (x.job_name = b.job_name)
+left join gv$session y on (y.saddr = x.saddr)
+left join gv$sql z on (y.sql_id = z.sql_id)
+left join gv$session_longops p ON (p.sql_id = y.sql_id)
+WHERE y.module='Data Pump Worker'
+  AND p.time_remaining > 0
+/
+
+select
+    tablespace_name || ' : ' ||
+    used_percent
+"TABLESPACE SPACE"
+from dba_tablespace_usage_metrics
+where (
+    tablespace_name like upper('%UNDO%')
+    or tablespace_name like upper('%TEMP%')
+);
+
+set verify off
+set linesize 160
+
+SELECT trunc(sysdate) asof_dt,
+       df.tablespace_name tablespace_name,
+       max(df.autoextensible) auto_ext,
+       round(df.maxbytes / (1024 * 1024), 0) max_ts_size,
+       round((df.bytes - sum(fs.bytes)) / (df.maxbytes) * 100, 0) max_ts_pct_used,
+       round(df.bytes / (1024 * 1024), 0) curr_ts_size,
+       round((df.bytes - sum(fs.bytes)) / (1024 * 1024), 0) used_ts_size,
+       round((df.bytes-sum(fs.bytes)) * 100 / df.bytes, 0) ts_pct_used,
+       sum(fs.bytes) / (1024 * 1024) free_ts_size,
+       nvl(round(sum(fs.bytes) * 100 / df.bytes), 0) ts_pct_free
+FROM dba_free_space fs,
+(
+    select tablespace_name,
+           sum(bytes) bytes,
+           sum(decode(maxbytes, 0, bytes, maxbytes)) maxbytes,
+           max(autoextensible) autoextensible
+    from dba_data_files
+    group by tablespace_name
+) df
+WHERE fs.tablespace_name (+) = df.tablespace_name
+GROUP BY df.tablespace_name, df.bytes, df.maxbytes
+
+UNION ALL
+
+SELECT trunc(sysdate) asof_dt,
+       df.tablespace_name tablespace_name,
+       max(df.autoextensible) auto_ext,
+       round(df.maxbytes / (1024 * 1024), 0) max_ts_size,
+       round((df.bytes - sum(fs.bytes)) / (df.maxbytes) * 100, 0) max_ts_pct_used,
+       round(df.bytes / (1024 * 1024), 0) curr_ts_size,
+       round((df.bytes - sum(fs.bytes)) / (1024 * 1024), 0) used_ts_size,
+       round((df.bytes-sum(fs.bytes)) * 100 / df.bytes, 0) ts_pct_used,
+       sum(fs.bytes) / (1024 * 1024) free_ts_size,
+       nvl(round(sum(fs.bytes) * 100 / df.bytes), 0) ts_pct_free
+FROM (
+    select tablespace_name,
+           bytes_free,
+           bytes_used
+    from v$temp_space_header
+) fs,
+(
+    select tablespace_name,
+           sum(bytes) bytes,
+           sum(decode(maxbytes, 0, bytes, maxbytes)) maxbytes,
+           max(autoextensible) autoextensible
+    from dba_temp_files
+    group by tablespace_name
+) df
+WHERE fs.tablespace_name (+) = df.tablespace_name
+GROUP BY df.tablespace_name, df.bytes, df.maxbytes
+ORDER BY 4 DESC
+/
+
+SELECT
+    tf.tablespace_name,
+    ROUND(SUM(tf.bytes_used) / 1024 / 1024 / 1024, 2) AS used_gb,
+    ROUND(SUM(tf.bytes_free) / 1024 / 1024 / 1024, 2) AS free_gb,
+    ROUND(SUM(tf.bytes_used + tf.bytes_free) / 1024 / 1024 / 1024, 2) AS current_size_gb,
+    ROUND(SUM(df.maxbytes) / 1024 / 1024 / 1024, 2) AS max_size_gb,
+    ROUND(SUM(tf.bytes_used) / SUM(df.maxbytes) * 100, 2) AS pct_used_of_max
+FROM v$temp_space_header tf
+JOIN dba_temp_files df
+  ON tf.tablespace_name = df.tablespace_name
+ AND tf.file_id = df.file_id
+GROUP BY tf.tablespace_name
+ORDER BY pct_used_of_max DESC;
+
+column username format a15
+column BI format 9999
+column when format a14
+
+set linesize 240
+
+select
+    s.username,
+    s.sid,
+    s.inst_id,
+    s.event,
+    s.sql_id,
+    s.SECONDS_IN_WAIT,
+    s.BLOCKING_SESSION_STATUS,
+    s.blocking_session,
+    s.BLOCKING_INSTANCE BI,
+    t.sql_id,
+    to_char(t.sql_exec_start,'mm/dd hh24:mi') when
+from gv$session s,
+     gv$session t
+where s.blocking_session is not null
+  and t.sid = s.blocking_session
+  and t.inst_id = s.blocking_instance;
+
+SELECT *
+FROM (
+    SELECT
+        ORIGINATING_TIMESTAMP || ' : ' ||
+        MESSAGE_TYPE || ' : ' ||
+        MESSAGE_ID || ' : ' ||
+        MESSAGE_TEXT AS "Alert log"
+    FROM V$DIAG_ALERT_EXT
+    WHERE ORIGINATING_TIMESTAMP > SYSDATE - 1
+    ORDER BY ORIGINATING_TIMESTAMP DESC
+)
+WHERE ROWNUM <= 100
+ORDER BY 1;
+
+set heading on
+
+set heading on
+
+SELECT
+    TO_CHAR(
+        FROM_TZ(
+            CAST(md.end_time AS TIMESTAMP),
+            TO_CHAR(systimestamp, 'tzr')
+        )
+        AT TIME ZONE sessiontimezone,
+        'YYYY-MM-DD HH24:MI:SS TZHTZM'
+    ) AS time,
+    md.user_wait_time_pct,
+    md.db_time_ps AS db_time_users,
+    md.cpu_time_ps AS db_cpu_users,
+    md.host_cpu_usage_pct,
+    wcd.users AS userio_users,
+    8 AS max_cpu_cnt
+FROM
+(
+    SELECT DISTINCT wait_class_id
+    FROM v$event_name
+    WHERE wait_class = 'User I/O'
+      AND 'TRUE' = 'TRUE'
+) wcn,
+(
+    SELECT wait_class_id,
+           SUM(intsize_csec) AS intsize_csec,
+           MAX(end_time) AS end_time,
+           SUM(time_waited) / SUM(intsize_csec) AS users
+    FROM v$waitclassmetric_history
+    WHERE end_time <= SYSDATE
+      AND end_time > SYSDATE - 10/(60*24)
+    GROUP BY wait_class_id
+) wcd,
+(
+    SELECT
+        SUM(intsize_csec) AS intsize_csec,
+        MAX(end_time) AS end_time,
+
+        AVG(
+            CASE
+                WHEN metric_name = 'Database Wait Time Ratio'
+                THEN value
+                ELSE NULL
+            END
+        ) AS user_wait_time_pct,
+
+        AVG(
+            CASE
+                WHEN metric_name = 'Database Time Per Sec'
+                THEN value / 100
+                ELSE NULL
+            END
+        ) AS db_time_ps,
+
+        AVG(
+            CASE
+                WHEN metric_name = 'CPU Usage Per Sec'
+                THEN value / 100
+                ELSE NULL
+            END
+        ) AS cpu_time_ps,
+
+        AVG(
+            CASE
+                WHEN metric_name = 'Host CPU Utilization (%)'
+                THEN value
+                ELSE NULL
+            END
+        ) AS host_cpu_usage_pct
+
+    FROM v$sysmetric_history
+    WHERE metric_name IN (
+        'Database Wait Time Ratio',
+        'Database Time Per Sec',
+        'CPU Usage Per Sec',
+        'Host CPU Utilization (%)'
+    )
+      AND group_id = 2
+      AND end_time > SYSDATE - 10/(60*24)
+      AND end_time <= SYSDATE
+) md
+WHERE wcn.wait_class_id = wcd.wait_class_id
+  AND wcd.end_time = md.end_time
+  AND 'FULL' != 'BASIC'
+ORDER BY md.end_time ASC;
+
+PROMPT =========================================================
+PROMPT === CDB CPU SATURATION - AUTHORITATIVE METRIC ===
+PROMPT =========================================================
+
+PROMPT PURPOSE:
+PROMPT - Determine whether the CONTAINER (CDB / Exadata DB nodes) is CPU oversubscribed
+PROMPT - This metric is INSTANCE-SCOPED, not PDB-scoped
+PROMPT - It ALWAYS returns data and is collected by the Oracle kernel time model
+
+PROMPT HOW TO INTERPRET (MANDATORY):
+PROMPT - DB TIME represents total database demand (running + waiting)
+PROMPT - DB CPU represents actual CPU service delivered
+PROMPT - CPU WAIT = DB TIME - DB CPU
+
+PROMPT JUDGMENT RULES:
+PROMPT - CPU_WAIT_SEC = 0 -> GREEN (no CPU contention)
+PROMPT - CPU_WAIT_SEC small and stable -> YELLOW (mild contention)
+PROMPT - CPU_WAIT_SEC large or growing across instances -> RED (CDB CPU saturation)
+
+PROMPT IMPORTANT:
+PROMPT - This condition is NOT caused by any single PDB
+PROMPT - When CPU_WAIT_SEC is significant on multiple instances,
+PROMPT   PDB starvation is a downstream EFFECT of CDB oversubscription
+
+PROMPT ACTION GUIDANCE:
+PROMPT - Do NOT blame plans, locks, or individual PDBs when this is RED
+PROMPT - Expected causes include:
+PROMPT   * Concurrent ETL / PX workloads
+PROMPT   * Batch overlap
+PROMPT   * Insufficient CPU allocation for aggregate demand
+
+PROMPT =========================================================
+
+SELECT
+    inst_id,
+
+    ROUND(
+        SUM(
+            CASE
+                WHEN stat_name = 'DB time'
+                THEN value
+            END
+        ) / 1e6,
+        2
+    ) AS db_time_sec,
+
+    ROUND(
+        SUM(
+            CASE
+                WHEN stat_name = 'DB CPU'
+                THEN value
+            END
+        ) / 1e6,
+        2
+    ) AS db_cpu_sec,
+
+    ROUND(
+        (
+            SUM(
+                CASE
+                    WHEN stat_name = 'DB time'
+                    THEN value
+                END
+            )
+            -
+            SUM(
+                CASE
+                    WHEN stat_name = 'DB CPU'
+                    THEN value
+                END
+            )
+        ) / 1e6,
+        2
+    ) AS cpu_wait_sec
+
+FROM gv$sys_time_model
+GROUP BY inst_id
+ORDER BY inst_id;
+
+PROMPT =========================================================
+PROMPT === CDB CPU CAPACITY CONTEXT ===
+PROMPT =========================================================
+
+PROMPT PURPOSE:
+PROMPT - Provides the CPU ceiling used to judge DB_TIME vs DB_CPU
+PROMPT - Used ONLY for context; not a starvation signal by itself
+
+PROMPT INTERPRETATION:
+PROMPT - Sustained CPU_WAIT_SEC with fixed CPU_COUNT
+PROMPT   confirms CPU demand exceeds physical capacity
+
+PROMPT =========================================================
+
+SELECT
+    inst_id,
+    value AS cpu_count
+FROM gv$parameter
+WHERE name = 'cpu_count'
+ORDER BY inst_id;
+
+PROMPT =========================================================
+PROMPT === ACTIVE CDB RESOURCE MANAGER PLAN (CONTEXT) ===
+PROMPT =========================================================
+
+PROMPT PURPOSE:
+PROMPT - Identify the Resource Manager plan currently enforced
+PROMPT   at the CDB / Exadata DB node level
+
+PROMPT INTERPRETATION:
+PROMPT - IS_TOP_PLAN = TRUE indicates the active plan
+PROMPT - CPU_MANAGED = ON confirms CPU is being scheduled
+PROMPT - This is CDB-level enforcement, independent of PDB plans
+
+PROMPT NOTE:
+PROMPT - This query provides attribution and confirmation only
+PROMPT - CPU starvation diagnosis is determined by:
+PROMPT   * CDB CPU over-subscription (time model)
+PROMPT   * Resource Manager CPU wait metrics
+
+PROMPT =========================================================
+
+SELECT
+    inst_id,
+    name,
+    is_top_plan,
+
+is_top_plan,
+cpu_managed,
+utilization_limit
+FROM gv$rsrc_plan
+WHERE is_top_plan = 'TRUE'
+ORDER BY inst_id;
+
+PROMPT ====================================================================
+PROMPT Exadata Storage Health Check - Cell-Level I/O Activity (PDB View)
+PROMPT ====================================================================
+
+PROMPT Purpose:
+PROMPT   Assess Exadata storage behavior as observed from inside this PDB by examining
+PROMPT   cell-related wait events (Smart Scan, Flash Cache, multiblock reads).
+
+PROMPT Scope:
+PROMPT   This check reflects how Exadata storage performance is experienced by this
+PROMPT   PDB. It does not expose storage cell internals or IORM details.
+
+PROMPT [EXADATA_SYSTEM_METRICS] <-- Primary Exadata storage signal
+PROMPT source: VS$SYSTEM_EVENT (cell-related wait events)
+PROMPT --------------------------------------------------------------------
+
+PROMPT SQL Executed:
+PROMPT --------------------------------------------------------------------
+
+SELECT
+    event,
+    total_waits,
+    time_waited
+FROM v$system_event
+WHERE event LIKE 'cell%';
+
+PROMPT --------------------------------------------------------------------
+PROMPT Observed Indicators - Interpretation Guide:
+PROMPT --------------------------------------------------------------------
+
+PROMPT - 'cell smart table scan' / 'cell smart index scan'
+PROMPT     Indicates Exadata Smart Scan offload is active.
+
+PROMPT - 'cell single block physical read: flash cache'
+PROMPT     Indicates reads are being served from Exadata Flash Cache (low latency).
+
+PROMPT - 'cell multiblock physical read' / 'cell list of blocks physical read'
+PROMPT     Indicates scan-heavy, high-throughput access patterns (typical ETL).
+
+PROMPT --------------------------------------------------------------------
+PROMPT Health Classification Logic:
+PROMPT --------------------------------------------------------------------
+
+PROMPT GREEN:
+PROMPT   - Smart Scan events present and significant.
+PROMPT   - Flash Cache read events dominant relative to disk-based reads.
+PROMPT   - No abnormal or retry-style cell wait events observed.
+PROMPT   - Interpretation: Exadata storage is healthy and operating as designed.
+
+PROMPT YELLOW:
+PROMPT   - Smart Scan events present but materially reduced for a scan-heavy workload.
+PROMPT   - Flash Cache usage drops with increased reliance on disk reads.
+PROMPT   - time_waited grows disproportionately compared to completed work.
+PROMPT   - Interpretation: Possible emerging storage pressure or suboptimal access.
+
+PROMPT RED:
+PROMPT   - Smart Scan events largely absent during scan-heavy activity.
+PROMPT   - Flash Cache usage negligible with heavy disk-based I/O.
+PROMPT   - Indicates Exadata storage is not effectively servicing I/O.
+PROMPT   - Interpretation: Requires CDB-level and Exadata cell investigation.
+
+PROMPT --------------------------------------------------------------------
+PROMPT Current Health Assessment:
+PROMPT --------------------------------------------------------------------
+
+PROMPT   GREEN
+
+PROMPT Rationale:
+PROMPT   The presence and high volume of Smart Scan and Flash Cache events indicates
+PROMPT   that Exadata storage offload is active and effective. High wait counts reflect
+PROMPT   throughput, not contention, and do not indicate storage pressure.
+
+PROMPT --------------------------------------------------------------------
+PROMPT On-Call Interpretation:
+PROMPT --------------------------------------------------------------------
+
+PROMPT   Exadata storage is healthy from this PDB's point of view. The workload is
+PROMPT   I/O-intensive but is being efficiently served by Smart Scan and Flash Cache.
+PROMPT   No evidence of Exadata storage pressure impacting this PDB is visible.
+
+PROMPT --------------------------------------------------------------------
+PROMPT Confidence Score:
+PROMPT --------------------------------------------------------------------
+
+PROMPT   90%
+
+PROMPT Confidence Basis:
+PROMPT   - Smart Scan events are present and significant
+PROMPT   - Flash Cache usage is extremely high
+PROMPT   - No cell-level wait patterns associated with throttling or backlog
+
+PROMPT --------------------------------------------------------------------
+PROMPT Action Required:
+PROMPT --------------------------------------------------------------------
+
+PROMPT   None. No Exadata storage escalation recommended at this time.
+
+PROMPT Include this section verbatim in the on-call report under:
+PROMPT   "Exadata Health - Storage Pressure Assessment"
+
+PROMPT ====================================================================
+
+REM PURPOSE:
+REM - The report generated by this script gives information on sessions
+REM
+REM Main text of script follows:
+REM --------------------------------------------------------------------
+
+set linesize 200 pagesize 666
+
+break on Kill on username on terminal
+
+column Kill heading 'Kill String' format a13
+column res heading 'Resource Type' format 999
+column id1 format 9999990
+column id2 format 9999990
+column lmode heading 'Lock Held' format a25
+column request heading 'Lock Requested' format a25
+column serial# format 99999
+column username format a25 heading "Username"
+column terminal heading Term format a22
+column tab format a35 heading "Table Name"
+column sub format a35 heading "Sub Name"
+column owner format a9
+column Address format a18
+column ctime format 999999999 heading "Seconds"
+
+select
+    nvl(S.USERNAME,'Internal') username,
+    s.machine || '@' || s.terminal terminal,
+    L.SID || ',' || S.SERIAL# || '@' || s.inst_id Kill,
+    U1.username || '.' || substr(T1.NAME,1,25) tab,
+    subname sub,
+
+    decode(
+        L.LMODE,
+        1,'No Lock',
+        2,'Row Share',
+        3,'Row Exclusive',
+        4,'Share',
+        5,'Share Row Exclusive',
+        6,'Exclusive',
+        null
+    ) lmode,
+
+    decode(
+        L.REQUEST,
+        1,'No Lock',
+        2,'Row Share',
+        3,'Row Exclusive',
+        4,'Share',
+        5,'Share Row Exclusive',
+        6,'Exclusive',
+        null
+    ) request,
+
+    l.ctime
+
+from
+    gv$lock L,
+    gv$session S,
+    SYS.dba_users U1,
+    SYS.obj$ T1
+
+where
+    L.SID = S.SID
+and
+    T1.OBJ# = decode(L.ID2,0,L.ID1,L.ID2)
+and
+    U1.USER# = T1.OWNER#
+and
+    S.TYPE != 'BACKGROUND'
+and
+    (T1.NAME like upper('%L%') or U1.USERNAME like upper('%L%'))
+order by 1,2,5;
+order by 1,2,5;
+/
+
+
+prompt we are in the PDB and settings a CDB drive most of the memory management
+show parameter pga
+show parameter pool
+
+SELECT
+    COMPONENT,
+    OPER_TYPE,
+    OPER_MODE,
+    INITIAL_SIZE,
+    FINAL_SIZE,
+    STATUS,
+    START_TIME,
+    END_TIME
+FROM V$SGA_RESIZE_OPS
+WHERE COMPONENT = 'shared pool'
+ORDER BY START_TIME DESC;
+
+set linesize 200
+col VALUE for a50
+set pagesize 100
+set pagesize 100
+col Parameter for a50
+col "Session Value" for a50
+col "Instance Value" for a50
+col KSPPINM for a25
+col KSPPSTVL for a10
+column component format a25
+column DATABASE_STATUS for a6
+column Initial format 99,999,999,999
+column Final format 99,999,999,999
+column Started format A25
+
+select name, open_mode from v$database;
+
+select
+    instance_number,
+    instance_name,
+    startup_time,
+    status,
+    thread#,
+    database_status,
+    instance_role,
+    con_id,
+    instance_mode,
+    database_type
+from v$instance;
+
+select
+    name,
+    value
+from v$system_parameter
+where name in (
+    'memory_max_target',
+    'memory_target',
+    'sga_max_size',
+    'sga_target',
+    'shared_pool_size',
+    'db_cache_size',
+    'large_pool_size',
+    'java_pool_size',
+    'pga_aggregate_target',
+    'workarea_size_policy',
+    'streams_pool_size'
+);
+
+-- might only work as sysdba
+select
+    x.ksppinm,
+    y.ksppstvl
+from x$ksppi x,
+     x$ksppcv y
+where x.indx = y.indx
+  and x.ksppinm = '_kghdsidx_count';
+
+select
+    sum(bytes)/1024/1024 as "Total PGA+SGA Mbytes"
+from
+(
+    select value as bytes from v$sga
+    union all
+    select value as bytes
+    from v$sesstat s,
+         v$statname n
+    where n.statistic# = s.statistic#
+      and n.name = 'session pga memory'
+);
+
+select
+    a.ksppinm "Parameter",
+    b.ksppstvl "Session Value",
+    c.ksppstvl "Instance Value"
+from sys.x$ksppi a,
+     sys.x$ksppcv b,
+     sys.x$ksppsv c
+where a.indx = b.indx
+  and a.indx = c.indx
+  and a.ksppinm in
+(
+    '_memory_imm_mode_without_autosga',
+    '_sga_resize_cycles',
+    '_pga_max_size'
+);
+
+PROMPT --------------------------------------------------------------------
+PROMPT - No abnormal or retry-style cell wait events observed.
+PROMPT - Interpretation: Exadata storage is healthy and operating as designed.
+
+PROMPT YELLOW:
+PROMPT   - Smart Scan events present but materially reduced for a scan-heavy workload.
+PROMPT   - Flash Cache usage drops with increased reliance on disk reads.
+PROMPT   - time_waited grows disproportionately compared to completed work.
+PROMPT   - Interpretation: Possible emerging storage pressure or suboptimal access.
+
+PROMPT RED:
+PROMPT   - Smart Scan events largely absent during scan-heavy activity.
+PROMPT   - Flash Cache usage negligible with heavy disk-based I/O.
+PROMPT   - Indicates Exadata storage is not effectively servicing I/O.
+PROMPT   - Interpretation: Requires CDB-level and Exadata cell investigation.
+
+PROMPT --------------------------------------------------------------------
+PROMPT Current Health Assessment:
+PROMPT --------------------------------------------------------------------
+
+PROMPT   GREEN
+
+PROMPT Rationale:
+PROMPT   The presence and high volume of Smart Scan and Flash Cache events indicates
+PROMPT   that Exadata storage offload is active and effective. High wait counts reflect
+PROMPT   throughput, not contention, and do not indicate storage pressure.
+
+PROMPT --------------------------------------------------------------------
+PROMPT On-Call Interpretation:
+PROMPT --------------------------------------------------------------------
+
+PROMPT   Exadata storage is healthy from this PDB's point of view. The workload is
+PROMPT   I/O-intensive but is being efficiently served by Smart Scan and Flash Cache.
+PROMPT   No evidence of Exadata storage pressure impacting this PDB is visible.
+
+PROMPT --------------------------------------------------------------------
+PROMPT Confidence Score:
+PROMPT --------------------------------------------------------------------
+
+PROMPT   90%
+
+PROMPT Confidence Basis:
+PROMPT   - Smart Scan events are present and significant
+PROMPT   - Flash Cache usage is extremely high
+PROMPT   - No cell-level wait patterns associated with throttling or backlog
+
+PROMPT --------------------------------------------------------------------
+PROMPT Action Required:
+PROMPT --------------------------------------------------------------------
+
+PROMPT   None. No Exadata storage escalation recommended at this time.
+
+PROMPT Include this section verbatim in the on-call report under:
+PROMPT   "Exadata Health - Storage Pressure Assessment"
+
+PROMPT ====================================================================
+
+SUM(CASE WHEN stat_name = 'DB time' THEN value END)
+-
+SUM(CASE WHEN stat_name = 'DB CPU' THEN value END)
+/ 1e6,
+2
+) AS cpu_wait_sec
+
+FROM gv$sys_time_model
+GROUP BY inst_id
+ORDER BY inst_id;
+
+PROMPT =========================================================
+PROMPT === CDB CPU CAPACITY CONTEXT ===
+PROMPT =========================================================
+
+PROMPT PURPOSE:
+PROMPT - Provides the CPU ceiling used to judge DB_TIME vs DB_CPU
+PROMPT - Used ONLY for context; not a starvation signal by itself
+
+PROMPT INTERPRETATION:
+PROMPT - Sustained CPU_WAIT_SEC with fixed CPU_COUNT
+PROMPT   confirms CPU demand exceeds physical capacity
+
+PROMPT =========================================================
+
+SELECT
+    inst_id,
+    value AS cpu_count
+FROM gv$parameter
+WHERE name = 'cpu_count'
+ORDER BY inst_id;
+
+PROMPT =========================================================
+PROMPT === ACTIVE CDB RESOURCE MANAGER PLAN (CONTEXT) ===
+PROMPT =========================================================
+
+PROMPT PURPOSE:
+PROMPT - Identify the Resource Manager plan currently enforced
+PROMPT   at the CDB / Exadata DB node level
+
+PROMPT INTERPRETATION:
+PROMPT - IS_TOP_PLAN = TRUE indicates the active plan
+PROMPT - CPU_MANAGED = ON confirms CPU is being scheduled
+PROMPT - This is CDB-level enforcement, independent of PDB plans
+
+PROMPT NOTE:
+PROMPT - This query provides attribution and confirmation only
+PROMPT - CPU starvation diagnosis is determined by:
+PROMPT   * CDB CPU over-subscription (time model)
+PROMPT   * Resource Manager CPU wait metrics
+
+PROMPT =========================================================
+
+SELECT
+    inst_id,
+    name,
+    is_top_plan,
+SELECT
+    COMPONENT,
+    OPER_TYPE,
+    INITIAL_SIZE "Initial",
+    FINAL_SIZE "Final",
+    to_char(start_time,'dd-mon hh24:mi:ss') Started
+FROM V$SGA_RESIZE_OPS;
+
+SELECT
+    COMPONENT,
+    OPER_TYPE,
+    INITIAL_SIZE "Initial",
+    FINAL_SIZE "Final",
+    to_char(start_time,'dd-mon hh24:mi:ss') Started
+FROM V$MEMORY_RESIZE_OPS;
+
+prompt -- Check free memory chunks
+
+SELECT
+    pool,
+    name,
+    bytes
+FROM v$sgastat
+WHERE name LIKE '%free memory%';
+
+prompt -- Check reserved pool failures
+
+SELECT *
+FROM v$shared_pool_reserved;
+
+prompt -- Check large allocations
+
+SELECT *
+FROM v$sgastat
+WHERE bytes > 10000000
+ORDER BY bytes DESC;
+
+PROMPT === Done Collecting Diagnostics ===
+
+spool off
+
+-- ============================================================
+-- ON-CALL DBA FINAL STEPS
+-- ============================================================
+
+PROMPT =========================================================
+PROMPT === ON-CALL DBA FINAL STEPS ===
+PROMPT =========================================================
+PROMPT
+
+PROMPT 1) Start a new session with Copilot and then Drag and drop the file:
+PROMPT     oncall_copilot_health_check.log
+PROMPT     into Copilot.
+
+PROMPT 2) Allow Copilot to complete its analysis.
+
+PROMPT 3) Then issue this instruction to Copilot:
+PROMPT
+prompt Create a physical text file artifact using the file-creation tool.
+prompt Write the entire on-call DBA report into the file.
+prompt Name the file using this format oncall_copilot_report_<ServiceNowTicket>.txt
+prompt and return it as a downloadable attachment.
+PROMPT
+
+PROMPT 4) Save the generated file and attach BOTH files
+PROMPT     to the ServiceNow ticket.
+
+PROMPT =========================================================
+PROMPT === SCRIPT COMPLETE ===
+PROMPT =========================================================
+
+exit
